@@ -16,6 +16,36 @@ const TOKEN_KEY = "rippa_dashboard_auth";
 let masterBridgeUrl = "";
 let authChecked = false;
 
+/**
+ * Last config loaded from /api/system/config, kept as the authoritative source
+ * for the Master URL so bridge actions work before/without touching the input.
+ */
+let configState = {};
+
+/**
+ * True once the user has edited/cleared the Master field. When set, the cached
+ * config value is NOT used as a fallback — otherwise deliberately clearing the
+ * field would silently fall back to the saved URL and still open a Master.
+ */
+let masterUrlEdited = false;
+
+/**
+ * Resolves the Master Command Center URL.
+ *
+ * Precedence: the live input first (so a typed value wins), then the last
+ * remembered selection, then the loaded config state as a fallback for the
+ * case where the field was never touched.
+ * Returns "" when no Master has been configured.
+ */
+function resolveMasterUrl() {
+  const fromInput = ((masterUrl && masterUrl.value) || "").trim();
+  if (fromInput) return fromInput;
+  const fromSelection = (masterBridgeUrl || "").trim();
+  if (fromSelection) return fromSelection;
+  if (masterUrlEdited) return "";
+  return (configState.master_node_url || configState.MASTER_LOCAL_URL || "").trim();
+}
+
 function showAlert(msg, kind) {
   if (!alertBox) return;
   alertBox.textContent = msg;
@@ -99,12 +129,12 @@ function refreshRole() {
 function refreshBridge() {
   if (!role || !satBridge) return;
   const isSat = role.value === "satellite";
-  const url = (masterBridgeUrl || (masterUrl && masterUrl.value) || "").trim();
+  const url = resolveMasterUrl();
   satBridge.classList.toggle("hidden", !isSat);
   if (isSat && satMasterLabel) satMasterLabel.textContent = url ? ("Master: " + url) : "Set the Master Node URL below.";
 }
 if (role) role.addEventListener("change", refreshRole);
-if (masterUrl) masterUrl.addEventListener("input", () => { masterBridgeUrl = masterUrl.value; refreshBridge(); });
+if (masterUrl) masterUrl.addEventListener("input", () => { masterBridgeUrl = masterUrl.value; masterUrlEdited = true; refreshBridge(); });
 
 /**
  * LAN AUTO-DISCOVERY.
@@ -192,13 +222,44 @@ if (masterUrl) masterUrl.addEventListener("input", () => {
   if (masterPicker && masterUrl.value !== masterPicker.value) masterPicker.value = "";
 });
 
-if (openMasterBtn) openMasterBtn.addEventListener("click", () => {
-  const url = (masterBridgeUrl || (masterUrl && masterUrl.value) || "").trim();
-  if (!url) { showAlert("Set the Master Node URL first.", "err"); return; }
-  window.location.href = url;
+/**
+ * Opens the Master Command Center in a NEW TAB.
+ *
+ * `window.location.href` was used here previously, which navigated the current
+ * tab to the Master and unloaded this Satellite dashboard — the user perceived
+ * that as the button "flickering"/refreshing the page. Opening a new tab keeps
+ * the Satellite dashboard live in the current tab.
+ *
+ * The URL is resolved from the last-loaded config state first (the authoritative
+ * value from /api/system/config), then the live input, so it works even if the
+ * field was never touched.
+ */
+if (openMasterBtn) openMasterBtn.addEventListener("click", (event) => {
+  // Belt-and-braces: the button is outside any form, but never let a click
+  // bubble into a submission or trigger the document's default action.
+  event.preventDefault();
+
+  const url = resolveMasterUrl();
+  if (!url) {
+    showAlert("Set the Master Node URL first.", "err");
+    return;
+  }
+
+  // `noopener` prevents the Master page from reaching back through
+  // window.opener to control this dashboard.
+  const opened = window.open(url, "_blank", "noopener,noreferrer");
+  if (!opened) {
+    // Popup blocked: fall back to same-tab navigation rather than doing nothing.
+    showAlert("New tab was blocked by the browser — opening in this tab instead.", "err");
+    window.location.href = url;
+  } else {
+    // Some browsers honour noopener without honouring noreferrer.
+    opened.opener = null;
+  }
 });
-if (copyMasterBtn) copyMasterBtn.addEventListener("click", async () => {
-  const url = (masterBridgeUrl || (masterUrl && masterUrl.value) || "").trim();
+if (copyMasterBtn) copyMasterBtn.addEventListener("click", async (event) => {
+  event.preventDefault();
+  const url = resolveMasterUrl();
   if (!url) return;
   try { await navigator.clipboard.writeText(url); showAlert("Master URL copied.", "ok"); }
   catch (e) { showAlert("Copy failed: " + e.message, "err"); }
@@ -300,6 +361,7 @@ async function load() {
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.success) throw new Error("config fetch failed");
     const c = (data && data.config) || {};
+    configState = c; // cached for bridge actions (see resolveMasterUrl)
     if (role) role.value = c.node_role || c.NODE_ROLE || "master";
     if (mothership) mothership.value = c.mothership_url || c.MOTHERSHIP_URL || "https://rippaadventures.com";
     if (masterUrl) { masterUrl.value = c.master_node_url || c.MASTER_LOCAL_URL || ""; masterBridgeUrl = masterUrl.value; }
