@@ -60,9 +60,20 @@
 <input id="mothership" type="url" placeholder="https://rippaadventures.com" />
 </section>
 <section class="field hidden" id="masterUrlWrap">
-<label for="masterUrl">Master Node Local IP / URL</label>
-<input id="masterUrl" type="url" placeholder="http://192.168.1.50:4000" />
-<p class="hint">Satellite nodes forward through this Master on your LAN.</p>
+    <label for="masterUrl">Master Node</label>
+    <div class="discover">
+      <button id="scanBtn" type="button" class="ghost">📡 Scan Local Network</button>
+      <select id="masterPicker" aria-label="Discovered Master nodes">
+        <option value="">— No Master selected —</option>
+      </select>
+    </div>
+    <input id="masterUrl" type="text" placeholder="http://192.168.1.50:4000" />
+    <p class="hint" id="scanState">Scan to find Masters automatically, or type an address below.</p>
+</section>
+<section class="field hidden" id="cloudLinkWrap">
+  <label for="cloudLink">Remote / Cloud Link</label>
+  <input id="cloudLink" type="text" inputmode="numeric" maxlength="6" placeholder="Enter Cloud Link Code" autocomplete="off" />
+  <p class="hint">Use this code to connect over the internet if a VPN or network isolates this device.</p>
 </section>
 <section class="field">
 <label for="nodeName">Node Name</label>

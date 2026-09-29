@@ -14,6 +14,8 @@ input:focus, select:focus { outline:none; border-color:var(--acc); box-shadow:0 
 .hint { color:var(--mut); font-size:12px; margin:6px 0 0; }
 .hidden { display:none; }
 .keyrow { display:flex; gap:8px; } .keyrow input { flex:1; }
+/* LAN discovery: scan button + discovered-Master dropdown above the manual input. */
+.discover { display:flex; gap:8px; margin-bottom:8px; } .discover select { flex:1; } .discover button { white-space:nowrap; }
 .keyrow button { border:1px solid var(--line); background:#0d1117; color:var(--txt); border-radius:10px; padding:0 14px; cursor:pointer; }
 .adv { margin:8px 0 16px; border:1px solid var(--line); border-radius:10px; padding:10px 14px; }
 .adv summary { cursor:pointer; color:var(--mut); font-size:13px; }

@@ -37,6 +37,12 @@ export interface RippaNodeConfig {
   master_node_url?: string;
   /** Alias of DASHBOARD_PIN used by the Web GUI. */
   dashboard_pin?: string;
+  /**
+   * Optional 6-digit Cloudflare relay code (satellites only). Lets a Satellite
+   * reach its Master over the internet when a VPN or a segmented network
+   * isolates the two devices. Blank/unset means LAN-only linking.
+   */
+  cloud_link_code?: string;
 }
 
 export type NodeRole = "master" | "satellite";
@@ -116,6 +122,11 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
   const pin =
     pickString(record, "DASHBOARD_PIN", "dashboard_pin", "dashboardPin", "pin", "passkey") ||
     DEFAULT_DASHBOARD_PIN;
+  // Digits only: the relay code is typed into a numeric UI field and used in a
+  // tunnel URL, so anything else is stripped rather than persisted.
+  const cloudLinkCode = normalizeCloudLinkCode(
+    pickString(record, "cloud_link_code", "CLOUD_LINK_CODE", "cloudLinkCode"),
+  );
   return {
     NODE_ROLE: role,
     NODE_NAME: pickString(record, "NODE_NAME", "node_name") || "Unnamed Rippa Node",
@@ -128,7 +139,21 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
     node_role: role,
     master_node_url: masterLocal,
     dashboard_pin: pin,
+    cloud_link_code: cloudLinkCode,
   };
+}
+
+/**
+ * Normalises a Cloud Link relay code.
+ *
+ * Strips non-digits, then requires EXACTLY 6 digits — anything else yields ""
+ * (LAN-only linking). It deliberately does NOT truncate an over-long code:
+ * silently turning a 7-digit value into a wrong 6-digit code would connect
+ * the satellite to the wrong tunnel. Validation surfaces the error instead.
+ */
+export function normalizeCloudLinkCode(value: string): string {
+  const digits = String(value ?? "").replace(/\D+/g, "");
+  return /^\d{6}$/.test(digits) ? digits : "";
 }
 
 /**
@@ -194,6 +219,9 @@ export function applyConfigToEnv(cfg: ConfigInput | RippaNodeConfig | null, forc
   put("node_role", config.NODE_ROLE);
   put("master_node_url", config.MASTER_LOCAL_URL);
   put("dashboard_pin", config.DASHBOARD_PIN);
+  if (config.cloud_link_code) {
+    put("CLOUD_LINK_CODE", config.cloud_link_code);
+  }
 }
 
 /** Writes config.json (0600 permissions on POSIX; best effort on Windows). */
@@ -323,6 +351,12 @@ export function validateConfigInput(
   const pin = pickString(record, "DASHBOARD_PIN", "dashboard_pin", "dashboardPin", "pin", "passkey");
   if (pin && pin.length < 4) {
     errors.push({ path: "dashboard_pin", message: "Dashboard passkey must be at least 4 characters" });
+  }
+  const cloudLink = pickString(record, "cloud_link_code", "CLOUD_LINK_CODE", "cloudLinkCode");
+  // An empty code is fine (LAN-only). A non-empty one must be exactly 6 digits,
+  // so a typo surfaces as a clear message instead of a silently dropped value.
+  if (cloudLink && !normalizeCloudLinkCode(cloudLink)) {
+    errors.push({ path: "cloud_link_code", message: "Cloud Link code must be exactly 6 digits" });
   }
   if (errors.length > 0) return { ok: false, errors };
   const config = normalizeConfig({ ...record, NODE_ROLE: role, node_role: role });

@@ -8,6 +8,9 @@ const lockScreen = $("lockScreen"), dashCard = $("dashCard"), unlockPin = $("unl
 const unlockBtn = $("unlockBtn"), lockAlert = $("lockAlert"), lockSub = $("lockSub");
 const satBridge = $("satBridge"), satMasterLabel = $("satMasterLabel");
 const openMasterBtn = $("openMaster"), copyMasterBtn = $("copyMaster"), lockBtn = $("lockBtn");
+// LAN auto-discovery + cloud link (satellite setup).
+const scanBtn = $("scanBtn"), masterPicker = $("masterPicker"), scanState = $("scanState");
+const cloudLinkWrap = $("cloudLinkWrap"), cloudLink = $("cloudLink");
 
 const TOKEN_KEY = "rippa_dashboard_auth";
 let masterBridgeUrl = "";
@@ -84,6 +87,7 @@ function refreshRole() {
   const isSat = role.value === "satellite";
   if (mothershipWrap) mothershipWrap.classList.toggle("hidden", isSat);
   if (masterUrlWrap) masterUrlWrap.classList.toggle("hidden", !isSat);
+  if (cloudLinkWrap) cloudLinkWrap.classList.toggle("hidden", !isSat);
   if (roleHint) roleHint.textContent = isSat
     ? "Satellite forwards through a Master on your LAN."
     : "Master connects directly to the Mothership cloud.";
@@ -101,6 +105,92 @@ function refreshBridge() {
 }
 if (role) role.addEventListener("change", refreshRole);
 if (masterUrl) masterUrl.addEventListener("input", () => { masterBridgeUrl = masterUrl.value; refreshBridge(); });
+
+/**
+ * LAN AUTO-DISCOVERY.
+ *
+ * Asks the node to listen for Master beacons for ~3 seconds, then fills the
+ * dropdown. Picking an entry writes the URL into the Master field so the
+ * existing bridge/save logic works unchanged. The manual text input below is
+ * always kept, so a user on an unusual network can still type an address.
+ */
+function setScanState(text) {
+  if (scanState) scanState.textContent = text;
+}
+
+function populateMasterPicker(masters) {
+  if (!masterPicker) return;
+  const current = masterBridgeUrl || (masterUrl && masterUrl.value) || "";
+  masterPicker.innerHTML = "";
+  const blank = document.createElement("option");
+  blank.value = "";
+  blank.textContent = "— No Master selected —";
+  masterPicker.appendChild(blank);
+  (masters || []).forEach((m) => {
+    const opt = document.createElement("option");
+    opt.value = m.url;
+    opt.textContent = `${m.nodeName} — ${m.ipAddress}${m.port ? ":" + m.port : ""}`;
+    masterPicker.appendChild(opt);
+  });
+  // Preselect the Master already configured, if we found it again.
+  if (current && [...masterPicker.options].some((o) => o.value === current)) {
+    masterPicker.value = current;
+  }
+}
+
+async function scanForMasters() {
+  if (!scanBtn) return;
+  scanBtn.disabled = true;
+  scanBtn.textContent = "Scanning…";
+  setScanState("Listening for Master nodes on this network (about 3 seconds)…");
+  try {
+    const res = await fetch("/api/system/network/scan", {
+      credentials: "same-origin",
+      headers: authHeaders(),
+    });
+    if (res.status === 401) { showLocked(); return; }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.success) throw new Error("scan failed");
+    const masters = data.masters || [];
+    populateMasterPicker(masters);
+    if (masters.length === 0) {
+      setScanState("No Masters found. Make sure the Master is running on this network, or type its address below.");
+    } else {
+      setScanState(`Found ${masters.length} Master${masters.length === 1 ? "" : "s"}. Select one above, or type an address below.`);
+      // Auto-select the single obvious choice to save a click.
+      if (masters.length === 1 && masterUrl) {
+        masterUrl.value = masters[0].url;
+        masterBridgeUrl = masters[0].url;
+        if (masterPicker) masterPicker.value = masters[0].url;
+        refreshBridge();
+      }
+    }
+  } catch (e) {
+    setScanState("Scan failed — check that this node is reachable, or type the Master address below.");
+  } finally {
+    scanBtn.disabled = false;
+    scanBtn.textContent = "📡 Scan Local Network";
+  }
+}
+
+if (scanBtn) scanBtn.addEventListener("click", () => { void scanForMasters(); });
+// The relay code is 6 digits; strip anything else as it is typed.
+if (cloudLink) cloudLink.addEventListener("input", () => {
+  const digits = cloudLink.value.replace(/\D+/g, "").slice(0, 6);
+  if (cloudLink.value !== digits) cloudLink.value = digits;
+});
+if (masterPicker) masterPicker.addEventListener("change", () => {
+  const url = masterPicker.value;
+  if (!url) return;
+  if (masterUrl) masterUrl.value = url;
+  masterBridgeUrl = url;
+  refreshBridge();
+  setScanState("Master selected. Save to apply.");
+});
+// Keep the dropdown in sync when the address is typed by hand.
+if (masterUrl) masterUrl.addEventListener("input", () => {
+  if (masterPicker && masterUrl.value !== masterPicker.value) masterPicker.value = "";
+});
 
 if (openMasterBtn) openMasterBtn.addEventListener("click", () => {
   const url = (masterBridgeUrl || (masterUrl && masterUrl.value) || "").trim();
@@ -213,6 +303,7 @@ async function load() {
     if (role) role.value = c.node_role || c.NODE_ROLE || "master";
     if (mothership) mothership.value = c.mothership_url || c.MOTHERSHIP_URL || "https://rippaadventures.com";
     if (masterUrl) { masterUrl.value = c.master_node_url || c.MASTER_LOCAL_URL || ""; masterBridgeUrl = masterUrl.value; }
+    if (cloudLink) cloudLink.value = c.cloud_link_code || c.CLOUD_LINK_CODE || "";
     if (nodeName) nodeName.value = c.node_name || c.NODE_NAME || "";
     if (port) port.value = c.port || c.PORT || 4000;
     if (ollama) ollama.value = c.ollama_url || c.OLLAMA_URL || "http://127.0.0.1:11434";
@@ -239,6 +330,7 @@ if (saveBtn) saveBtn.addEventListener("click", async () => {
     node_role: role ? role.value : "master",
     mothership_url: mothership ? mothership.value.trim() : "",
     master_node_url: masterUrl ? masterUrl.value.trim() : "",
+    cloud_link_code: cloudLink ? cloudLink.value.trim() : "",
     node_name: nodeName ? nodeName.value.trim() : "",
     node_api_key: apiKey ? apiKey.value : "",
     port: port ? (Number(port.value) || 4000) : 4000,

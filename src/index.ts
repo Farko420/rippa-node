@@ -67,6 +67,10 @@ async function main(): Promise<void> {
   let syncManager: import("./network/SyncManager").SyncManager | null = null;
   let orchestrator: import("./agent/Orchestrator").Orchestrator | null = null;
 
+  // LAN discovery beacon — advertised by Masters so Satellites can auto-detect.
+  const { MasterBeacon, shouldAdvertise } = require("./network/discovery") as typeof import("./network/discovery");
+  const beacon = new MasterBeacon();
+
   const startNodeServices = (): void => {
     if (!isConfigComplete(readCurrentConfig())) {
       console.log("[Boot] Node not fully configured — services paused until GUI setup completes.");
@@ -79,9 +83,18 @@ async function main(): Promise<void> {
     syncManager.start();
     orchestrator = new Orchestrator(swarm);
     orchestrator.start();
+
+    // A Master advertises itself on the LAN so satellite nodes can find it
+    // without a hand-typed IP. Satellites never broadcast.
+    if (shouldAdvertise(env.NODE_ROLE)) {
+      void beacon.start(env.NODE_NAME, env.PORT);
+    } else {
+      beacon.stop();
+    }
   };
 
   const stopNodeServices = async (): Promise<void> => {
+    beacon.stop(); // release the UDP discovery port before rebinding
     if (orchestrator) {
       await orchestrator.stop();
       orchestrator = null;

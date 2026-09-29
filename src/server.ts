@@ -6,6 +6,7 @@ import type { Server } from "node:http";
 import { z } from "zod";
 import { env, reloadEnv } from "./config";
 import { APP_VERSION } from "./version";
+import { scanForMasters } from "./network/discovery";
 import {
   DEFAULT_DASHBOARD_PIN,
   applyConfigToEnv,
@@ -299,6 +300,7 @@ export function createApp(): Express {
         apiKeyConfigured: apiKey.trim().length >= 8,
         dashboard_pin: "",
         pinConfigured: (stored.DASHBOARD_PIN ?? "").trim().length >= 4,
+        cloud_link_code: stored.cloud_link_code ?? "",
         ollama_url: stored.OLLAMA_URL,
         OLLAMA_URL: stored.OLLAMA_URL,
         port: stored.PORT,
@@ -306,6 +308,27 @@ export function createApp(): Express {
       },
     });
   });
+
+  // GET /api/system/network/scan — LAN auto-discovery for satellite setup.
+  // Listens for Master beacons on the UDP discovery port and returns every
+  // Master heard, so the GUI can offer a one-click Master selection instead of
+  // a hand-typed IP. Always succeeds with (possibly empty) results: a blocked
+  // firewall or a network that forbids broadcast is not an error.
+  app.get(
+    "/api/system/network/scan",
+    requireDashboardAuth,
+    async (_req: Request, res: Response) => {
+      try {
+        const masters = await scanForMasters();
+        res.json({ success: true, count: masters.length, masters });
+      } catch (error) {
+        // scanForMasters resolves rather than rejects, so this is a last-resort
+        // net — the UI must still fall back to manual entry rather than hang.
+        console.warn(`[Discovery] Scan failed — ${error instanceof Error ? error.message : error}`);
+        res.json({ success: true, count: 0, masters: [] });
+      }
+    },
+  );
 
   // POST /api/system/config — validate, save, re-init node services.
   app.post("/api/system/config", requireDashboardAuth, (req: Request, res: Response) => {
