@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+*.log
+
+# First-run setup output (contains the Node API key — never commit it)
+config.json
+
+# Deep Brain (SQLite) + WAL sidecars
+*.db
+*.db-shm
+*.db-wal

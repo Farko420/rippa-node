@@ -1,0 +1,236 @@
+import axios, { type AxiosInstance } from "axios";
+import { z } from "zod";
+import { env } from "../config";
+
+/**
+ * THE BRAIN — local Ollama extraction client.
+ *
+ * Talks to the node's Ollama instance over HTTP, drives the model with a
+ * system prompt that enforces the `verified_knowledge` JSON shape, and
+ * hard-validates the response with zod before handing it back.
+ */
+
+/** Preferred model; falls back to `llama3` when it is not pulled locally. */
+export const PRIMARY_MODEL = "qwen2.5-coder:7b";
+export const FALLBACK_MODEL = "llama3";
+
+/** Ollama's default port when OLLAMA_URL is not set. */
+export const DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434";
+
+/** Hard cap on source text sent to the model (keeps the prompt in-budget). */
+const MAX_INPUT_CHARS = 16_000;
+const REQUEST_TIMEOUT_MS = 180_000; // local 7B inference can take a while
+
+/**
+ * The structured shape of a `verified_knowledge` row, as produced by the LLM.
+ * `coordinates` is a "lat, lon" string when the source implies a place,
+ * otherwise `null`.
+ */
+export const verifiedFactSchema = z.object({
+  category: z.string().min(1),
+  fact_summary: z.string().min(1),
+  confidence_score: z.number(),
+  coordinates: z.string().nullable(),
+});
+export type VerifiedFact = z.infer<typeof verifiedFactSchema>;
+
+/**
+ * SYSTEM PROMPT — the critical directive:
+ *  - Australian outdoor guide persona.
+ *  - Extracts locations, rules, hazards and descriptions.
+ *  - CRITICAL: every imperial measurement must be converted to metric.
+ *  - Output is a single JSON object matching `verified_knowledge`.
+ */
+const SYSTEM_PROMPT = `You are an Australian outdoor guide with decades of experience in the Queensland bush, 4WD touring, bushwalking and remote-area safety.
+
+From the TEXT supplied by the user, extract the single most useful and verifiable fact for an outdoor-adventure knowledge base. Cover these kinds of facts when present: locations, rules/regulations, hazards, and descriptions of places or conditions.
+
+CRITICAL MEASUREMENT RULE: The source text may use imperial units. You MUST convert ALL imperial measurements to metric before writing anything: feet -> metres, miles -> kilometres, pounds -> kilograms, ounces -> grams, inches -> centimetres, Fahrenheit -> Celsius. Never leave an imperial unit (ft, feet, mi, miles, lb, lbs, in, degrees F) anywhere in your output. Round sensibly (e.g. "1,500 ft" -> "457 metres").
+
+Australia-specific conventions:
+- Use Australian English spelling.
+- Report coordinates as decimal degrees "latitude, longitude" (WGS84) when the text identifies a real place; otherwise use null.
+- Distances in metres or kilometres; state track grades and hazards plainly.
+
+Respond with ONLY one JSON object (no markdown fences, no commentary) with exactly this structure:
+{
+  "category": "location" | "rule" | "hazard" | "description",
+  "fact_summary": "One concise sentence containing the extracted fact with all measurements in metric units.",
+  "confidence_score": <number from 0.0 to 1.0 - how well the source states this fact>,
+  "coordinates": "<lat, lon>" or null
+}`;
+
+interface ChatResponse {
+  message?: { content?: string };
+  done?: boolean;
+}
+
+export class OllamaClient {
+  private readonly client: AxiosInstance;
+  private resolvedModel: string | null = null;
+
+  constructor(baseUrl: string = env.OLLAMA_URL ?? DEFAULT_OLLAMA_URL) {
+    this.client = axios.create({
+      baseURL: baseUrl.replace(/\/+$/, ""),
+      timeout: REQUEST_TIMEOUT_MS,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  /**
+   * Extracts a `verified_knowledge`-shaped fact from raw page text.
+   * Returns `null` when the model is unreachable or the payload is not
+   * valid JSON matching the schema — callers decide what to do then.
+   */
+  async extractFacts(rawText: string): Promise<VerifiedFact | null> {
+    const model = await this.resolveModel();
+    const input = rawText.slice(0, MAX_INPUT_CHARS);
+
+    const { data } = await this.client.post<ChatResponse>("/api/chat", {
+      model,
+      stream: false,
+      format: "json", // force JSON-only output from the model
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: `TEXT:\n${input}` },
+      ],
+      options: {
+        temperature: 0.1, // deterministic extraction
+        num_ctx: 8192,
+      },
+    });
+
+    const content = data?.message?.content;
+    if (!content) {
+      console.warn(`[Ollama] Empty response from model "${model}".`);
+      return null;
+    }
+
+    return parseFactPayload(content, model);
+  }
+
+  /**
+   * Picks `PRIMARY_MODEL` when it is pulled locally, otherwise falls back
+   * to `llama3`. The answer is cached for the process lifetime; if the
+   * model list cannot be fetched we just try the primary and let the
+   * subsequent call surface any error.
+   */
+  private async resolveModel(): Promise<string> {
+    if (this.resolvedModel) {
+      return this.resolvedModel;
+    }
+
+    try {
+      const { data } = await this.client.get<{ models?: Array<{ name?: string }> }>("/api/tags", {
+        timeout: 5_000,
+      });
+      const names = (data?.models ?? []).map((m) => m.name ?? "");
+
+      if (matchesModel(names, PRIMARY_MODEL)) {
+        this.resolvedModel = PRIMARY_MODEL;
+      } else if (matchesModel(names, FALLBACK_MODEL)) {
+        console.warn(`[Ollama] "${PRIMARY_MODEL}" not available — falling back to "${FALLBACK_MODEL}".`);
+        this.resolvedModel = FALLBACK_MODEL;
+      } else {
+        console.warn(`[Ollama] No recognised model found — attempting "${PRIMARY_MODEL}".`);
+        this.resolvedModel = PRIMARY_MODEL;
+      }
+    } catch {
+      this.resolvedModel = PRIMARY_MODEL;
+    }
+
+    return this.resolvedModel;
+  }
+}
+
+/**
+ * True when any installed model name equals `target`, or shares its bare
+ * name (e.g. target "llama3" matches installed "llama3.1:latest").
+ */
+function matchesModel(installed: string[], target: string): boolean {
+  const bare = target.split(":")[0];
+  return installed.some((name) => name === target || name.split(":")[0] === bare);
+}
+
+/**
+ * Parses and validates the model's raw output: tolerates markdown fences
+ * or surrounding chatter, accepts either a single object or an array
+ * (highest confidence wins), and normalises confidence to 0–1.
+ */
+function parseFactPayload(content: string, model: string): VerifiedFact | null {
+  const candidate = stripToJsonObject(content);
+  if (!candidate) {
+    console.warn(`[Ollama] Model "${model}" did not return JSON — ignoring.`);
+    return null;
+  }
+
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(candidate);
+  } catch {
+    console.warn(`[Ollama] Model "${model}" returned malformed JSON — ignoring.`);
+    return null;
+  }
+
+  // If the model returned several facts, keep the most confident one.
+  if (Array.isArray(decoded)) {
+    if (decoded.length === 0) {
+      console.warn(`[Ollama] Model "${model}" returned an empty fact array.`);
+      return null;
+    }
+    decoded = decoded
+      .slice()
+      .sort((x, y) => confidenceOf(y) - confidenceOf(x))[0];
+  }
+
+  const parsed = verifiedFactSchema.safeParse(decoded);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    console.warn(`[Ollama] Payload failed schema validation: ${issue ? `${issue.path.join(".")} — ${issue.message}` : "unknown"}`);
+    return null;
+  }
+
+  const fact = parsed.data;
+
+  // Normalise confidence: accept 0–1 as-is, treat 0–100 as a percentage.
+  let confidence = fact.confidence_score;
+  if (confidence > 1 && confidence <= 100) {
+    confidence = confidence / 100;
+  }
+  confidence = Math.max(0, Math.min(1, confidence));
+
+  const coordinates =
+    fact.coordinates === null || fact.coordinates.trim() === ""
+      ? null
+      : fact.coordinates.trim();
+
+  return {
+    category: fact.category.trim(),
+    fact_summary: fact.fact_summary.trim(),
+    confidence_score: confidence,
+    coordinates,
+  };
+}
+
+/** Best-effort extraction of the first balanced JSON object in a string. */
+function stripToJsonObject(content: string): string | null {
+  const unfenced = content.replace(/```(?:json)?/gi, "").trim();
+  const start = unfenced.indexOf("{");
+  const end = unfenced.lastIndexOf("}");
+  if (start === -1 || end <= start) {
+    return null;
+  }
+  return unfenced.slice(start, end + 1);
+}
+
+/** Reads and normalises a candidate's confidence score (0–1 scale). */
+function confidenceOf(candidate: unknown): number {
+  if (typeof candidate === "object" && candidate !== null && "confidence_score" in candidate) {
+    const value = (candidate as { confidence_score?: unknown }).confidence_score;
+    if (typeof value === "number") {
+      return value > 1 && value <= 100 ? value / 100 : value;
+    }
+  }
+  return 0;
+}
+

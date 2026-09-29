@@ -1,0 +1,49 @@
+{
+  "name": "rippa-node",
+  "version": "1.0.0",
+  "description": "Rippa Node â€” Deep Brain worker for Rippa Adventures: headless scraping, local LLM extraction (Ollama), and autonomous feature research.",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck",
+    "package": "node scripts/package.mjs"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "dependencies": {
+    "axios": "^1.20.0",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^18.0.4",
+    "express": "^5.2.1",
+    "node-cron": "^4.6.0",
+    "playwright": "^1.63.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.3",
+    "@types/node-cron": "^3.0.11",
+    "@yao-pkg/pkg": "^6.23.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "better-sqlite3@13.0.3": true
+  },
+  "pkg": {
+    "assets": [
+      "node_modules/better-sqlite3/prebuilds/win32-x64.node",
+      "node_modules/better-sqlite3/prebuilds/win32-arm64.node",
+      "node_modules/playwright-core/browsers.json",
+      "node_modules/playwright-core/package.json",
+      "node_modules/playwright/package.json",
+      "public/**/*"
+    ]
+  }
+}

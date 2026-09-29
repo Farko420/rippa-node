@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+<title>Rippa Node — Command Center</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="bg"></div>
+
+<!-- FULLSCREEN PASSKEY LOCK -->
+<div id="lockScreen" class="lock hidden">
+  <div class="lock-card">
+    <div class="logo big">🔒</div>
+    <h1>Node Locked</h1>
+    <p class="sub" id="lockSub">Enter the Master passkey to manage this node.</p>
+    <input id="unlockPin" type="password" inputmode="numeric" autocomplete="current-password"
+      placeholder="Enter Passkey" />
+    <div id="lockAlert" class="alert hidden"></div>
+    <button id="unlockBtn" type="button" class="save">🔓 Unlock Command Center</button>
+  </div>
+</div>
+
+<!-- COMMAND CENTER -->
+<main class="card hidden" id="dashCard">
+<header>
+<div class="logo">◈</div>
+<div>
+<h1>Rippa Node</h1>
+<p class="sub" id="dashSub">Local Configuration Dashboard</p>
+</div>
+<div id="statusPill" class="pill idle">● checking…</div>
+</header>
+
+<!-- SATELLITE → MASTER BRIDGE -->
+<section id="satBridge" class="bridge hidden">
+  <div>
+    <strong>🛰 Satellite Mode</strong>
+    <p>This node forwards to its Master. Open the full swarm Command Center on the server PC.</p>
+    <p class="hint" id="satMasterLabel"></p>
+  </div>
+  <button id="openMaster" type="button">🚀 Open Master Command Center</button>
+  <button id="copyMaster" type="button" class="ghost" title="Copy Master URL">⧉</button>
+</section>
+
+<section class="field">
+<label for="role">Node Role</label>
+<select id="role">
+<option value="master">Master Node (Connects to Cloud)</option>
+<option value="satellite">Satellite Node (Connects to Master)</option>
+</select>
+<p class="hint" id="roleHint">Master connects directly to the Mothership cloud.</p>
+</section>
+<section class="field" id="mothershipWrap">
+<label for="mothership">Mothership URL</label>
+<input id="mothership" type="url" placeholder="https://rippaadventures.com" />
+</section>
+<section class="field hidden" id="masterUrlWrap">
+<label for="masterUrl">Master Node Local IP / URL</label>
+<input id="masterUrl" type="url" placeholder="http://192.168.1.50:4000" />
+<p class="hint">Satellite nodes forward through this Master on your LAN.</p>
+</section>
+<section class="field">
+<label for="nodeName">Node Name</label>
+<input id="nodeName" type="text" placeholder="Main Server PC" />
+</section>
+<section class="field">
+<label for="apiKey">Node API Key</label>
+<div class="keyrow">
+<input id="apiKey" type="password" placeholder="Paste key from Admin Fleet Command" autocomplete="off" />
+<button id="toggleKey" type="button" title="Show/hide key">👁</button>
+</div>
+<p class="hint" id="keyState">Key status unknown.</p>
+</section>
+<section class="field">
+<label for="dashPin">Dashboard Passkey (LAN lock screen)</label>
+<div class="keyrow">
+<input id="dashPin" type="password" placeholder="Leave blank to keep current passkey" autocomplete="off" />
+<button id="togglePin" type="button" title="Show/hide passkey">👁</button>
+</div>
+<p class="hint" id="pinState">Passkey protects LAN access to this dashboard.</p>
+</section>
+<details class="adv">
+<summary>Advanced</summary>
+<div class="grid2">
+<div class="field">
+<label for="port">Local Port</label>
+<input id="port" type="number" min="1" max="65535" value="4000" />
+</div>
+<div class="field">
+<label for="ollama">Ollama URL</label>
+<input id="ollama" type="url" value="http://127.0.0.1:11434" />
+</div>
+</div>
+</details>
+<div id="alert" class="alert hidden"></div>
+<button id="save" class="save">💾 Save &amp; Restart Node</button>
+<div class="row2">
+<button id="lockBtn" type="button" class="ghost">🔒 Lock</button>
+<span class="foot">Saved to <code>config.json</code> beside the app. LAN: <code id="lanHint">0.0.0.0</code></span>
+</div>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
+
