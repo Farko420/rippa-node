@@ -5,6 +5,7 @@ const roleHint = $("roleHint"), mothershipWrap = $("mothershipWrap"), masterUrlW
 const statusPill = $("statusPill"), keyState = $("keyState"), alertBox = $("alert"), saveBtn = $("save");
 const dashPin = $("dashPin"), pinState = $("pinState");
 const lockScreen = $("lockScreen"), dashCard = $("dashCard"), unlockPin = $("unlockPin");
+const bootScreen = $("bootScreen"), setupBanner = $("setupBanner");
 const unlockBtn = $("unlockBtn"), lockAlert = $("lockAlert"), lockSub = $("lockSub");
 const satBridge = $("satBridge"), satMasterLabel = $("satMasterLabel");
 const openMasterBtn = $("openMaster"), copyMasterBtn = $("copyMaster"), lockBtn = $("lockBtn");
@@ -14,7 +15,58 @@ const cloudLinkWrap = $("cloudLinkWrap"), cloudLink = $("cloudLink");
 
 const TOKEN_KEY = "rippa_dashboard_auth";
 let masterBridgeUrl = "";
-let authChecked = false;
+
+/**
+ * Which screen is currently authoritative: "boot" | "setup" | "locked" | "dashboard".
+ *
+ * This is the single source of truth for screen visibility. Every container
+ * (#bootScreen, #lockScreen, #dashCard) ships with the `hidden` attribute in
+ * index.html, and `showScreen()` is the only function allowed to reveal one —
+ * it always hides the others in the same synchronous step, so a screen can
+ * never be painted over another (the Lock -> Setup flicker).
+ */
+
+/**
+ * Shows exactly one top-level screen and hides the others, atomically.
+ *
+ * Both the `hidden` ATTRIBUTE and the legacy `hidden` CLASS are toggled, plus
+ * the inline `display` style. The attribute is what index.html ships and what
+ * `[hidden]{display:none!important}` in styles.css keys off; the class/style
+ * are kept so stale cached markup or CSS can never leave two screens visible
+ * at the same time.
+ *
+ * @param {"boot"|"setup"|"locked"|"dashboard"} screen
+ */
+function showScreen(screen) {
+  currentScreen = screen;
+  const setup = screen === "setup";
+  const locked = screen === "locked";
+  const dashboard = screen === "dashboard";
+  const booting = screen === "boot";
+  const set = (el, visible) => {
+    if (!el) return;
+    if (visible) {
+      el.removeAttribute("hidden");
+      el.classList.remove("hidden");
+      el.style.removeProperty("display");
+    } else {
+      el.setAttribute("hidden", "");
+      el.classList.add("hidden");
+      el.style.display = "none";
+    }
+  };
+  set(bootScreen, booting);
+  set(lockScreen, locked);
+  set(dashCard, setup || dashboard);
+  if (setupBanner) set(setupBanner, setup);
+  // Expose the mode for CSS/inspection; handy when diagnosing a flicker.
+  try { if (document.body) document.body.setAttribute("data-screen", screen); } catch (err) { /* noop */ }
+  if (locked) {
+    setTimeout(() => { try { if (unlockPin) unlockPin.focus(); } catch (err) { /* noop */ } }, 50);
+  }
+}
+
+let currentScreen = "boot";
 
 /**
  * Last config loaded from /api/system/config, kept as the authoritative source
@@ -83,30 +135,15 @@ function authHeaders() {
 }
 
 function showLocked(hint) {
-  if (dashCard) {
-    dashCard.classList.add("hidden");
-    dashCard.style.display = "none";
-  }
-  if (lockScreen) {
-    lockScreen.classList.remove("hidden");
-    lockScreen.style.display = "";
-  }
+  showScreen("locked");
   if (hint && lockSub) lockSub.textContent = hint;
-  setTimeout(() => { try { if (unlockPin) unlockPin.focus(); } catch (err) { /* noop */ } }, 50);
+  else if (lockSub) lockSub.textContent = "Enter the Master passkey to manage this node.";
 }
 function showUnlocked() {
-  // CRITICAL: update the UI immediately on a successful auth — do not wait
-  // for load()/refresh. Both class + inline style are toggled so a missing
-  // or stale ".hidden" rule can never leave the lock screen visible.
-  if (lockScreen) {
-    lockScreen.classList.add("hidden");
-    lockScreen.style.display = "none";
-  }
-  if (dashCard) {
-    dashCard.classList.remove("hidden");
-    dashCard.style.display = "";
-  }
-  try { authChecked = true; } catch (err) { /* noop */ }
+  // CRITICAL: the UI is updated in the same tick as the state change — never
+  // wait for load()/refresh. showScreen() guarantees only one screen is
+  // visible, so a slow /api/system/config cannot re-introduce the flicker.
+  showScreen(currentScreen === "setup" ? "setup" : "dashboard");
   try { if (unlockPin) unlockPin.value = ""; } catch (err) { /* noop */ }
   try { hideLockAlert(); } catch (err) { /* noop */ }
   try { refreshRole(); } catch (err) { /* noop */ }
@@ -298,10 +335,16 @@ async function unlock(pin) {
     // showUnlocked() hides #lockScreen, shows #dashCard, and refreshes the view.
     try { showUnlocked(); } catch (uiErr) {
       // Last-resort DOM fallback so a missing helper can never strand the user.
+      // Goes through showScreen() so the `hidden` attribute, the class and the
+      // inline style can never disagree about which screen is visible.
       try {
-        if (lockScreen) { lockScreen.classList.add("hidden"); lockScreen.style.display = "none"; }
-        if (dashCard) { dashCard.classList.remove("hidden"); dashCard.style.display = ""; }
-      } catch (err2) { /* noop */ }
+        showScreen("dashboard");
+      } catch (err2) {
+        try {
+          if (lockScreen) { lockScreen.setAttribute("hidden", ""); lockScreen.style.display = "none"; }
+          if (dashCard) { dashCard.removeAttribute("hidden"); dashCard.style.removeProperty("display"); }
+        } catch (err3) { /* noop */ }
+      }
     }
     try {
       await load();
@@ -333,23 +376,49 @@ if (lockBtn) lockBtn.addEventListener("click", async () => {
   showLocked();
 });
 
+/**
+ * BOOT SEQUENCER — the only place a screen is chosen from server state.
+ *
+ * Every container is `hidden` in index.html, so nothing is on screen until this
+ * fetch resolves. Exactly one screen is then revealed, in one synchronous step:
+ *
+ *   !configured                     -> Setup Screen
+ *   configured && !authenticated    -> Lock Screen
+ *   configured &&  authenticated   -> Dashboard
+ *
+ * A malformed/failed response is treated as "cannot verify" and falls back to
+ * the Lock Screen, which is the safe default: it never claims the node is
+ * configured, so it can never expose the dashboard to an unauthenticated LAN
+ * visitor.
+ *
+ * @returns {Promise<boolean>} true when a config payload can be loaded.
+ */
 async function checkAuth() {
   try {
     const res = await fetch("/api/system/auth/status", { credentials: "same-origin", headers: authHeaders() });
     const data = await res.json().catch(() => ({}));
-    masterBridgeUrl = (data && data.master_node_url) || "";
-    if (data && data.authenticated) {
+    if (!res.ok || !data || typeof data.configured !== "boolean") {
+      throw new Error("status " + res.status);
+    }
+    masterBridgeUrl = (data.master_node_url || "").trim();
+
+    if (!data.configured) {
+      // No usable config.json yet -> first-run Setup Screen.
+      showScreen("setup");
       showUnlocked();
       return true;
     }
-    if (data && data.configured === false) {
-      showUnlocked();
-      return true;
+    if (!data.authenticated) {
+      // Configured, but this browser has no live session -> Lock Screen.
+      showLocked();
+      return false;
     }
-    showLocked();
-    return false;
+    // Configured + authenticated -> Dashboard.
+    showScreen("dashboard");
+    showUnlocked();
+    return true;
   } catch (e) {
-    showLocked("Could not reach the node — is it online?");
+    showLocked("Could not verify node status — is it online?");
     return false;
   }
 }
@@ -357,7 +426,15 @@ async function checkAuth() {
 async function load() {
   try {
     const res = await fetch("/api/system/config", { credentials: "same-origin", headers: authHeaders() });
-    if (res.status === 401) { showLocked(); return; }
+    if (res.status === 401) {
+      // The session expired between the boot probe and this fetch. Only drop to
+      // the Lock Screen if we were showing the authenticated dashboard — during
+      // first-run setup a 401 is surfaced in place, so the Setup Screen is not
+      // replaced by the Lock Screen mid-boot (a second flicker source).
+      if (currentScreen === "dashboard") showLocked();
+      else showAlert("Dashboard is locked — enter the passkey to continue.", "err");
+      return;
+    }
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.success) throw new Error("config fetch failed");
     const c = (data && data.config) || {};
@@ -379,7 +456,10 @@ async function load() {
     if (lan) lan.textContent = location.host + " (bound 0.0.0.0)";
   } catch (e) {
     try { showAlert("Could not load current config: " + (e && e.message ? e.message : e), "err"); } catch (err2) { /* noop */ }
-    if (!authChecked) showLocked();
+    // The screen was already chosen by checkAuth(); a failed config fetch must
+    // NOT swap it for another screen (that was a Setup -> Lock flicker).
+    // Only fall back to the Lock Screen if we never reached a verified state.
+    if (currentScreen === "boot") showLocked("Could not load configuration from the node.");
   }
   try { refreshRole(); } catch (err) { /* noop */ }
 }
@@ -427,11 +507,15 @@ if (saveBtn) saveBtn.addEventListener("click", async () => {
 });
 
 (async () => {
+  // Screens are `hidden` in the markup; the boot splash is the only thing
+  // painted. checkAuth() reveals exactly one screen once the status probe
+  // resolves, so this is the single, flicker-free transition.
   try {
+    showScreen("boot");
     const ok = await checkAuth();
-    if (ok) { try { await load(); } catch (err) { /* unlocked UI already shown */ } }
+    if (ok) { try { await load(); } catch (err) { /* screen already chosen */ } }
     else { try { refreshRole(); } catch (err) { /* noop */ } }
   } catch (err) {
-    try { showLocked(); } catch (err2) { /* noop */ }
+    try { showLocked("Could not reach the node — is it online?"); } catch (err2) { /* noop */ }
   }
 })();

@@ -10,6 +10,8 @@ import { scanForMasters } from "./network/discovery";
 import {
   DEFAULT_DASHBOARD_PIN,
   applyConfigToEnv,
+  configFileExists,
+  configFilePath,
   isConfigComplete,
   normalizeConfig,
   readConfig,
@@ -116,12 +118,19 @@ export function hasDashboardSession(req: Request): boolean {
 
 /**
  * PIN gate for `/api/system/*` (except the auth + status probes below) and the
- * main dashboard view. Setup can proceed unauthenticated until the first
- * `config.json` exists; afterwards the LAN passkey is required.
+ * main dashboard view. Setup can proceed unauthenticated until the node has a
+ * complete config.json; afterwards the LAN passkey is required.
  */
 export function requireDashboardAuth(req: Request, res: Response, next: NextFunction): void {
   // First-run setup stays open so the operator can create config.json + PIN.
-  if (!readConfigLenient()) {
+  //
+  // CRITICAL: this MUST use the same predicate as the `configured` field of
+  // GET /api/system/auth/status (`isConfigComplete`). The two previously
+  // disagreed — this gate keyed off "config.json exists" while `configured`
+  // keyed off "config.json is complete" — so a partially written config.json
+  // made the GUI show the Setup Screen and then receive a 401, bouncing the
+  // user to the Lock Screen mid-boot. One predicate, no bounce.
+  if (!isConfigComplete(readConfig())) {
     next();
     return;
   }
@@ -228,6 +237,12 @@ export function createApp(): Express {
       success: true,
       authenticated: _req ? hasDashboardSession(_req) : false,
       configured,
+      // Diagnostic only: separates "no config.json on disk" from "config.json
+      // present but incomplete". Both yield configured:false, but the GUI uses
+      // this to show the right guidance, and it makes a mis-placed config.json
+      // obvious in the network tab when troubleshooting the .exe.
+      configPresent: configFileExists(),
+      configPath: configFilePath(),
       node_role: stored?.NODE_ROLE ?? env.NODE_ROLE,
       master_node_url: stored?.MASTER_LOCAL_URL ?? env.MASTER_LOCAL_URL,
       pinConfigured: Boolean((stored?.DASHBOARD_PIN ?? "").trim()),
@@ -253,8 +268,11 @@ export function createApp(): Express {
       res.status(400).json({ success: false, authenticated: false, message: "Passkey is required." });
       return;
     }
-    // First-run (no config.json yet): accept the default PIN so setup can start.
-    if (!readConfigLenient()) {
+    // First-run (no usable config.json yet): accept the default PIN so setup can
+    // start. Uses the same isConfigComplete() predicate as requireDashboardAuth
+    // and the `configured` flag, so a partially written config.json cannot
+    // lock the operator out of the screen that repairs it.
+    if (!isConfigComplete(readConfig())) {
       if (supplied !== DEFAULT_DASHBOARD_PIN) {
         res.status(401).json({ success: false, authenticated: false, message: "Incorrect passkey." });
         return;

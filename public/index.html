@@ -7,13 +7,42 @@
 <meta http-equiv="Pragma" content="no-cache" />
 <meta http-equiv="Expires" content="0" />
 <title>Rippa Node — Command Center</title>
+<!--
+  CRITICAL (anti-flicker): inline, render-blocking rules so the screen state is
+  correct on the FIRST paint. `hidden` is applied to every screen container in
+  the markup, and the UA `[hidden]{display:none}` rule is too weak to beat the
+  author `.lock{display:flex}` rule below — so it is reinforced here and in
+  styles.css. app.js removes `hidden` only after GET /api/system/auth/status
+  resolves, which guarantees a single screen transition and no flicker.
+-->
+<style>
+  [hidden] { display: none !important; }
+</style>
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
 <div class="bg"></div>
 
-<!-- FULLSCREEN PASSKEY LOCK -->
-<div id="lockScreen" class="lock hidden">
+<!--
+  BOOT SPLASH — the ONLY element visible on first paint. It is a static,
+  correct-by-construction "checking…" state, so the user never sees a wrong
+  screen flash before the status probe answers. app.js removes `hidden` from
+  exactly one of #lockScreen / #dashCard once /api/system/auth/status resolves
+  and hides this splash in the same synchronous step.
+-->
+<div id="bootScreen" class="lock">
+  <div class="lock-card">
+    <div class="logo big">◈</div>
+    <h1>Rippa Node</h1>
+    <p class="sub">Checking node status…</p>
+  </div>
+</div>
+
+<!--
+  FULLSCREEN PASSKEY LOCK — `hidden` by default. Shown ONLY when the node is
+  configured AND the session is not authenticated.
+-->
+<div id="lockScreen" class="lock" hidden>
   <div class="lock-card">
     <div class="logo big">🔒</div>
     <h1>Node Locked</h1>
@@ -25,8 +54,8 @@
   </div>
 </div>
 
-<!-- COMMAND CENTER -->
-<main class="card hidden" id="dashCard">
+<!-- SETUP SCREEN / DASHBOARD — one configuration surface, two modes. `hidden` by default; it is unhidden ONLY after /api/system/auth/status resolves. body[data-screen] is "setup" (node not configured yet) or "dashboard" (configured + authenticated), and #setupBanner is the visible difference between the two. The fields and the Save endpoint are identical in both modes, so the form is intentionally a single container driven by mode rather than a duplicated markup tree that could drift out of sync. -->
+<main class="card" id="dashCard" hidden>
 <header>
 <div class="logo">◈</div>
 <div>
@@ -35,6 +64,12 @@
 </div>
 <div id="statusPill" class="pill idle">● checking…</div>
 </header>
+
+<!-- First-run banner: shown only while body[data-screen="setup"]. -->
+<div id="setupBanner" class="alert setup-banner" hidden>
+  <strong>First-time setup.</strong> This node has no <code>config.json</code> yet — fill in your details below and save to start the node services.
+</div>
+
 
 <!-- SATELLITE → MASTER BRIDGE -->
 <section id="satBridge" class="bridge hidden">

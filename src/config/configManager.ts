@@ -61,33 +61,88 @@ const CONFIG_FILENAME = "config.json";
  */
 const PRESET_ENV_KEYS = new Set(Object.keys(process.env));
 
+/**
+ * True when running from a `pkg`-built executable (rippa-node.exe).
+ *
+ * Uses the literal `typeof … !== "undefined"` form rather than a truthiness
+ * check: `process.pkg` is injected by the pkg bootstrap and is genuinely
+ * absent from a normal `node`/`tsx` process, so the typeof test is the
+ * canonical way to detect the snapshot runtime.
+ */
 function isPackaged(): boolean {
-  return Boolean((process as NodeJS.Process & { pkg?: unknown }).pkg);
+  return typeof (process as NodeJS.Process & { pkg?: unknown }).pkg !== "undefined";
 }
 
-/** Root folder that holds `config.json` (and, when packaged, the exe + DB). */
+/**
+ * Walks up from `start` looking for the project root (the folder holding
+ * package.json). Bounded to 8 levels so a symlinked/odd layout can never loop
+ * forever. Returns "" when nothing is found.
+ */
+function findProjectRoot(start: string): string {
+  let dir = start;
+  for (let i = 0; i < 8; i += 1) {
+    try {
+      if (fs.existsSync(path.join(dir, "package.json"))) return dir;
+    } catch {
+      /* unreadable dir — keep walking up */
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return "";
+}
+
+/**
+ * ROOT DIRECTORY THAT HOLDS `config.json`.
+ *
+ * CRITICAL (pkg): `__dirname` is NOT usable to locate a writable config file
+ * inside a `pkg` executable — it points into the read-only virtual snapshot
+ * filesystem bundled into the exe, so reads/writes there either fail or land
+ * somewhere that vanishes on the next build. The packaged path is therefore
+ * derived from `process.execPath` (the real .exe on disk) so `config.json` is
+ * always written right next to `rippa-node.exe`, which is the only location
+ * that survives an app update and is the folder the user copies between PCs.
+ *
+ * Resolution order:
+ *   1. `RIPPA_CONFIG_ROOT` — explicit override (tests / custom deployments).
+ *   2. pkg executable       — `path.dirname(process.execPath)`.
+ *   3. dev / `node dist/…`  — `process.cwd()`, refined by walking up to the
+ *      folder containing package.json so `node dist/index.js` still finds the
+ *      project config when launched from a subdirectory.
+ */
 export function resolveAppRoot(): string {
   const override = process.env.RIPPA_CONFIG_ROOT;
   if (override && override.trim()) {
     return path.resolve(override.trim());
   }
-  if (isPackaged()) {
-    return path.dirname(process.execPath);
+
+  const isPkg = isPackaged();
+  const basePath = isPkg ? path.dirname(process.execPath) : process.cwd();
+
+  if (isPkg) {
+    // Already correct for the portable-app layout: config.json lives beside
+    // the .exe. No further walking — a parent folder would be wrong.
+    return basePath;
   }
-  // Dev/dist: walk up from this file (src/config or dist/config) to the project root.
-  let dir = __dirname;
-  for (let i = 0; i < 8; i += 1) {
-    if (fs.existsSync(path.join(dir, "package.json"))) return dir;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return process.cwd();
+
+  // Dev: prefer the project root so config.json is not duplicated per folder.
+  // If cwd already is the project root, findProjectRoot returns it unchanged.
+  return findProjectRoot(basePath) || basePath;
 }
 
 /** Absolute path of `config.json` for the given (or resolved) root. */
 export function configFilePath(root: string = resolveAppRoot()): string {
   return path.join(root, CONFIG_FILENAME);
+}
+
+/** True when a `config.json` file physically exists at the resolved path. */
+export function configFileExists(root: string = resolveAppRoot()): boolean {
+  try {
+    return fs.existsSync(configFilePath(root));
+  } catch {
+    return false;
+  }
 }
 
 /** Loose input accepted from config.json, .env, or the Web GUI form. */
@@ -250,6 +305,13 @@ export async function ensureConfiguration(
   options: { rootDir?: string } = {},
 ): Promise<{ configured: boolean; config: RippaNodeConfig | null; root: string }> {
   const root = options.rootDir ?? resolveAppRoot();
+  // Log the exact config.json location at boot. When a user reports "my
+  // settings vanished" this line is the first thing to check: it proves which
+  // directory the process is actually reading and writing.
+  console.log(`[Config] Root: ${root}`);
+  console.log(
+    `[Config] File: ${configFilePath(root)} (${configFileExists(root) ? "found" : "not found"})`,
+  );
   const existing = readConfig(root);
   if (existing) {
     applyConfigToEnv(existing);
@@ -363,7 +425,13 @@ export function validateConfigInput(
   return { ok: true, config };
 }
 
-/** Resolves the `public/` web GUI directory (dev, dist, and pkg snapshot). */
+/**
+ * Resolves the `public/` web GUI directory (dev, dist, and pkg snapshot).
+ *
+ * The app root (folder beside the .exe when packaged) is checked FIRST so a
+ * user-supplied `public/` next to the exe always wins over the bundled
+ * snapshot. The `__dirname` candidates remain for dev/dist only.
+ */
 export function resolvePublicDir(): string | null {
   const candidates: string[] = [];
   try {
@@ -371,8 +439,12 @@ export function resolvePublicDir(): string | null {
   } catch {
     /* ignore */
   }
-  candidates.push(path.join(__dirname, "..", "..", "public"));
-  candidates.push(path.join(__dirname, "..", "public"));
+  if (!isPackaged()) {
+    // Inside a pkg exe __dirname points at the virtual snapshot; only the
+    // staged/bundled asset is valid there, so skip these in the packaged case.
+    candidates.push(path.join(__dirname, "..", "..", "public"));
+    candidates.push(path.join(__dirname, "..", "public"));
+  }
   candidates.push(path.join(process.cwd(), "public"));
   for (const dir of candidates) {
     try {

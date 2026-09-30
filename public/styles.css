@@ -12,7 +12,17 @@ h1 { margin:0; font-size:22px; } .sub { margin:2px 0 0; color:var(--mut); font-s
 input, select { width:100%; padding:11px 12px; border-radius:10px; border:1px solid var(--line); background:#0d1117; color:var(--txt); font-size:14px; }
 input:focus, select:focus { outline:none; border-color:var(--acc); box-shadow:0 0 0 2px #2f81f755; }
 .hint { color:var(--mut); font-size:12px; margin:6px 0 0; }
+/* CRITICAL (anti-flicker): screens ship with the `hidden` attribute in index.html
+   and are only unhidden by app.js after /api/system/auth/status resolves. The UA
+   `[hidden]{display:none}` rule is too weak to override the author
+   `.lock{display:flex}` / `.card{...}` rules below, so enforce it here. Without
+   this, the Lock Screen paints on first load, then gets replaced by the Setup
+   Screen — the flicker this rule exists to prevent. */
+[hidden] { display:none !important; }
 .hidden { display:none; }
+/* First-run setup banner inside the configuration card. */
+.setup-banner { background:#d2992218; border:1px solid var(--warn); }
+.setup-banner strong { color:var(--warn); }
 .keyrow { display:flex; gap:8px; } .keyrow input { flex:1; }
 /* LAN discovery: scan button + discovered-Master dropdown above the manual input. */
 .discover { display:flex; gap:8px; margin-bottom:8px; } .discover select { flex:1; } .discover button { white-space:nowrap; }
