@@ -10,3 +10,6 @@ config.json
 *.db
 *.db-shm
 *.db-wal
+
+# Brain-parity contract test scratch: node config with a PIN + local SQLite
+.parity/

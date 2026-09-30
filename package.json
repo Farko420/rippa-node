@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck",
+    "test:brain-parity": "tsx scripts/brain-parity-check.ts .parity/bundle.json",
     "package": "node scripts/package.mjs"
   },
   "keywords": [],
