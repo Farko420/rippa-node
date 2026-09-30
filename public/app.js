@@ -8,7 +8,7 @@ const lockScreen = $("lockScreen"), dashCard = $("dashCard"), unlockPin = $("unl
 const bootScreen = $("bootScreen"), setupBanner = $("setupBanner");
 const unlockBtn = $("unlockBtn"), lockAlert = $("lockAlert"), lockSub = $("lockSub");
 const satBridge = $("satBridge"), satMasterLabel = $("satMasterLabel");
-const openMasterBtn = $("openMaster"), copyMasterBtn = $("copyMaster"), lockBtn = $("lockBtn");
+const bridgeLink = $("bridgeLink"), copyMasterBtn = $("copyMaster"), lockBtn = $("lockBtn");
 // LAN auto-discovery + cloud link (satellite setup).
 const scanBtn = $("scanBtn"), masterPicker = $("masterPicker"), scanState = $("scanState");
 const cloudLinkWrap = $("cloudLinkWrap"), cloudLink = $("cloudLink");
@@ -163,12 +163,44 @@ function refreshRole() {
   try { refreshBridge(); } catch (err) { /* noop */ }
 }
 
+/**
+ * Points the native bridge anchor at the resolved Master URL.
+ *
+ * The "Open Master Command Center" control is a real <a target="_blank">, so
+ * the browser performs the navigation itself: no click listener, no
+ * window.open() and therefore no pop-up blocker and no form/default action to
+ * swallow the click (both of which made the old <button> appear to flicker).
+ * `noopener noreferrer` is hard-coded in index.html, so the Master page can
+ * never reach back through window.opener.
+ *
+ * When no Master is configured yet the href is REMOVED rather than blanked. An
+ * anchor without href is inert — it cannot navigate and is not focusable — so
+ * there is nothing for the browser to "flicker" to, and the CSS renders it in
+ * a disabled state instead of as a live link.
+ *
+ * @param {string} url The Master URL, or "" when none is configured.
+ */
+function applyBridgeHref(url) {
+  if (!bridgeLink) return;
+  const target = (url || "").trim();
+  if (target) {
+    bridgeLink.href = target;
+    bridgeLink.removeAttribute("aria-disabled");
+    bridgeLink.removeAttribute("title");
+  } else {
+    bridgeLink.removeAttribute("href");
+    bridgeLink.setAttribute("aria-disabled", "true");
+    bridgeLink.setAttribute("title", "Set the Master Node URL below to enable this link");
+  }
+}
+
 function refreshBridge() {
   if (!role || !satBridge) return;
   const isSat = role.value === "satellite";
   const url = resolveMasterUrl();
   satBridge.classList.toggle("hidden", !isSat);
   if (isSat && satMasterLabel) satMasterLabel.textContent = url ? ("Master: " + url) : "Set the Master Node URL below.";
+  applyBridgeHref(url);
 }
 if (role) role.addEventListener("change", refreshRole);
 if (masterUrl) masterUrl.addEventListener("input", () => { masterBridgeUrl = masterUrl.value; masterUrlEdited = true; refreshBridge(); });
@@ -260,40 +292,16 @@ if (masterUrl) masterUrl.addEventListener("input", () => {
 });
 
 /**
- * Opens the Master Command Center in a NEW TAB.
+ * The "Open Master Command Center" control is a native <a> in index.html and
+ * intentionally has NO click listener here.
  *
- * `window.location.href` was used here previously, which navigated the current
- * tab to the Master and unloaded this Satellite dashboard — the user perceived
- * that as the button "flickering"/refreshing the page. Opening a new tab keeps
- * the Satellite dashboard live in the current tab.
- *
- * The URL is resolved from the last-loaded config state first (the authoritative
- * value from /api/system/config), then the live input, so it works even if the
- * field was never touched.
+ * This used to be a <button> with a `window.open()` handler plus a
+ * `window.location.href` fallback. That was defeated twice over: the pop-up
+ * blocker refused the programmatic `window.open()`, and the fallback navigated
+ * this Satellite dashboard away (which the user saw as the page flickering).
+ * The href is now set from the config state by applyBridgeHref(), so the
+ * browser handles the click natively — unblockable and flicker-free.
  */
-if (openMasterBtn) openMasterBtn.addEventListener("click", (event) => {
-  // Belt-and-braces: the button is outside any form, but never let a click
-  // bubble into a submission or trigger the document's default action.
-  event.preventDefault();
-
-  const url = resolveMasterUrl();
-  if (!url) {
-    showAlert("Set the Master Node URL first.", "err");
-    return;
-  }
-
-  // `noopener` prevents the Master page from reaching back through
-  // window.opener to control this dashboard.
-  const opened = window.open(url, "_blank", "noopener,noreferrer");
-  if (!opened) {
-    // Popup blocked: fall back to same-tab navigation rather than doing nothing.
-    showAlert("New tab was blocked by the browser — opening in this tab instead.", "err");
-    window.location.href = url;
-  } else {
-    // Some browsers honour noopener without honouring noreferrer.
-    opened.opener = null;
-  }
-});
 if (copyMasterBtn) copyMasterBtn.addEventListener("click", async (event) => {
   event.preventDefault();
   const url = resolveMasterUrl();
@@ -401,6 +409,9 @@ async function checkAuth() {
       throw new Error("status " + res.status);
     }
     masterBridgeUrl = (data.master_node_url || "").trim();
+    // Point the native <a> straight at the API's master_node_url so the link is
+    // live before the config fetch (and while the Lock/Setup screens are up).
+    applyBridgeHref(masterBridgeUrl);
 
     if (!data.configured) {
       // No usable config.json yet -> first-run Setup Screen.
@@ -442,6 +453,9 @@ async function load() {
     if (role) role.value = c.node_role || c.NODE_ROLE || "master";
     if (mothership) mothership.value = c.mothership_url || c.MOTHERSHIP_URL || "https://rippaadventures.com";
     if (masterUrl) { masterUrl.value = c.master_node_url || c.MASTER_LOCAL_URL || ""; masterBridgeUrl = masterUrl.value; }
+    // The authoritative master_node_url from /api/system/config becomes the
+    // bridge anchor's href. The browser opens it natively — no click handler.
+    applyBridgeHref(c.master_node_url || c.MASTER_LOCAL_URL || "");
     if (cloudLink) cloudLink.value = c.cloud_link_code || c.CLOUD_LINK_CODE || "";
     if (nodeName) nodeName.value = c.node_name || c.NODE_NAME || "";
     if (port) port.value = c.port || c.PORT || 4000;

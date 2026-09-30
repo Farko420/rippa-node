@@ -78,7 +78,16 @@
     <p>This node forwards to its Master. Open the full swarm Command Center on the server PC.</p>
     <p class="hint" id="satMasterLabel"></p>
   </div>
-  <button id="openMaster" type="button">🚀 Open Master Command Center</button>
+  <!--
+    NATIVE ANCHOR, not a <button>. This must be a real <a target="_blank">:
+    a JS-driven `window.open()` is both popup-blocked and prone to being
+    swallowed as a form/default action, which made this control look like it
+    "flickered" the page. A plain link is handled by the browser itself, so
+    there is no user-gesture requirement and no pop-up blocker to defeat.
+    app.js only ever sets `href` (see applyBridgeHref) — it never listens for
+    clicks on this element.
+  -->
+  <a id="bridgeLink" class="bridge-link" target="_blank" rel="noopener noreferrer" title="Open the Master Command Center in a new tab">🚀 Open Master Command Center</a>
   <button id="copyMaster" type="button" class="ghost" title="Copy Master URL">⧉</button>
 </section>
 
