@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,14 @@ import { z } from "zod";
 import { env, reloadEnv } from "./config";
 import { APP_VERSION } from "./version";
 import { scanForMasters } from "./network/discovery";
+import {
+  ensureNodeIdentity,
+  getPairing,
+  isValidNodeCode,
+  normalizeNodeCode,
+  type PeerEndpoint,
+} from "./config/nodeAuth";
+import { SwarmDispatcher, type LoadClass, type TaskOutcome } from "./services/swarmDispatcher";
 import {
   DEFAULT_DASHBOARD_PIN,
   applyConfigToEnv,
@@ -58,6 +67,20 @@ function expectedDashboardPin(): string {
 export type ConfigChangeHandler = () => void | Promise<void>;
 
 let configChangeHandler: ConfigChangeHandler | null = null;
+
+/**
+ * The Rippa Node AI instance backing the mesh endpoints.
+ *
+ * Owned by the server (not index.ts) so the API routes and the boot sequence
+ * share one registry. index.ts drives start()/stop() through the exported
+ * accessors below rather than constructing a second dispatcher.
+ */
+const dispatcher = new SwarmDispatcher();
+
+/** The shared dispatcher used by the mesh API routes. */
+export function getDispatcher(): SwarmDispatcher {
+  return dispatcher;
+}
 
 /** Registers the re-initializer run after a GUI config save. */
 export function onConfigChange(handler: ConfigChangeHandler | null): void {
@@ -418,12 +441,255 @@ export function createApp(): Express {
     }
   });
 
+  // ---- Zero-config mesh API (Master ⇄ Satellite) -----------------------------
+  //
+  // Split by trust level:
+  //  - /api/mesh/pair, /api/mesh/heartbeat and /api/mesh/assign are the
+  //    node-to-node channels and authenticate with the mesh key.
+  //  - the /api/mesh/* dashboard routes sit behind requireDashboardAuth so the
+  //    LAN passkey still protects the Control Center.
+
+  /** Reads the mesh key from the X-Mesh-Key header. */
+  const meshKeyOf = (req: Request): string =>
+    String((req.headers["x-mesh-key"] as string | undefined) ?? "");
+
+  // POST /api/mesh/pair — the ONE-TIME Satellite → Master handshake.
+  app.post("/api/mesh/pair", (req: Request, res: Response) => {
+    if (env.NODE_ROLE !== "master") {
+      res.status(400).json({ success: false, message: "This node is not a Master." });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const nodeCode = normalizeNodeCode(body["nodeCode"]);
+    if (!isValidNodeCode(nodeCode)) {
+      res.status(400).json({
+        success: false,
+        message: "A valid rippa_node_code is required (format RIPPA-XXXX-XXXX).",
+      });
+      return;
+    }
+    try {
+      const { meshKey, masterEndpoint } = dispatcher.registerSatellite({
+        nodeCode,
+        nodeName: String(body["nodeName"] ?? nodeCode),
+        ipAddress: String(body["ipAddress"] ?? ""),
+        port: Number(body["port"] ?? 0),
+        cloudLinkUrl: String(body["cloudLinkUrl"] ?? ""),
+      });
+      res.json({
+        success: true,
+        message: `Paired. ${env.NODE_NAME} now manages your networking.`,
+        // Returned under both keys: `masterCode` is what the Satellite stores as
+        // its pairing identity, `nodeCode` is the conventional field name.
+        masterCode: dispatcher.nodeCode,
+        nodeCode: dispatcher.nodeCode,
+        meshKey,
+        master: masterEndpoint,
+      });
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // POST /api/mesh/heartbeat — Satellite reports in, Master returns its work.
+  app.post("/api/mesh/heartbeat", (req: Request, res: Response) => {
+    if (env.NODE_ROLE !== "master") {
+      res.status(400).json({ success: false, message: "This node is not a Master." });
+      return;
+    }
+    if (!dispatcher.authenticate(meshKeyOf(req))) {
+      res.status(401).json({ success: false, message: "Invalid or missing mesh key." });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      const result = dispatcher.handleHeartbeat({
+        nodeCode: String(body["nodeCode"] ?? ""),
+        nodeName: String(body["nodeName"] ?? ""),
+        ipAddress: String(body["ipAddress"] ?? ""),
+        port: Number(body["port"] ?? 0),
+        cloudLinkUrl: String(body["cloudLinkUrl"] ?? ""),
+        metrics: (body["metrics"] ?? undefined) as never,
+        p2pEnabled: body["p2pEnabled"] !== false,
+      });
+      res.json({ success: true, ...result });
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // POST /api/mesh/assign — Master pushes the auto-provisioning payload to a
+  // Satellite: its task plus every sibling's IP, port and Cloud Link URLs.
+  app.post("/api/mesh/assign", (req: Request, res: Response) => {
+    if (!dispatcher.authenticate(meshKeyOf(req))) {
+      res.status(401).json({ success: false, message: "Invalid or missing mesh key." });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const task = (body["task"] ?? null) as Record<string, unknown> | null;
+    const siblings = Array.isArray(body["siblings"]) ? (body["siblings"] as PeerEndpoint[]) : [];
+    const allowP2p = body["p2pEnabled"] !== false;
+
+    if (task && typeof task["id"] === "string") {
+      dispatcher.applyIncomingAssignment({
+        id: String(task["id"]),
+        label: String(task["label"] ?? "Shared task"),
+        load: String(task["load"] ?? "normal") as LoadClass,
+        assignees: Array.isArray(task["assignees"]) ? (task["assignees"] as string[]) : [],
+        p2p: task["p2p"] !== false,
+        createdAt: String(task["createdAt"] ?? new Date().toISOString()),
+      });
+    }
+
+    // AUTO-FILL: the sibling endpoints land in this node's settings with zero
+    // operator input. A revoked node receives an empty list, so peers it
+    // previously learned are actively cleared rather than left lingering.
+    const stored = dispatcher.applyIncomingSiblings(allowP2p ? siblings : []);
+    res.json({
+      success: true,
+      p2pEnabled: allowP2p,
+      peers: stored,
+      peersCleared: !allowP2p,
+      message: allowP2p
+        ? `Auto-provisioned ${stored.length} sibling endpoint(s).`
+        : "P2P revoked — report to the Master only.",
+    });
+  });
+
+  // POST /api/mesh/result — Satellite reports a finished task.
+  app.post("/api/mesh/result", (req: Request, res: Response) => {
+    if (!dispatcher.authenticate(meshKeyOf(req))) {
+      res.status(401).json({ success: false, message: "Invalid or missing mesh key." });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    dispatcher.completeTask(
+      normalizeNodeCode(body["nodeCode"]),
+      String(body["taskId"] ?? ""),
+      String(body["outcome"] ?? "success") as TaskOutcome,
+    );
+    res.json({ success: true });
+  });
+
+  // POST /api/mesh/peer-outcome — Satellite reports a sibling exchange result.
+  // Feeds the adaptive fallback (a high failure ratio revokes P2P).
+  app.post("/api/mesh/peer-outcome", (req: Request, res: Response) => {
+    if (!dispatcher.authenticate(meshKeyOf(req))) {
+      res.status(401).json({ success: false, message: "Invalid or missing mesh key." });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    dispatcher.reportPeerOutcome(
+      normalizeNodeCode(body["nodeCode"]),
+      String(body["outcome"] ?? "failure") as TaskOutcome,
+    );
+    res.json({ success: true });
+  });
+
+  // POST /api/mesh/pair-with-master — Satellite-side one-time pairing action.
+  app.post("/api/mesh/pair-with-master", requireDashboardAuth, async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const target = String(body["masterUrl"] ?? "").trim();
+    if (!target) {
+      res.status(400).json({ success: false, message: "masterUrl is required." });
+      return;
+    }
+    try {
+      const result = await dispatcher.pairWithMaster(target);
+      res.json({
+        success: true,
+        message: `Paired with Master ${result.masterCode}. Networking is now managed automatically.`,
+        masterCode: result.masterCode,
+      });
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        message: `Pairing failed — ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  });
+
+  // GET /api/mesh/snapshot — everything the Control Center renders.
+  app.get("/api/mesh/snapshot", requireDashboardAuth, (_req: Request, res: Response) => {
+    res.json({ success: true, ...dispatcher.getSnapshot() });
+  });
+
+  // GET /api/mesh/satellite/:code — detail payload for the modal.
+  app.get("/api/mesh/satellite/:code", requireDashboardAuth, (req: Request, res: Response) => {
+    const detail = dispatcher.getSatellite(String(req.params["code"] ?? ""));
+    if (!detail) {
+      res.status(404).json({ success: false, message: "Unknown satellite." });
+      return;
+    }
+    res.json({ success: true, satellite: detail });
+  });
+
+  // POST /api/mesh/task — Master assigns a shared task (auto-provisions P2P).
+  app.post("/api/mesh/task", requireDashboardAuth, async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const load = String(body["load"] ?? "normal") as LoadClass;
+    if (!["heavy", "normal", "lite"].includes(load)) {
+      res.status(400).json({ success: false, message: "load must be heavy, normal or lite." });
+      return;
+    }
+    const assignees = Array.isArray(body["assignees"]) ? (body["assignees"] as string[]) : undefined;
+    try {
+      const task = await dispatcher.assignSharedTask({
+        label: String(body["label"] ?? "Shared swarm task"),
+        load,
+        ...(assignees ? { assignees } : {}),
+      });
+      res.json({ success: true, task });
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // POST /api/mesh/satellite/:code/restore-p2p — undo an adaptive revocation.
+  app.post("/api/mesh/satellite/:code/restore-p2p", requireDashboardAuth, (req: Request, res: Response) => {
+    dispatcher.restoreP2p(String(req.params["code"] ?? ""));
+    res.json({ success: true });
+  });
+
+  // GET /api/mesh/identity — this node's permanent code (shown in the UI).
+  app.get("/api/mesh/identity", requireDashboardAuth, (_req: Request, res: Response) => {
+    const identity = ensureNodeIdentity();
+    res.json({
+      success: true,
+      nodeCode: identity.code,
+      createdAt: identity.createdAt,
+      nodeName: env.NODE_NAME,
+      role: env.NODE_ROLE,
+      pairing: getPairing(),
+    });
+  });
+
   // Local Web GUI — static Settings UI from public/.
   const publicDir = resolvePublicDir();
   if (publicDir) {
     app.use(express.static(publicDir));
     app.get("/", (_req: Request, res: Response) => {
       res.sendFile(path.join(publicDir, "index.html"));
+    });
+    // The Master Control Center is a dedicated view; the setup/lock screens in
+    // index.html stay exactly as they were. A missing file falls through to the
+    // Setup screen rather than a hard 404.
+    app.get("/dashboard", (_req: Request, res: Response) => {
+      const dashboardFile = path.join(publicDir, "dashboard.html");
+      if (fs.existsSync(dashboardFile)) {
+        res.sendFile(dashboardFile);
+        return;
+      }
+      res.redirect("/");
     });
     console.log(`[API] Serving Local Web GUI from ${publicDir}`);
   } else {

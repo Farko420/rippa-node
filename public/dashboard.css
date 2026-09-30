@@ -1,0 +1,93 @@
+/* ==========================================================================
+   MASTER CONTROL CENTER — companion styles for dashboard.html
+   Loaded after styles.css so it can override the single-column setup layout.
+   ========================================================================== */
+.cc-body { display:block; padding:0; }
+.cc-shell { max-width:1200px; margin:0 auto; padding:24px 24px 60px; }
+
+.cc-header { display:flex; align-items:center; gap:12px; margin-bottom:22px; flex-wrap:wrap; }
+.cc-head-text { flex:1; min-width:200px; }
+.cc-code { display:flex; flex-direction:column; align-items:flex-end; gap:2px;
+  border:1px dashed var(--line); border-radius:10px; padding:6px 12px; }
+.cc-code-label { font-size:10px; letter-spacing:.14em; color:var(--mut); }
+.cc-code code { font-size:15px; font-weight:700; color:var(--acc); }
+
+/* Summary tiles */
+.cc-stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:18px; }
+.tile { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+.tile-label { display:block; font-size:11px; letter-spacing:.1em; color:var(--mut); text-transform:uppercase; }
+.tile strong { display:block; margin-top:6px; font-size:26px; }
+.tile strong.ok { color:var(--ok); } .tile strong.warn { color:var(--warn); }
+
+/* Control bar */
+.cc-control { display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap; }
+.cc-control input { flex:2 1 260px; }
+.cc-control select { flex:0 0 120px; }
+.cc-run { width:auto; flex:0 0 auto; padding:11px 20px; font-size:14px; }
+
+/* Layout */
+.cc-main { display:grid; grid-template-columns:1fr; gap:18px; }
+@media (min-width:900px){ .cc-main { grid-template-columns:1.35fr 1fr; } }
+.cc-panel { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:20px; }
+.cc-panel h2 { margin:0 0 4px; font-size:17px; }
+.cc-panel .hint { margin:0 0 14px; }
+.cc-empty { color:var(--mut); font-size:13px; padding:18px; text-align:center;
+  border:1px dashed var(--line); border-radius:12px; }
+/* Topology grid */
+.cc-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(168px,1fr)); gap:12px; }
+.node-card { background:#0d1117; border:1px solid var(--line); border-radius:12px; padding:12px;
+  cursor:pointer; transition:transform .12s ease, border-color .12s ease; text-align:left;
+  color:var(--txt); font:inherit; }
+.node-card:hover { transform:translateY(-2px); border-color:var(--acc); }
+.node-card:focus-visible { outline:2px solid var(--acc); outline-offset:2px; }
+.node-card.offline { opacity:.55; }
+/* Left edge carries the shared-task colour so collaborating nodes match. */
+.node-accent { height:4px; border-radius:4px; margin:-12px -12px 10px; background:var(--line); }
+.node-card.busy .node-accent { background:var(--acc); }
+.node-card.revoked .node-accent { background:var(--warn); }
+.node-top { display:flex; align-items:center; gap:6px; }
+.node-dot { width:8px; height:8px; border-radius:50%; background:var(--mut); flex:none; }
+.node-dot.on { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+.node-name { font-weight:700; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.node-code { font-size:11px; color:var(--mut); margin-top:2px; }
+.node-task { margin-top:8px; font-size:11px; color:var(--acc); overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
+.node-badges { display:flex; gap:4px; margin-top:8px; flex-wrap:wrap; }
+.badge { font-size:10px; padding:2px 7px; border-radius:999px; border:1px solid var(--line); color:var(--mut); }
+.badge.p2p { border-color:var(--ok); color:var(--ok); }
+.badge.relay { border-color:var(--warn); color:var(--warn); }
+.badge.busy { border-color:var(--acc); color:var(--acc); }
+
+/* Active processes — grouped shared tasks with connecting links */
+.cc-proc-list { display:flex; flex-direction:column; gap:12px; }
+.proc { border:1px solid var(--line); border-radius:12px; padding:12px; background:#0d1117; }
+.proc-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.proc-swatch { width:10px; height:10px; border-radius:3px; flex:none; }
+.proc-label { font-weight:700; font-size:13px; }
+.proc-meta { margin-left:auto; font-size:11px; color:var(--mut); }
+/* Sibling nodes in a shared task sit on a linked rail. */
+.proc-chain { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:10px;
+  padding-top:10px; border-top:1px dashed var(--line); }
+.proc-node { font-size:11px; padding:4px 9px; border-radius:8px; border:1px solid currentColor; }
+.proc-link { color:var(--mut); font-size:11px; }
+.proc-revoke { margin-top:8px; font-size:11px; color:var(--warn); }
+
+/* Detail modal */
+.cc-modal-card { width:min(520px,100%); text-align:left; position:relative; max-height:90vh; overflow:auto; }
+.cc-modal-card > .logo.big, .cc-modal-card > h1, .cc-modal-card > .sub { text-align:center; }
+.cc-modal-x { position:absolute; top:14px; right:14px; width:32px; height:32px; border-radius:8px;
+  border:1px solid var(--line); background:#0d1117; color:var(--txt); cursor:pointer; font-size:14px; }
+.cc-modal-body { margin-top:18px; display:flex; flex-direction:column; gap:16px; }
+.metric-block { border:1px solid var(--line); border-radius:12px; padding:14px; background:#0d1117; }
+.metric-block h3 { margin:0 0 10px; font-size:12px; letter-spacing:.1em; text-transform:uppercase; color:var(--mut); }
+.metric-line { margin:0 0 8px; font-size:14px; }
+.bar { height:8px; border-radius:999px; background:#0006; overflow:hidden; }
+.bar-fill { height:100%; border-radius:999px; background:var(--acc); transition:width .3s ease; }
+.bar-fill.heavy { background:#f85149; } .bar-fill.normal { background:var(--acc); } .bar-fill.lite { background:var(--ok); }
+.load-row { display:grid; grid-template-columns:56px 1fr 46px; align-items:center; gap:10px; margin-bottom:8px; font-size:12px; }
+.load-row span:last-child { text-align:right; color:var(--mut); }
+.score-row { display:flex; align-items:center; gap:14px; }
+.score-ring { width:64px; height:64px; border-radius:50%; display:flex; align-items:center;
+  justify-content:center; font-size:22px; font-weight:800; border:3px solid var(--ok);
+  background:#0d1117; flex:none; }
+.cc-restore { margin-top:10px; width:100%; }

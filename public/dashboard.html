@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+<title>Rippa Node — Master Control Center</title>
+<style>
+  /* Anti-flicker: the shell renders a static "connecting" state on first paint
+     and app.js swaps in the live view only after /api/mesh/snapshot resolves. */
+  [hidden] { display: none !important; }
+</style>
+<link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="dashboard.css" />
+</head>
+<body class="cc-body">
+<div class="bg"></div>
+
+<!-- SHELL — visible immediately so the page is never blank while polling. -->
+<div id="ccApp" class="cc-shell" hidden>
+  <header class="cc-header">
+    <div class="logo">◈</div>
+    <div class="cc-head-text">
+      <h1>Master Control Center</h1>
+      <p class="sub" id="ccSub">Live swarm topology</p>
+    </div>
+    <div class="cc-code" title="This node's permanent code — pair a Satellite with it once.">
+      <span class="cc-code-label">NODE CODE</span>
+      <code id="ccNodeCode">—</code>
+    </div>
+    <a id="ccSetupLink" class="ghost" href="/">⚙ Setup</a>
+    <button id="ccLock" type="button" class="ghost">🔒 Lock</button>
+  </header>
+
+  <!-- SUMMARY TILES -->
+  <section class="cc-stats">
+    <div class="tile"><span class="tile-label">Satellites</span><strong id="statTotal">0</strong></div>
+    <div class="tile"><span class="tile-label">Online</span><strong id="statOnline" class="ok">0</strong></div>
+    <div class="tile"><span class="tile-label">Running</span><strong id="statBusy">0</strong></div>
+    <div class="tile"><span class="tile-label">P2P Revoked</span><strong id="statRevoked" class="warn">0</strong></div>
+    <div class="tile"><span class="tile-label">Avg Efficiency</span><strong id="statEff">—</strong></div>
+  </section>
+
+  <!-- CONTROL BAR: dispatch a shared task (the Master auto-provisions P2P). -->
+  <section class="cc-control">
+    <input id="taskLabel" type="text" placeholder="Shared task — e.g. verify Lamington NP facts" />
+    <select id="taskLoad" aria-label="Task load">
+      <option value="lite">Lite</option>
+      <option value="normal" selected>Normal</option>
+      <option value="heavy">Heavy</option>
+    </select>
+    <button id="taskRun" type="button" class="save cc-run">▶ Assign to Swarm</button>
+  </section>
+  <div id="ccAlert" class="alert hidden"></div>
+
+  <main class="cc-main">
+    <!-- SWARM TOPOLOGY -->
+    <section class="cc-panel">
+      <h2>Swarm Topology</h2>
+      <p class="hint">Click a node for its performance detail.</p>
+      <div id="topology" class="cc-grid"></div>
+      <p id="topologyEmpty" class="cc-empty">
+        No satellites paired yet. On a new node open its dashboard, choose
+        <strong>Satellite</strong>, enter this Master&rsquo;s node code or IP once — pairing is all that is required.
+      </p>
+    </section>
+
+    <!-- ACTIVE PROCESSES -->
+    <section class="cc-panel">
+      <h2>Active Processes</h2>
+      <p class="hint">Nodes on the same task share a colour and are linked together.</p>
+      <div id="processes" class="cc-proc-list"></div>
+      <p id="processesEmpty" class="cc-empty">No shared tasks running.</p>
+    </section>
+  </main>
+</div>
+
+<!-- CONNECTING SHELL — the only element painted before the first snapshot. -->
+<div id="ccBoot" class="lock">
+  <div class="lock-card">
+    <div class="logo big">◈</div>
+    <h1>Master Control Center</h1>
+    <p class="sub" id="ccBootSub">Connecting to the swarm…</p>
+  </div>
+</div>
+
+<!-- SATELLITE DETAIL MODAL -->
+<div id="ccModal" class="lock" hidden>
+  <div class="lock-card cc-modal-card">
+    <button id="ccModalClose" type="button" class="cc-modal-x" title="Close">✕</button>
+    <div class="logo big" id="ccModalLogo">🛰</div>
+    <h1 id="ccModalName">Satellite</h1>
+    <p class="sub" id="ccModalCode">—</p>
+
+    <div class="cc-modal-body">
+      <!-- Current task & progress -->
+      <div class="metric-block">
+        <h3>Current Task</h3>
+        <p id="mTask" class="metric-line">Idle</p>
+        <div class="bar"><div id="mBar" class="bar-fill" style="width:0%"></div></div>
+        <p id="mTaskMeta" class="hint">—</p>
+      </div>
+
+      <!-- Efficiency -->
+      <div class="metric-block">
+        <h3>Efficiency Score</h3>
+        <div class="score-row">
+          <div class="score-ring" id="mScoreRing"><span id="mScore">0</span></div>
+          <p class="hint" id="mScoreNote">Uptime + successful task completion.</p>
+        </div>
+      </div>
+
+      <!-- Load handling -->
+      <div class="metric-block">
+        <h3>Load Handling</h3>
+        <div class="load-row"><span>Heavy</span><div class="bar"><div class="bar-fill heavy" id="mHeavy"></div></div><span id="mHeavyVal">—</span></div>
+        <div class="load-row"><span>Normal</span><div class="bar"><div class="bar-fill normal" id="mNormal"></div></div><span id="mNormalVal">—</span></div>
+        <div class="load-row"><span>Lite</span><div class="bar"><div class="bar-fill lite" id="mLite"></div></div><span id="mLiteVal">—</span></div>
+      </div>
+
+      <!-- Problem solving -->
+      <div class="metric-block">
+        <h3>Problem Solving Rate</h3>
+        <p class="metric-line"><strong id="mPsa">0%</strong></p>
+        <p id="mPsaNote" class="hint">Captcha / retry loops resolved without failing the task.</p>
+      </div>
+
+      <!-- Networking -->
+      <div class="metric-block">
+        <h3>Networking</h3>
+        <p class="hint" id="mNet">—</p>
+        <button id="mRestoreP2p" type="button" class="ghost cc-restore" hidden>Restore P2P</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="dashboard.js"></script>
+</body>
+</html>

@@ -27,7 +27,7 @@ async function main(): Promise<void> {
   const { env, reloadEnv } = configModule;
   const { closeDeepBrain, initializeDeepBrain } = require("./db/database") as typeof import("./db/database");
   const serverModule = require("./server") as typeof import("./server");
-  const { startServer, onConfigChange } = serverModule;
+  const { startServer, onConfigChange, getDispatcher } = serverModule;
   const { SwarmClient } = require("./network/SwarmClient") as typeof import("./network/SwarmClient");
   const { SyncManager } = require("./network/SyncManager") as typeof import("./network/SyncManager");
   const { Orchestrator } = require("./agent/Orchestrator") as typeof import("./agent/Orchestrator");
@@ -51,6 +51,12 @@ async function main(): Promise<void> {
   // --- 2. Always: local API + Web GUI. Master-only: Deep Brain. ---
   let httpServer: import("node:http").Server | null = null;
   httpServer = startServer();
+
+  // The Rippa Node AI is owned by the server module (the API routes and the
+  // boot sequence share one registry) and started for BOTH roles: a Master
+  // monitors its satellites, a Satellite polls for work.
+  const dispatcher = getDispatcher();
+  dispatcher.start();
   let deepBrainOpen = false;
   const openDeepBrain = (): void => {
     if (env.NODE_ROLE === "master") {
@@ -95,6 +101,7 @@ async function main(): Promise<void> {
 
   const stopNodeServices = async (): Promise<void> => {
     beacon.stop(); // release the UDP discovery port before rebinding
+    dispatcher.stop();
     if (orchestrator) {
       await orchestrator.stop();
       orchestrator = null;
@@ -123,6 +130,9 @@ async function main(): Promise<void> {
       deepBrainOpen = false;
     }
     startNodeServices();
+    // The dispatcher reads NODE_ROLE, so a role change must restart it with the
+    // new mode (Master monitor loop vs. Satellite poll loop).
+    dispatcher.start();
     console.log("[Boot] Re-initialization complete.");
   });
 

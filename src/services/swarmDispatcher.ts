@@ -1,0 +1,1026 @@
+import crypto from "node:crypto";
+
+import axios from "axios";
+import { env } from "../config";
+import { localIPv4 } from "../network/discovery";
+import {
+  applyPeerProvision,
+  ensureNodeIdentity,
+  getMeshKey,
+  getPairing,
+  isValidNodeCode,
+  listPeers,
+  normalizeNodeCode,
+  p2pEnabled,
+  peerCandidateUrls,
+  saveMeshKey,
+  savePairing,
+  selfEndpoint,
+  setP2pEnabled,
+  verifyMeshKey,
+  type PeerEndpoint,
+} from "../config/nodeAuth";
+
+/**
+ * RIPPA NODE AI — AUTO-PROVISIONING & P2P ROUTING.
+ *
+ * This is the brain that makes the mesh "zero-config": once a Satellite has
+ * been paired (one time), the Master is solely responsible for telling it what
+ * to do and who else is on the job.
+ *
+ * Responsibilities:
+ *  1. REGISTRATION — accept a Satellite's pairing handshake, issue the mesh
+ *     key, and remember the node (code, name, IP, port, cloud link URLs).
+ *  2. AUTO-PROVISIONING — when a shared task is assigned to N Satellites, push
+ *     a network payload to each one containing every SIBLING's IP, port and
+ *     Cloud Link URLs. Satellites auto-fill this into their own settings, so
+ *     they form a direct LAN/internet mesh with no operator input.
+ *  3. ADAPTIVE FALLBACK — the Master watches real P2P collaboration results.
+ *     When the error/timeout rate between siblings crosses a threshold it
+ *     REVOKES the P2P flag and forces those nodes to report exclusively back
+ *     to the Master, so a flaky peer link degrades instead of stalling.
+ *  4. TELEMETRY — per-node performance metrics backing the Master Control
+ *     Center UI (efficiency, load handling, problem-solving rate).
+ *
+ * Roles:
+ *  - MASTER    owns the registry, assigns tasks, monitors P2P health.
+ *  - SATELLITE polls the Master for assignments, executes them, reports back.
+ *
+ * The dispatcher speaks plain HTTP+JSON over sibling `/api/mesh/*` endpoints,
+ * so it works identically on the LAN and over the internet via Cloud Link.
+ */
+
+// --- TUNING KNOBS -----------------------------------------------------------
+
+/** How often a Satellite polls its Master for new assignments. */
+const POLL_INTERVAL_MS = 10_000;
+/** How often the Master re-checks satellite liveness. */
+const MONITOR_INTERVAL_MS = 15_000;
+/** Per-request timeout when talking to a sibling or the Master. */
+const MESH_HTTP_TIMEOUT_MS = 8_000;
+/** A satellite silent for this long is marked offline in the UI. */
+const SATELLITE_OFFLINE_AFTER_MS = 45_000;
+
+/**
+ * Adaptive fallback thresholds. When the failure ratio of a node's recent P2P
+ * exchanges exceeds P2P_FAILURE_RATIO_LIMIT, the Master revokes its P2P flag.
+ */
+const P2P_WINDOW_SIZE = 20;
+/** Fraction (0-1) of failed/timeout P2P exchanges that triggers revocation. */
+const P2P_FAILURE_RATIO_LIMIT = 0.4;
+/** Never revoke below this sample count (prevents noise-driven flapping). */
+const P2P_MIN_SAMPLES = 4;
+/** Finished tasks retained for history before the oldest are pruned. */
+const MAX_RETAINED_TASKS = 50;
+
+/** Efficiency score weights (must total 1). */
+const W_UPTIME = 0.4;
+const W_SUCCESS = 0.6;
+
+/** Load buckets reported per satellite. */
+export type LoadClass = "heavy" | "normal" | "lite";
+
+/** Outcome of a single task attempt as reported by a node. */
+export type TaskOutcome = "success" | "failure" | "timeout";
+
+/** A task the Master hands to one or more Satellites. */
+export interface SwarmAssignment {
+  id: string;
+  label: string;
+  load: LoadClass;
+  /** Node codes participating in this shared task. */
+  assignees: string[];
+  /** True while the nodes may collaborate directly; false after revocation. */
+  p2p: boolean;
+  createdAt: string;
+  /** ISO timestamp when the Master revoked P2P for this task. */
+  p2pRevokedAt?: string;
+  /** Human-readable reason recorded when P2P was revoked. */
+  p2pRevokeReason?: string;
+}
+
+/** Rolling P2P health between the Master and one satellite. */
+export interface P2pHealth {
+  attempts: number;
+  failures: number;
+  timeouts: number;
+  /** True once the Master revoked P2P for this node. */
+  revoked: boolean;
+  revokedReason?: string;
+}
+
+/** Performance counters for one node, as shown in the detail modal. */
+export interface NodeMetrics {
+  tasksSucceeded: number;
+  tasksFailed: number;
+  tasksTimedOut: number;
+  /** Successes per load bucket. */
+  loadSuccess: Record<LoadClass, number>;
+  /** Attempts per load bucket (success rate derives from these). */
+  loadAttempts: Record<LoadClass, number>;
+  /** Challenges (captcha / retry loop) encountered. */
+  challenges: number;
+  /** Challenges resolved without human help. */
+  challengesResolved: number;
+  /** Uptime in seconds, accumulated between heartbeats. */
+  uptimeSeconds: number;
+  lastStatus: "idle" | "busy";
+  lastSeenAt: string;
+  registeredAt: string;
+}
+
+/** A satellite as known by the Master. */
+export interface SatelliteRecord {
+  nodeCode: string;
+  nodeName: string;
+  endpoint: PeerEndpoint;
+  /** Whether the Master currently allows direct P2P with this node. */
+  p2pEnabled: boolean;
+  /** Task currently executing (null when idle). */
+  currentTask: SwarmAssignment | null;
+  /** Task ids completed since registration. */
+  completedTaskIds: string[];
+  p2pHealth: P2pHealth;
+  metrics: NodeMetrics;
+}
+
+/** Result of the Satellite's one-time pairing handshake. */
+export interface PairingResult {
+  /** Mesh key issued by the Master and persisted by the Satellite. */
+  meshKey: string;
+  /** The Master's endpoint (IP/port/Cloud Link) for later heartbeats. */
+  masterEndpoint: PeerEndpoint;
+  /** The Master's permanent node code. */
+  masterCode: string;
+}
+// --- METRICS MATH -----------------------------------------------------------
+
+/** Safe ratio helper: returns 0 (not NaN) when the denominator is 0. */
+function ratio(part: number, whole: number): number {
+  return whole > 0 ? part / whole : 0;
+}
+
+/** Clamp helper — keeps NaN out of every score. */
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(1, Math.max(0, value));
+}
+
+/** Fresh, zeroed metrics for a newly registered node. */
+export function emptyMetrics(): NodeMetrics {
+  return {
+    tasksSucceeded: 0,
+    tasksFailed: 0,
+    tasksTimedOut: 0,
+    loadSuccess: { heavy: 0, normal: 0, lite: 0 },
+    loadAttempts: { heavy: 0, normal: 0, lite: 0 },
+    challenges: 0,
+    challengesResolved: 0,
+    uptimeSeconds: 0,
+    lastStatus: "idle",
+    lastSeenAt: new Date().toISOString(),
+    registeredAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * EFFICIENCY SCORE (0-100).
+ *
+ * Weighted blend of two measurable signals:
+ *  - uptime share (heartbeat coverage since registration), weight 0.4
+ *  - task success rate (successes / all attempts), weight 0.6
+ *
+ * A node that has never completed a task still scores on uptime alone, so a
+ * freshly paired satellite is not shown as 0 and flagged "broken".
+ */
+export function efficiencyScore(metrics: NodeMetrics): number {
+  const now = Date.now();
+  const registered = Date.parse(metrics.registeredAt) || now;
+  const lastSeen = Date.parse(metrics.lastSeenAt) || now;
+  const elapsedSeconds = Math.max(1, (lastSeen - registered) / 1000);
+  const uptimeShare = clamp01(ratio(metrics.uptimeSeconds, elapsedSeconds));
+  const attempts = metrics.tasksSucceeded + metrics.tasksFailed + metrics.tasksTimedOut;
+  const successShare = ratio(metrics.tasksSucceeded, attempts);
+  const score = 100 * (W_UPTIME * uptimeShare + W_SUCCESS * successShare);
+  return Math.round(clamp01(score / 100) * 100);
+}
+
+/**
+ * PROBLEM SOLVING RATE (0-100).
+ *
+ * How often a node clears a captcha / retry loop on its own rather than failing
+ * the task. With no challenges recorded the answer is 100 ("nothing to solve
+ * yet") rather than a division error.
+ */
+export function problemSolvingRate(metrics: NodeMetrics): number {
+  if (metrics.challenges <= 0) return 100;
+  return Math.round(clamp01(ratio(metrics.challengesResolved, metrics.challenges)) * 100);
+}
+
+/** LOAD HANDLING — combined success rate across all load buckets (0-100). */
+export function loadHandlingScore(metrics: NodeMetrics): number {
+  const classes: LoadClass[] = ["heavy", "normal", "lite"];
+  const attempted = classes.reduce((sum, key) => sum + metrics.loadAttempts[key], 0);
+  if (attempted <= 0) return 100;
+  const succeeded = classes.reduce((sum, key) => sum + metrics.loadSuccess[key], 0);
+  return Math.round(clamp01(ratio(succeeded, attempted)) * 100);
+}
+
+// --- HTTP HELPER ------------------------------------------------------------
+
+/** Uniform result of one mesh HTTP call, so P2P health can be scored. */
+type MeshCallResult =
+  | { ok: true; data: Record<string, unknown> }
+  | { ok: false; timedOut: boolean; reason: string };
+
+/**
+ * POSTs `body` to `<base><path>` with the mesh key attached, trying each URL in
+ * `urls` in order (LAN first, then Cloud Link) and returning the first success.
+ *
+ * Failure on every candidate is reported as ONE result, so the Master's
+ * adaptive monitor sees one message per logical peer exchange rather than one
+ * per route attempted.
+ */
+export async function meshPost(
+  urls: string[],
+  path: string,
+  body: Record<string, unknown>,
+  meshKey: string,
+  timeoutMs = MESH_HTTP_TIMEOUT_MS,
+): Promise<MeshCallResult> {
+  let lastReason = "no reachable endpoint";
+  let lastTimedOut = false;
+  for (const base of urls) {
+    if (!base) continue;
+    try {
+      const response = await axios.post(`${base.replace(/\/+$/, "")}${path}`, body, {
+        timeout: timeoutMs,
+        headers: { "Content-Type": "application/json", "X-Mesh-Key": meshKey },
+      });
+      const data = (response.data ?? {}) as Record<string, unknown>;
+      if (data.success === false) {
+        lastReason = String(data.message || "peer rejected the payload");
+        continue;
+      }
+      return { ok: true, data };
+    } catch (error) {
+      lastTimedOut =
+        axios.isAxiosError(error) &&
+        (error.code === "ECONNABORTED" || /timeout/i.test(error.message));
+      lastReason = error instanceof Error ? error.message : String(error);
+    }
+  }
+  return { ok: false, timedOut: lastTimedOut, reason: lastReason };
+}
+
+// --- DISPATCHER -------------------------------------------------------------
+
+/**
+ * In-process registry + task engine for the mesh.
+ *
+ * The Master keeps the authoritative {@link SatelliteRecord} map in memory
+ * (rebuilt from Satellite heartbeats after a restart). Satellites own a single
+ * assignment slot and a peer list, both filled automatically by the Master.
+ */
+export class SwarmDispatcher {
+  /** Master-only: nodeCode -> record. */
+  private readonly registry = new Map<string, SatelliteRecord>();
+  /** Master-only: taskId -> assignment. */
+  private readonly tasks = new Map<string, SwarmAssignment>();
+  /** Master-only: the mesh key issued to every paired Satellite. */
+  private meshKey = "";
+  /** Master-only: the self endpoint advertised to satellites. */
+  private masterEndpoint: PeerEndpoint | null = null;
+
+  /** Any role: the single assignment this node is currently executing. */
+  private activeAssignment: SwarmAssignment | null = null;
+  /** Any role: how the active assignment is actually being executed. */
+  private reportingMode: "p2p" | "master-relay" = "p2p";
+  /** Any role: metrics this node reports about its own work. */
+  private localMetrics: NodeMetrics = emptyMetrics();
+  /** Any role: last instant a heartbeat landed. */
+  private lastHeartbeatAt = 0;
+
+  private monitorTimer: NodeJS.Timeout | null = null;
+  private pollTimer: NodeJS.Timeout | null = null;
+  private running = false;
+
+  /** The permanent code identifying this node on the mesh. */
+  get nodeCode(): string {
+    return ensureNodeIdentity().code;
+  }
+
+  /** True when this instance is running as the Master. */
+  get isMaster(): boolean {
+    return env.NODE_ROLE === "master";
+  }
+
+  /** The assignment this node is currently running (null when idle). */
+  getActiveAssignment(): SwarmAssignment | null {
+    return this.activeAssignment;
+  }
+
+  /** How this node is reporting its current work ("p2p" | "master-relay"). */
+  getReportingMode(): "p2p" | "master-relay" {
+    return this.reportingMode;
+  }
+
+  /** Metrics for THIS node, as it reports them upward. */
+  getLocalMetrics(): NodeMetrics {
+    return this.localMetrics;
+  }
+
+  /** Starts the loop appropriate to this node's role (idempotent). */
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    ensureNodeIdentity();
+
+    if (this.isMaster) {
+      // The mesh key is minted once and handed to every Satellite at pairing
+      // time; it authenticates all sibling traffic afterwards.
+      if (!this.meshKey) this.meshKey = `mesh-${crypto.randomUUID()}`;
+      this.masterEndpoint = selfEndpoint(localIPv4());
+      this.monitorTimer = setInterval(() => void this.runMonitorCycle(), MONITOR_INTERVAL_MS);
+      this.monitorTimer.unref?.();
+      console.log(
+        `[Swarm] Rippa Node AI active (MASTER) — monitoring every ${MONITOR_INTERVAL_MS / 1000}s.`,
+      );
+    } else {
+      this.pollTimer = setInterval(() => void this.runSatelliteCycle(), POLL_INTERVAL_MS);
+      this.pollTimer.unref?.();
+      console.log(
+        `[Swarm] Rippa Node AI active (SATELLITE) — polling Master every ${POLL_INTERVAL_MS / 1000}s.`,
+      );
+    }
+  }
+
+  /** Stops the background loop. Safe to call repeatedly. */
+  stop(): void {
+    this.running = false;
+    if (this.monitorTimer) {
+      clearInterval(this.monitorTimer);
+      this.monitorTimer = null;
+    }
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+  }
+
+  /** The mesh key used for node-to-node calls (Master: issues it). */
+  getMeshKeyOrEmpty(): string {
+    return this.meshKey || getMeshKey();
+  }
+
+  /** True when the presented key matches this node's mesh key. */
+  authenticate(candidate: string | undefined): boolean {
+    return this.isMaster
+      ? Boolean(this.meshKey) && this.meshKey === candidate
+      : verifyMeshKey(candidate);
+  }
+
+  /** The endpoint this node advertises to its peers. */
+  getSelfEndpoint(): PeerEndpoint {
+    return selfEndpoint(localIPv4());
+  }
+
+  /** The Master's own endpoint (falls back to the live LAN address). */
+  private selfEndpoint(): PeerEndpoint {
+    return this.masterEndpoint ?? selfEndpoint(localIPv4());
+  }
+// =========================================================================
+  // MASTER — REGISTRATION (the one-time pairing handshake)
+  // =========================================================================
+
+  /**
+   * MASTER: registers (or refreshes) a Satellite and returns the mesh key plus
+   * the Master's own endpoint.
+   *
+   * This is the ONLY interaction an operator ever performs. The Satellite sends
+   * its permanent node code and address once; everything after this — routing,
+   * P2P provisioning, monitoring — is driven by the Master.
+   */
+  registerSatellite(input: {
+    nodeCode: string;
+    nodeName: string;
+    ipAddress?: string;
+    port?: number;
+    cloudLinkUrl?: string;
+  }): { record: SatelliteRecord; meshKey: string; masterEndpoint: PeerEndpoint } {
+    const nodeCode = normalizeNodeCode(input.nodeCode);
+    if (!isValidNodeCode(nodeCode)) {
+      throw new Error("A valid rippa_node_code is required to pair (format RIPPA-XXXX-XXXX).");
+    }
+    if (!this.isMaster) throw new Error("Only a Master node can register satellites.");
+    if (!this.meshKey) this.meshKey = `mesh-${crypto.randomUUID()}`;
+
+    const ip = (input.ipAddress || "").trim();
+    const port = Number(input.port) || env.PORT;
+    const endpoint: PeerEndpoint = {
+      nodeCode,
+      nodeName: (input.nodeName || nodeCode).slice(0, 60),
+      ipAddress: ip,
+      port,
+      lanUrl: `http://${ip || "127.0.0.1"}:${port}`,
+      cloudLinkUrl: (input.cloudLinkUrl || "").trim(),
+      lastProvisionedAt: new Date().toISOString(),
+    };
+
+    const existing = this.registry.get(nodeCode);
+    if (existing) {
+      existing.nodeName = endpoint.nodeName;
+      existing.endpoint = endpoint;
+      existing.metrics.lastSeenAt = new Date().toISOString();
+      console.log(`[Swarm] Satellite ${nodeCode} (${endpoint.nodeName}) re-registered.`);
+      return { record: existing, meshKey: this.meshKey, masterEndpoint: this.selfEndpoint() };
+    }
+
+    const record: SatelliteRecord = {
+      nodeCode,
+      nodeName: endpoint.nodeName,
+      endpoint,
+      p2pEnabled: true,
+      currentTask: null,
+      completedTaskIds: [],
+      p2pHealth: { attempts: 0, failures: 0, timeouts: 0, revoked: false },
+      metrics: emptyMetrics(),
+    };
+    this.registry.set(nodeCode, record);
+    console.log(`[Swarm] SATELLITE PAIRED: ${endpoint.nodeName} (${nodeCode}) at ${endpoint.lanUrl}`);
+    return { record, meshKey: this.meshKey, masterEndpoint: this.selfEndpoint() };
+  }
+
+  /**
+   * MASTER: the peer payload pushed to each assignee of a shared task.
+   *
+   * This is the "auto-fill" payload: for a task with N assignees, every
+   * assignee receives the IP, port and Cloud Link URLs of the other N-1 nodes.
+   * Satellites apply it automatically and never ask the user for an address.
+   */
+  private buildSiblingPayload(task: SwarmAssignment, forNode: string): PeerEndpoint[] {
+    return task.assignees
+      .filter((code) => code !== forNode)
+      .map((code) => this.registry.get(code)?.endpoint)
+      .filter((endpoint): endpoint is PeerEndpoint => Boolean(endpoint));
+  }
+
+  /**
+   * MASTER: records a Satellite heartbeat and returns its current work.
+   *
+   * One request does everything the Satellite needs each cycle: register (or
+   * refresh), report metrics, receive the assignment, and receive the sibling
+   * endpoints required for P2P collaboration.
+   */
+  handleHeartbeat(input: {
+    nodeCode: string;
+    nodeName: string;
+    ipAddress?: string;
+    port?: number;
+    cloudLinkUrl?: string;
+    metrics?: Partial<NodeMetrics>;
+    p2pEnabled?: boolean;
+  }): { task: SwarmAssignment | null; siblings: PeerEndpoint[]; p2pEnabled: boolean; meshKey: string } {
+    const { record, meshKey } = this.registerSatellite(input);
+    if (input.metrics) {
+      // Trust the node's own counters, but keep the ORIGINAL registration
+      // timestamp so the efficiency score always measures uptime from pairing.
+      record.metrics = {
+        ...record.metrics,
+        ...input.metrics,
+        registeredAt: record.metrics.registeredAt,
+        lastSeenAt: new Date().toISOString(),
+      };
+    }
+    const task = record.currentTask;
+    // CRITICAL: siblings must NOT be returned once P2P is revoked. The satellite
+    // re-applies whatever it is handed on every poll, so leaking the peer list
+    // here would silently undo an adaptive-fallback revocation ~10s later.
+    const allowP2p = record.p2pEnabled && Boolean(task?.p2p);
+    return {
+      task,
+      siblings: task && allowP2p ? this.buildSiblingPayload(task, record.nodeCode) : [],
+      p2pEnabled: allowP2p,
+      meshKey,
+    };
+  }
+// =========================================================================
+  // MASTER — AUTO-PROVISIONING (shared tasks + sibling payload push)
+  // =========================================================================
+
+  /**
+   * MASTER: creates a shared task and pushes the network payload to every
+   * assignee so they auto-connect to each other.
+   *
+   * With no explicit `assignees`, the Master picks the least-busy satellites,
+   * so a single call is enough to put idle capacity to work.
+   */
+  async assignSharedTask(input: {
+    label: string;
+    load: LoadClass;
+    assignees?: string[];
+  }): Promise<SwarmAssignment> {
+    if (!this.isMaster) throw new Error("Only a Master node can assign shared tasks.");
+
+    const explicit = (input.assignees ?? []).map(normalizeNodeCode).filter(isValidNodeCode);
+    const assignees = explicit.filter((code) => this.registry.has(code));
+    const task: SwarmAssignment = {
+      id: `task-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`,
+      label: input.label,
+      load: input.load,
+      assignees: assignees.length > 0 ? assignees : this.selectIdleNodes(2),
+      p2p: true,
+      createdAt: new Date().toISOString(),
+    };
+    this.tasks.set(task.id, task);
+
+    for (const code of task.assignees) {
+      const record = this.registry.get(code);
+      if (record) record.currentTask = task;
+    }
+
+    // Push the auto-provisioning payload to each assignee in parallel.
+    await Promise.all(task.assignees.map((code) => this.provisionToNode(code, task)));
+
+    console.log(
+      `[Swarm] Task "${task.label}" (${task.load}) assigned to ${task.assignees.length} node(s); sibling payloads pushed.`,
+    );
+    return task;
+  }
+
+  /** Picks up to `count` idle satellites, preferring the highest efficiency. */
+  private selectIdleNodes(count: number): string[] {
+    return [...this.registry.values()]
+      .filter((record) => !record.currentTask && record.p2pEnabled)
+      .sort((a, b) => efficiencyScore(b.metrics) - efficiencyScore(a.metrics))
+      .slice(0, count)
+      .map((record) => record.nodeCode);
+  }
+
+  /**
+   * Pushes one node its assignment plus the sibling endpoints it needs.
+   *
+   * The body carries everything required to form a direct mesh with the
+   * co-workers: the task, the sibling IP/port/Cloud Link URLs, the Master
+   * endpoint, and whether P2P is currently allowed.
+   */
+  private async provisionToNode(nodeCode: string, task: SwarmAssignment): Promise<void> {
+    const record = this.registry.get(nodeCode);
+    if (!record) return;
+    // A node whose P2P was revoked receives NO siblings at all — the payload is
+    // emptied so the Satellite physically cannot route around the Master.
+    const siblings = record.p2pEnabled && task.p2p ? this.buildSiblingPayload(task, nodeCode) : [];
+    const result = await meshPost(
+      peerCandidateUrls(record.endpoint),
+      "/api/mesh/assign",
+      {
+        kind: "mesh_assignment",
+        task,
+        siblings,
+        master: this.selfEndpoint(),
+        p2pEnabled: record.p2pEnabled && task.p2p,
+      },
+      this.meshKey,
+    );
+    record.p2pHealth.attempts += 1;
+    if (!result.ok) {
+      record.p2pHealth.failures += 1;
+      if (result.timedOut) record.p2pHealth.timeouts += 1;
+      console.warn(`[Swarm] Provisioning push to ${nodeCode} failed — ${result.reason}`);
+    }
+    // NOTE: a successful push must NOT clear `revoked`. The revocation is a
+    // deliberate routing decision; only restoreP2p() lifts it. Reaching a node
+    // proves nothing about whether its peers are usable.
+  }
+// =========================================================================
+  // MASTER — ADAPTIVE FALLBACK
+  // =========================================================================
+
+  /**
+   * MASTER: records one peer-exchange outcome reported by a Satellite and
+   * re-evaluates whether P2P should stay enabled for it.
+   *
+   * @param nodeCode the reporting Satellite
+   * @param outcome  "success" | "failure" | "timeout" for a sibling exchange
+   */
+  reportPeerOutcome(nodeCode: string, outcome: TaskOutcome): void {
+    const record = this.registry.get(normalizeNodeCode(nodeCode));
+    if (!record) return;
+    record.p2pHealth.attempts += 1;
+    if (outcome === "failure") record.p2pHealth.failures += 1;
+    if (outcome === "timeout") {
+      record.p2pHealth.failures += 1;
+      record.p2pHealth.timeouts += 1;
+    }
+    this.evaluateP2pHealth(record);
+  }
+
+  /**
+   * ADAPTIVE FALLBACK: revokes P2P once the failure ratio breaches the limit,
+   * forcing the affected nodes to report exclusively back to the Master.
+   *
+   * Two guards prevent flapping:
+   *  - at least P2P_MIN_SAMPLES exchanges must have happened, so a single
+   *    unlucky timeout on a brand-new link cannot revoke P2P;
+   *  - once revoked for a running task the Master stays in relay mode until
+   *    that task finishes, so the fleet cannot oscillate mid-run.
+   */
+  private evaluateP2pHealth(record: SatelliteRecord): void {
+    const { attempts, failures } = record.p2pHealth;
+    if (attempts < P2P_MIN_SAMPLES || attempts > P2P_WINDOW_SIZE) return;
+    const failureRatio = ratio(failures, attempts);
+    if (failureRatio < P2P_FAILURE_RATIO_LIMIT) return;
+    if (record.p2pHealth.revoked) return; // already revoked for this task
+
+    record.p2pEnabled = false;
+    record.p2pHealth.revoked = true;
+    record.p2pHealth.revokedReason =
+      `P2P failure ratio ${(failureRatio * 100).toFixed(0)}% over ${attempts} exchanges ` +
+      `(limit ${(P2P_FAILURE_RATIO_LIMIT * 100).toFixed(0)}%) — revoked, node now reports to the Master only.`;
+
+    const task = record.currentTask;
+    if (task) {
+      task.p2p = false;
+      task.p2pRevokedAt = new Date().toISOString();
+      task.p2pRevokeReason = record.p2pHealth.revokedReason;
+      // Re-provision every assignee of this task into master-relay mode.
+      // Siblings must have their OWN p2pEnabled cleared, not just the flag
+      // marked revoked — otherwise the UI would show a node as still able to
+      // reach its peers while it has in fact been emptied of them.
+      for (const code of task.assignees) {
+        const peer = this.registry.get(code);
+        if (peer) {
+          peer.p2pEnabled = false;
+          peer.p2pHealth.revoked = true;
+          peer.p2pHealth.revokedReason = record.p2pHealth.revokedReason;
+        }
+        void this.provisionToNode(code, task);
+      }
+    }
+
+    console.warn(`[Swarm] P2P REVOKED for ${record.nodeCode} — ${record.p2pHealth.revokedReason}`);
+  }
+
+  /** MASTER: manually re-enables P2P for a node and clears the revocation. */
+  restoreP2p(nodeCode: string): void {
+    const record = this.registry.get(normalizeNodeCode(nodeCode));
+    if (!record) return;
+    record.p2pEnabled = true;
+    record.p2pHealth.revoked = false;
+    record.p2pHealth.revokedReason = undefined;
+    record.p2pHealth.failures = 0;
+    record.p2pHealth.timeouts = 0;
+    const task = record.currentTask;
+    if (task) {
+      task.p2p = true;
+      task.p2pRevokedAt = undefined;
+      task.p2pRevokeReason = undefined;
+      void this.provisionToNode(record.nodeCode, task);
+    }
+    console.log(`[Swarm] P2P restored for ${record.nodeCode}.`);
+  }
+
+  /**
+   * MASTER: a Satellite finished a task — records the outcome, clears the
+   * active slot, and re-arms P2P health for the node's next assignment.
+   */
+  completeTask(nodeCode: string, taskId: string, outcome: TaskOutcome): void {
+    const record = this.registry.get(normalizeNodeCode(nodeCode));
+    if (!record) return;
+    const task = record.currentTask;
+    if (!task || task.id !== taskId) return;
+
+    record.metrics.loadAttempts[task.load] += 1;
+    if (outcome === "success") {
+      record.metrics.tasksSucceeded += 1;
+      record.metrics.loadSuccess[task.load] += 1;
+    } else if (outcome === "timeout") {
+      record.metrics.tasksTimedOut += 1;
+    } else {
+      record.metrics.tasksFailed += 1;
+    }
+
+    record.completedTaskIds.push(task.id);
+    record.currentTask = null;
+    record.metrics.lastStatus = "idle";
+    record.metrics.lastSeenAt = new Date().toISOString();
+
+    // Rolling window: reset the counters once the window is exceeded so the
+    // failure ratio always reflects recent behaviour, not all-time history.
+    if (record.p2pHealth.attempts > P2P_WINDOW_SIZE) {
+      record.p2pHealth.attempts = P2P_MIN_SAMPLES;
+      record.p2pHealth.failures = 0;
+      record.p2pHealth.timeouts = 0;
+    }
+
+    this.pruneTasks();
+  }
+
+  /**
+   * Drops the oldest finished tasks once the retention cap is exceeded.
+   * A task is kept while ANY assignee is still running it, so this can never
+   * evict live work from the Master's Active Processes view.
+   */
+  private pruneTasks(): void {
+    if (this.tasks.size <= MAX_RETAINED_TASKS) return;
+    const live = new Set(
+      [...this.registry.values()].map((r) => r.currentTask?.id).filter((id): id is string => Boolean(id)),
+    );
+    for (const [id, task] of this.tasks) {
+      if (this.tasks.size <= MAX_RETAINED_TASKS) break;
+      if (live.has(id)) continue;
+      // No assignee is still on this task, so it is safe to forget.
+      if (!task.assignees.some((code) => this.registry.get(code)?.currentTask?.id === id)) {
+        this.tasks.delete(id);
+      }
+    }
+  }
+// =========================================================================
+  // MASTER — MONITORING & UI SNAPSHOT
+  // =========================================================================
+
+  /**
+   * Periodic Master housekeeping: re-evaluates P2P health for every node, so
+   * the adaptive fallback still reacts when a node has stopped reporting.
+   */
+  private async runMonitorCycle(): Promise<void> {
+    if (!this.isMaster || !this.running) return;
+    for (const record of this.registry.values()) {
+      this.evaluateP2pHealth(record);
+    }
+  }
+
+  /** True when the node has been silent long enough to count as offline. */
+  isOffline(record: SatelliteRecord): boolean {
+    return Date.now() - (Date.parse(record.metrics.lastSeenAt) || 0) > SATELLITE_OFFLINE_AFTER_MS;
+  }
+
+  /**
+   * MASTER CONTROL CENTER SNAPSHOT — everything the topology grid, the active
+   * process list and the satellite detail modal render from.
+   */
+  getSnapshot(): Record<string, unknown> {
+    const satellites = [...this.registry.values()].map((record) => {
+      // Per-bucket success rates; a bucket with no attempts reports 100 so an
+      // unused "heavy" slot never drags the average down.
+      const loadRates: Record<LoadClass, number> = { heavy: 100, normal: 100, lite: 100 };
+      (Object.keys(loadRates) as LoadClass[]).forEach((key) => {
+        const attempts = record.metrics.loadAttempts[key];
+        loadRates[key] =
+          attempts > 0 ? Math.round((record.metrics.loadSuccess[key] / attempts) * 100) : 100;
+      });
+      const attempts = record.p2pHealth.attempts;
+      return {
+        nodeCode: record.nodeCode,
+        nodeName: record.nodeName,
+        endpoint: record.endpoint,
+        online: !this.isOffline(record),
+        p2pEnabled: record.p2pEnabled,
+        p2pRevoked: record.p2pHealth.revoked,
+        p2pRevokeReason: record.p2pHealth.revokedReason ?? null,
+        p2pFailureRate: attempts > 0 ? Math.round((record.p2pHealth.failures / attempts) * 100) : 0,
+        currentTask: record.currentTask,
+        completedTasks: record.completedTaskIds.length,
+        efficiency: efficiencyScore(record.metrics),
+        problemSolvingRate: problemSolvingRate(record.metrics),
+        loadHandling: loadHandlingScore(record.metrics),
+        loadRates,
+        metrics: record.metrics,
+      };
+    });
+
+    const tasks = [...this.tasks.values()].map((task) => ({
+      ...task,
+      // The UI links collaborating nodes with these names, so resolve the
+      // codes to display names here rather than in the browser.
+      assignees: task.assignees.map((code) => {
+        const record = this.registry.get(code);
+        return {
+          nodeCode: code,
+          nodeName: record?.nodeName ?? code,
+          p2pEnabled: record?.p2pEnabled ?? false,
+        };
+      }),
+    }));
+
+    const online = satellites.filter((s) => s.online).length;
+    const avgEfficiency =
+      satellites.length > 0
+        ? Math.round(
+            satellites.reduce((sum, s) => sum + s.efficiency, 0) / satellites.length,
+          )
+        : 100;
+
+    return {
+      nodeCode: this.nodeCode,
+      nodeName: env.NODE_NAME,
+      role: env.NODE_ROLE,
+      // The Master never exposes its own mesh key over the dashboard.
+      meshKey: this.isMaster ? "" : this.getMeshKeyOrEmpty(),
+      pairable: this.isMaster,
+      paired: !this.isMaster && Boolean(getPairing()),
+      masterUrl: getPairing()?.masterUrl ?? "",
+      peers: listPeers(),
+      satellites,
+      tasks,
+      summary: {
+        total: satellites.length,
+        online,
+        busy: satellites.filter((s) => s.currentTask).length,
+        p2pRevoked: satellites.filter((s) => s.p2pRevoked).length,
+        avgEfficiency,
+      },
+    };
+  }
+
+  /** A single satellite's detail record, or null when the code is unknown. */
+  getSatellite(nodeCode: string): Record<string, unknown> | null {
+    const satellites = this.getSnapshot()["satellites"] as Array<Record<string, unknown>>;
+    return satellites.find((entry) => entry["nodeCode"] === normalizeNodeCode(nodeCode)) ?? null;
+  }
+// =========================================================================
+  // SATELLITE — PAIRING, POLLING & REPORTING
+  // =========================================================================
+
+  /**
+   * SATELLITE: performs the ONE-TIME handshake with the Master.
+   *
+   * Sends this node's permanent code and address, receives the mesh key plus
+   * the Master's endpoint, and persists the pairing locally. After this call
+   * the operator never touches networking settings again.
+   */
+  async pairWithMaster(masterUrl: string): Promise<PairingResult> {
+    if (this.isMaster) throw new Error("This node is already a Master.");
+    const base = masterUrl.replace(/\/+$/, "");
+    const self = selfEndpoint(localIPv4());
+
+    const response = await axios.post(
+      `${base}/api/mesh/pair`,
+      {
+        nodeCode: this.nodeCode,
+        nodeName: env.NODE_NAME,
+        ipAddress: self.ipAddress,
+        port: self.port,
+        cloudLinkUrl: self.cloudLinkUrl,
+      },
+      { timeout: MESH_HTTP_TIMEOUT_MS },
+    );
+
+    const data = (response.data ?? {}) as Record<string, unknown>;
+    const meshKey = String(data["meshKey"] ?? "");
+    const masterEndpoint = (data["master"] ?? {}) as PeerEndpoint;
+    // The Master returns its code under `masterCode` (and `nodeCode` for
+    // convention); fall back to the advertised endpoint if neither is present.
+    const masterCode =
+      normalizeNodeCode(data["masterCode"]) ||
+      normalizeNodeCode(data["nodeCode"]) ||
+      normalizeNodeCode(masterEndpoint.nodeCode);
+
+    savePairing({
+      masterCode: normalizeNodeCode(masterCode) || normalizeNodeCode(masterEndpoint.nodeCode),
+      masterUrl: base,
+      cloudLinkUrl: masterEndpoint.cloudLinkUrl ?? "",
+      pairedAt: new Date().toISOString(),
+      p2pEnabled: true,
+    });
+    if (meshKey) saveMeshKey(meshKey, masterCode);
+    setP2pEnabled(true);
+
+    console.log(`[Swarm] Paired with Master at ${base} — zero-config networking is now managed remotely.`);
+    return { meshKey, masterEndpoint, masterCode };
+  }
+
+  /** Satellite cycle: poll the Master for work and report local activity. */
+  private async runSatelliteCycle(): Promise<void> {
+    if (this.isMaster || !this.running) return;
+    try {
+      // Never paired yet — the operator must pair once before this node joins.
+      const pairing = getPairing();
+      if (!pairing) return;
+      await this.pollMaster(pairing);
+    } catch (error) {
+      console.warn(`[Swarm] Mesh poll failed — ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * SATELLITE: asks the Master for work and posts a heartbeat in one request.
+   *
+   * The Master's reply carries the assignment plus any sibling endpoints, so
+   * the Control Center stays live without a second channel. Uptime is
+   * accumulated from the gap between polls rather than a wall clock, so a
+   * sleeping node does not claim uptime it never had.
+   */
+  async pollMaster(pairing = getPairing()): Promise<void> {
+    if (!pairing) return;
+    const self = selfEndpoint(localIPv4());
+    const now = Date.now();
+    this.localMetrics.uptimeSeconds += Math.max(
+      0,
+      Math.round((now - (this.lastHeartbeatAt || now)) / 1000),
+    );
+    this.lastHeartbeatAt = now;
+    this.localMetrics.lastSeenAt = new Date(now).toISOString();
+
+    const response = await axios.post(
+      `${pairing.masterUrl.replace(/\/+$/, "")}/api/mesh/heartbeat`,
+      {
+        nodeCode: this.nodeCode,
+        nodeName: env.NODE_NAME,
+        ipAddress: self.ipAddress,
+        port: self.port,
+        cloudLinkUrl: self.cloudLinkUrl,
+        metrics: this.localMetrics,
+        p2pEnabled: p2pEnabled(),
+      },
+      { timeout: MESH_HTTP_TIMEOUT_MS, headers: { "X-Mesh-Key": getMeshKey() } },
+    );
+
+    const data = (response.data ?? {}) as Record<string, unknown>;
+    const task = (data["task"] ?? null) as SwarmAssignment | null;
+    const siblings = (data["siblings"] ?? []) as PeerEndpoint[];
+    const allowP2p = data["p2pEnabled"] === true;
+
+    // AUTO-FILL: persist the sibling endpoints the Master just handed over.
+    // An empty list is meaningful — the Master sends one when P2P has been
+    // revoked, which actively clears previously-learned peers rather than
+    // leaving a node able to route around its Master.
+    if (siblings.length > 0 || !allowP2p) {
+      this.applyIncomingSiblings(siblings);
+    }
+
+    // The Master may revoke P2P at any time — honour it immediately.
+    if (p2pEnabled() !== allowP2p) setP2pEnabled(allowP2p);
+
+    if (task && task.id !== this.activeAssignment?.id) {
+      this.activeAssignment = task;
+      this.reportingMode = task.p2p && allowP2p ? "p2p" : "master-relay";
+      this.localMetrics.lastStatus = "busy";
+      console.log(`[Swarm] Assignment received: "${task.label}" (${task.load}) via ${this.reportingMode}.`);
+    } else if (!task && this.activeAssignment) {
+      this.activeAssignment = null;
+      this.reportingMode = "p2p";
+      this.localMetrics.lastStatus = "idle";
+    }
+  }
+
+  /**
+   * SATELLITE: records an assignment pushed by the Master.
+   *
+   * Local-only bookkeeping — the task the node is executing and how it is
+   * reporting. Kept separate from the Master's registry so a Satellite holds
+   * exactly one active task and never mistakes peer data for its own.
+   */
+  applyIncomingAssignment(task: SwarmAssignment): SwarmAssignment {
+    this.activeAssignment = task;
+    this.localMetrics.lastStatus = "busy";
+    console.log(
+      `[Swarm] Assignment "${task.label}" (${task.load}) accepted; reporting via ${this.reportingMode}.`,
+    );
+    return task;
+  }
+
+  /**
+   * SATELLITE: AUTO-FILLS the sibling endpoints the Master pushed.
+   *
+   * No operator input is involved — this is the zero-config guarantee. Passing
+   * an empty list (which the Master does after revoking P2P) actively clears
+   * previously learned peers so the node can no longer route around the Master.
+   *
+   * NOTE: the reporting mode follows the P2P FLAG, not the sibling count. A
+   * task with a single assignee legitimately has no siblings while P2P is
+   * perfectly healthy, so an empty list alone must not demote the node.
+   */
+  applyIncomingSiblings(siblings: PeerEndpoint[]): PeerEndpoint[] {
+    const stored = applyPeerProvision(siblings);
+    this.reportingMode = p2pEnabled() && stored.length > 0 ? "p2p" : "master-relay";
+    return stored;
+  }
+
+  /**
+   * SATELLITE: records the result of local work.
+   *
+   * Feeds the same counters the Master keeps, so the Control Center reflects
+   * real outcomes rather than optimistic placeholders.
+   *
+   * @param challengeResolved true when the node cleared a captcha / retry loop
+   *        on its own instead of failing the task.
+   */
+  reportLocalTaskResult(task: SwarmAssignment, outcome: TaskOutcome, challengeResolved = false): void {
+    this.localMetrics.loadAttempts[task.load] += 1;
+    if (outcome === "success") {
+      this.localMetrics.tasksSucceeded += 1;
+      this.localMetrics.loadSuccess[task.load] += 1;
+    } else if (outcome === "timeout") {
+      this.localMetrics.tasksTimedOut += 1;
+    } else {
+      this.localMetrics.tasksFailed += 1;
+    }
+    if (challengeResolved) {
+      this.localMetrics.challenges += 1;
+      this.localMetrics.challengesResolved += 1;
+    }
+    this.localMetrics.lastStatus = this.activeAssignment ? "busy" : "idle";
+    this.localMetrics.lastSeenAt = new Date().toISOString();
+  }
+}

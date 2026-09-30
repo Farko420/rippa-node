@@ -2,6 +2,9 @@ import { exec } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { config as loadDotenv } from "dotenv";
+// TYPE-ONLY import: erased at compile time, so this creates no runtime cycle
+// even though `nodeAuth` imports this module for its fs/validation helpers.
+import type { PeerEndpoint } from "./nodeAuth";
 
 /**
  * FIRST-RUN SETUP / CONFIGURATION MANAGER.
@@ -43,6 +46,26 @@ export interface RippaNodeConfig {
    * isolates the two devices. Blank/unset means LAN-only linking.
    */
   cloud_link_code?: string;
+  /** Permanent, unique node code minted on first boot (zero-config identity). */
+  NODE_CODE?: string;
+  /** ISO timestamp of when NODE_CODE was minted. */
+  NODE_CREATED_AT?: string;
+  /** Master node code this Satellite is paired with (set by the one-time handshake). */
+  PAIRED_MASTER_CODE?: string;
+  /** Base URL of the Master this Satellite is paired with. */
+  PAIRED_MASTER_URL?: string;
+  /** Cloud Link URL of the Master, when one was advertised during pairing. */
+  PAIRED_MASTER_CLOUD_URL?: string;
+  /** ISO timestamp of the completed pairing handshake. */
+  PAIRED_MASTER_AT?: string;
+  /** Shared secret issued by the Master; authenticates node-to-node traffic. */
+  MESH_KEY?: string;
+  /** Node code of the Master that issued MESH_KEY (diagnostic only). */
+  MESH_KEY_ISSUER?: string;
+  /** False when the Master revoked P2P and forces master-relay reporting. */
+  P2P_ENABLED?: boolean;
+  /** Sibling endpoints auto-filled by the Master (never typed by a user). */
+  PEER_MESH?: PeerEndpoint[];
 }
 
 export type NodeRole = "master" | "satellite";
@@ -195,7 +218,37 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
     master_node_url: masterLocal,
     dashboard_pin: pin,
     cloud_link_code: cloudLinkCode,
+    // Zero-config mesh state. Carried through verbatim so a GUI save (which
+    // rebuilds the object from this function) can never wipe a node code, a
+    // completed pairing handshake, or Master-provisioned sibling endpoints.
+    NODE_CODE: pickString(record, "NODE_CODE") || undefined,
+    NODE_CREATED_AT: pickString(record, "NODE_CREATED_AT") || undefined,
+    PAIRED_MASTER_CODE: pickString(record, "PAIRED_MASTER_CODE") || undefined,
+    PAIRED_MASTER_URL: pickString(record, "PAIRED_MASTER_URL") || undefined,
+    PAIRED_MASTER_CLOUD_URL: pickString(record, "PAIRED_MASTER_CLOUD_URL") || undefined,
+    PAIRED_MASTER_AT: pickString(record, "PAIRED_MASTER_AT") || undefined,
+    MESH_KEY: pickString(record, "MESH_KEY") || undefined,
+    MESH_KEY_ISSUER: pickString(record, "MESH_KEY_ISSUER") || undefined,
+    P2P_ENABLED: record["P2P_ENABLED"] === false ? false : true,
+    PEER_MESH: normalizePeers(record["PEER_MESH"]),
   };
+}
+
+/** Keeps only well-formed peer entries when normalising config.json. */
+function normalizePeers(value: unknown): PeerEndpoint[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((peer): peer is PeerEndpoint => Boolean(peer) && typeof peer === "object")
+    .map((peer) => ({
+      nodeCode: pickString(peer as unknown as Record<string, unknown>, "nodeCode"),
+      nodeName: pickString(peer as unknown as Record<string, unknown>, "nodeName"),
+      ipAddress: pickString(peer as unknown as Record<string, unknown>, "ipAddress"),
+      port: Number(pickString(peer as unknown as Record<string, unknown>, "port")) || 0,
+      lanUrl: pickString(peer as unknown as Record<string, unknown>, "lanUrl"),
+      cloudLinkUrl: pickString(peer as unknown as Record<string, unknown>, "cloudLinkUrl"),
+      lastProvisionedAt: pickString(peer as unknown as Record<string, unknown>, "lastProvisionedAt"),
+    }))
+    .filter((peer) => Boolean(peer.nodeCode));
 }
 
 /**
