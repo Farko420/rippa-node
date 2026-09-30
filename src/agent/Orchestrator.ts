@@ -12,6 +12,9 @@ import { OtaUpdater } from "../update/OtaUpdater";
 import { APP_VERSION } from "../version";
 import { schedule, type ScheduledTask } from "node-cron";
 import { clearCurrentProcess, setCurrentProcess } from "../services/heartbeat";
+import { executeSkill } from "../services/skillExecutor";
+import { healTask } from "../services/taskManager";
+import { startLocalAiDiscovery, type LocalAiStatus } from "../services/localAi";
 
 /**
  * AUTONOMOUS AGENT ORCHESTRATOR.
@@ -44,6 +47,9 @@ const SEED_URLS: string[] = [
   "https://www.patrol4x4.com/forums/",
 ];
 
+/** The new dynamic-skill task type, and the failure signals that trigger healing. */
+const DYNAMIC_SKILL = "DYNAMIC_SKILL";
+
 export class Orchestrator {
   private running = false;
   private loopPromise: Promise<void> | null = null;
@@ -55,12 +61,28 @@ export class Orchestrator {
   private readonly ota: OtaUpdater;
   private otaTask: ScheduledTask | null = null;
   private otaFirstCheck: NodeJS.Timeout | null = null;
+  /** Latest local-AI capability, consumed by the self-healing loop. */
+  private localAiStatus: LocalAiStatus | null = null;
+  /** Cancels the periodic local-AI probe. */
+  private stopLocalAi: (() => void) | null = null;
 
   constructor(private readonly swarm: SwarmClient) {
     this.ota = new OtaUpdater(swarm);
     // A version advertised on the heartbeat reply triggers an immediate
     // update attempt instead of waiting for the next scheduled check.
     this.swarm.setUpdateSignalHandler((info) => this.ota.onUpdateSignal(info));
+    // Watch for a local Ollama server continuously: the node may boot before the
+    // model server, or a model may be pulled later. The callback only fires on a
+    // real change, so the Mothership is re-registered exactly once per change.
+    this.stopLocalAi = startLocalAiDiscovery((status) => {
+      this.localAiStatus = status;
+      void this.swarm.registerAiCapability({
+        aiCapable: status.capable,
+        url: status.url,
+        models: status.capableModels,
+        preferredModel: status.preferredModel,
+      });
+    });
   }
 
   /** Starts the background loop (idempotent). Does not block the caller. */
@@ -78,6 +100,11 @@ export class Orchestrator {
   async stop(): Promise<void> {
     this.running = false;
     this.stopOtaUpdates();
+    // Stop probing for a local AI server alongside everything else.
+    if (this.stopLocalAi) {
+      this.stopLocalAi();
+      this.stopLocalAi = null;
+    }
     if (this.loopPromise) {
       await this.loopPromise;
       this.loopPromise = null;
@@ -165,6 +192,10 @@ export class Orchestrator {
     setCurrentProcess(task.type || task.id || "task");
     try {
       switch (task.type) {
+        // AI-generated JavaScript from the Mothership, run in the skill sandbox.
+        case DYNAMIC_SKILL:
+          await this.handleDynamicSkill(task);
+          break;
         // TODO: wire real handlers as they are built, e.g.:
         //   case "scrape":   → Playwright headless scrape
         //   case "extract":  → Ollama structured extraction
@@ -177,6 +208,77 @@ export class Orchestrator {
       this.swarm.setStatus("idle");
       clearCurrentProcess();
     }
+  }
+
+  /**
+   * DYNAMIC_SKILL — executes AI-generated code in the isolated sandbox.
+   *
+   * On failure the orchestrator does NOT give up: it feeds the real error and
+   * input sample to the local model (falling back to the cloud), has it write a
+   * patched function, sandbox-tests the patch, and re-runs the task. A patch
+   * that works is submitted back to the Mothership so the whole fleet inherits
+   * the fix.
+   */
+  private async handleDynamicSkill(task: SwarmTask): Promise<void> {
+    const code = String(task.payload?.["code"] ?? "");
+    const input = task.payload?.["input"];
+    if (!code.trim()) {
+      console.warn(`[Orchestrator] ${DYNAMIC_SKILL} task ${task.id} had no code — skipping.`);
+      return;
+    }
+
+    const result = await executeSkill({
+      id: task.id,
+      code,
+      input,
+      timeoutMs: numberOr(task.payload?.["timeoutMs"], 5_000),
+      memoryMb: numberOr(task.payload?.["memoryMb"], 128),
+    });
+
+    if (result.ok) {
+      console.log(`[Orchestrator] ${DYNAMIC_SKILL} ${task.id} completed in ${result.durationMs}ms.`);
+      await this.swarm.submitProfile({
+        kind: "skill_result",
+        taskId: task.id,
+        status: "success",
+        output: result.output,
+        durationMs: result.durationMs,
+      });
+      return;
+    }
+
+    console.warn(`[Orchestrator] ${DYNAMIC_SKILL} ${task.id} failed — ${result.error.split("\n")[0]}`);
+
+    // SELF-HEAL: ask the model for a patch and retry.
+    const outcome = await healTask(
+      {
+        taskId: task.id,
+        taskType: task.type,
+        message: result.error.split("\n")[0] ?? "skill failed",
+        stack: result.error,
+        code,
+        inputSample: input,
+      },
+      {
+        ollama: this.ollama,
+        localStatus: () => this.localAiStatus,
+        swarm: this.swarm,
+        rerun: async (patchedCode) => {
+          const retried = await executeSkill({ id: task.id, code: patchedCode, input });
+          if (!retried.ok) throw new Error(retried.error.split("\n")[0]);
+        },
+        submitPatch: (payload) => this.swarm.submitProfile({ kind: "skill_patch", ...payload }),
+      },
+    );
+
+    for (const line of outcome.log) console.log(`[Heal] ${line}`);
+    await this.swarm.submitProfile({
+      kind: "skill_result",
+      taskId: task.id,
+      status: outcome.healed ? "healed" : "failed",
+      attempts: outcome.attempts,
+      error: outcome.healed ? "" : result.error.split("\n")[0],
+    });
   }
 
   /**
@@ -259,4 +361,10 @@ export class Orchestrator {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Reads a finite number from an untrusted task payload, else uses `fallback`. */
+function numberOr(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }

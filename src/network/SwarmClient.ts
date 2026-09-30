@@ -257,6 +257,53 @@ export class SwarmClient {
       return false;
     }
   }
+
+  /**
+   * Asks the Mothership to generate a patch, used when the node has no usable
+   * local model. Returns "" when the endpoint is absent or fails — the caller
+   * then reports the original failure rather than stalling.
+   */
+  async requestSkillPatch(systemPrompt: string, userPrompt: string): Promise<string> {
+    try {
+      const { data } = await this.client.post("/api/skills/patch", {
+        systemPrompt,
+        userPrompt,
+      });
+      const body = (data ?? {}) as { patch?: string; code?: string; result?: string };
+      return String(body.patch ?? body.code ?? body.result ?? "");
+    } catch (error) {
+      console.warn(`[Swarm] Cloud patch request failed — ${describeError(error)}`);
+      return "";
+    }
+  }
+
+  /**
+   * Registers this node as an `AI_CAPABLE_NODE` with the Mothership.
+   *
+   * Sent when local-model discovery changes state, so the cloud can route heavy
+   * work (HTML→JSON structuring, review summarising) to this node's GPU
+   * instead of spending API credits.
+   */
+  async registerAiCapability(payload: {
+    aiCapable: boolean;
+    url?: string;
+    models?: string[];
+    preferredModel?: string;
+  }): Promise<boolean> {
+    try {
+      await this.client.post("/api/swarm/capabilities", payload);
+      console.log(
+        `[Swarm] Registered as ${payload.aiCapable ? "AI_CAPABLE_NODE" : "standard node"}` +
+          (payload.preferredModel ? ` (${payload.preferredModel})` : ""),
+      );
+      return true;
+    } catch (error) {
+      // A Mothership without this endpoint is fine — the node just stays a
+      // standard worker.
+      console.warn(`[Swarm] Capability registration failed — ${describeError(error)}`);
+      return false;
+    }
+  }
 }
 
 function describeError(error: unknown): string {

@@ -141,6 +141,46 @@ export class OllamaClient {
 
     return this.resolvedModel;
   }
+
+  /**
+   * Generates raw code from a system + user prompt.
+   *
+   * Added for the self-healing loop, which needs JavaScript back rather than
+   * the strictly-validated `verified_knowledge` shape that
+   * {@link extractFacts} produces. Unlike `extractFacts` this performs NO schema
+   * validation — the patcher parses and sandbox-tests the result itself.
+   */
+  async generatePatch(
+    systemPrompt: string,
+    userPrompt: string,
+    options: { model?: string; timeoutMs?: number } = {},
+  ): Promise<string> {
+    const model = options.model ?? (await this.resolveModel());
+    try {
+      const { data } = await this.client.post(
+        "/api/generate",
+        {
+          model,
+          system: systemPrompt,
+          prompt: userPrompt,
+          stream: false,
+          options: {
+            // Low temperature: a patch should follow the original code, not
+            // improvise a redesign.
+            temperature: 0.1,
+          },
+        },
+        { timeout: options.timeoutMs ?? REQUEST_TIMEOUT_MS },
+      );
+      const body = (data ?? {}) as { response?: string; message?: { content?: string } };
+      return String(body.response ?? body.message?.content ?? "");
+    } catch (error) {
+      console.warn(
+        `[Ollama] Patch generation failed — ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return "";
+    }
+  }
 }
 
 /**
