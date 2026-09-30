@@ -625,6 +625,17 @@ if (saveBtn) saveBtn.addEventListener("click", async () => {
   // Keep the existing key when the field is left blank.
   if (!body.node_api_key) delete body.node_api_key;
   if (dashPin && dashPin.value.trim()) body.dashboard_pin = dashPin.value.trim();
+  /*
+    CAPTURED BEFORE THE FIELD IS CLEARED.
+
+    First-run setup runs with no dashboard session (the auth gate stays open
+    only while the config is incomplete). The moment this save completes the
+    config, that gate closes and every subsequent request 401s - which bounced
+    the operator straight to the Lock Screen, demanding the passkey they had
+    just typed one moment earlier. Holding the value lets us establish the
+    session with it instead.
+  */
+  const submittedPin = (dashPin && dashPin.value.trim()) || "";
   try {
     const res = await fetch("/api/system/config", {
       method: "POST",
@@ -652,10 +663,68 @@ if (saveBtn) saveBtn.addEventListener("click", async () => {
       */
       if (apiKey) apiKey.value = "";
       if (dashPin) dashPin.value = "";
-      await load();
       if (data.configured) {
         showAlert("✓ " + data.message, "ok");
         userPinnedToSetup = false;
+        /*
+          ESTABLISH THE SESSION BEFORE SHOWING THE DASHBOARD.
+
+          Completing the config CLOSES the auth gate that first-run setup was
+          relying on, and this browser never had a session (there was no passkey
+          to unlock with until now). Showing the dashboard anyway meant every
+          poll immediately 401'd and bounced the operator to the Lock Screen,
+          asking for the passkey they had just typed - a second, subtler version
+          of the very trap this screen was rebuilt to escape.
+
+          So: log in with the passkey just submitted, and only fall back to the
+          Lock Screen if that genuinely fails. A node saved WITHOUT a passkey
+          falls back too, which is correct - there is nothing to log in with, and
+          the default passkey is a server-side secret we must not assume.
+        */
+        /*
+          WHY THE LOGIN IS UNCONDITIONAL (when a passkey is in hand).
+
+          The save response reports `authenticated:true`, but that means "this
+          request was permitted" — the config gate is open while the node is
+          unconfigured — NOT "this browser holds a session". No cookie was
+          issued, so the very next request 401s. Gating the login on that flag
+          therefore skipped the one call that actually creates the session.
+
+          POSTing /api/system/auth is idempotent and harmless when a session
+          already exists, so it is simply always attempted; the explicit
+          verification below decides what the operator actually sees.
+        */
+        if (submittedPin) {
+          try {
+            const authRes = await fetch("/api/system/auth", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ pin: submittedPin }),
+            });
+            const authData = await authRes.json().catch(() => ({}));
+            if (authRes.ok && authData && authData.success) {
+              try { if (authData.token) setToken(authData.token); } catch (err) { /* noop */ }
+            }
+          } catch (err) { /* handled by the check below */ }
+        }
+        // Re-read now that we hold a session (or know we do not).
+        await load();
+        // Verify rather than assume: showing a dashboard we cannot authenticate
+        // would 401 on its first poll and bounce back to Lock anyway, which reads
+        // as a glitch. Saying why here is clearer.
+        try {
+          const res2 = await fetch("/api/config", { credentials: "same-origin", headers: authHeaders() });
+          const d2 = await res2.json().catch(() => ({}));
+          if (!d2.authenticated) {
+            showLocked(
+              submittedPin
+                ? "Setup saved. Enter the passkey you just set to open the Command Center."
+                : "Setup saved. No passkey was set, so the default passkey is required.",
+            );
+            return;
+          }
+        } catch (err) { /* if we cannot even ask, let load()'s handling stand */ }
         showScreen("dashboard");
         try { if (typeof window.RippaControlCenterStart === "function") window.RippaControlCenterStart(); } catch (err) { /* noop */ }
       } else {

@@ -11,6 +11,29 @@
  * The snapshot is polled rather than pushed, so a node that goes offline simply
  * stops updating and is rendered greyed out by the server's staleness check.
  */
+/*
+ * RIPPA_CONTROL_CENTER_MODULE
+ *
+ * WHY THIS FILE IS WRAPPED IN AN IIFE.
+ *
+ * index.html loads app.js AND this file as two plain classic scripts. They share
+ * one global scope, so a top-level "const $" in BOTH files makes the second one
+ * fail to PARSE with "SyntaxError: Identifier '$' has already been declared".
+ *
+ * That failure is silent and severe: the browser drops the entire script, so the
+ * swarm grid, the brain drop zone and the OTA strip are present in the DOM but
+ * have no event handlers and no poll loop. The page looks built and is dead —
+ * the Master Brain Parity zone appeared in the markup and did nothing at all.
+ *
+ * Wrapping the body scopes every declaration ($, esc, api, refresh, ...) to this
+ * file, which is what "a module" should have meant. Nothing inside needs to be
+ * global: the only cross-script value is the explicit
+ * window.RippaControlCenterStart assigned at the bottom, and app.js already
+ * feature-detects it.
+ */
+(function () {
+"use strict";
+
 const $ = (id) => document.getElementById(id);
 
 /** How often the Control Center refreshes from the Master. */
@@ -861,3 +884,6 @@ window.RippaControlCenterStart = startControlCenter;
 
 // Standalone /dashboard: this document IS the Control Center, so start now.
 if (!$("dashboardContainer")) startControlCenter();
+
+// --- MODULE END ---------------------------------------------------------------
+})();
