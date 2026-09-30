@@ -123,3 +123,32 @@
 #brainMessage { margin-top:10px; }
 #brainMessage.brain-error { color:var(--bad); }
 #brainMessage.brain-warn { color:var(--warn); }
+/* Real read/upload progress under the drop zone. */
+.brain-progress { margin-top:14px; }
+.brain-progress .hint { display:block; margin-top:6px; }
+
+/* ---- SWARM GRID NODE METRICS ----------------------------------------------
+   Per-card CPU / RAM / uptime bars. The `.nm-row` grid mirrors the modal's
+   `.load-row` so a card and its detail modal read identically. */
+.node-metrics { margin-top:10px; display:flex; flex-direction:column; gap:5px; }
+.nm-row { display:grid; grid-template-columns:26px 1fr 34px; align-items:center; gap:6px; }
+.nm-label { font-size:9px; letter-spacing:.08em; text-transform:uppercase; color:var(--mut); }
+.nm-row .bar { height:5px; }
+.nm-val { font-size:10px; text-align:right; color:var(--mut); font-variant-numeric:tabular-nums; }
+.nm-row.cpu .bar-fill { background:#f85149; }
+.nm-row.ram .bar-fill { background:var(--acc); }
+.nm-row.uptime .bar-fill { background:var(--ok); }
+/* An offline node reports stale vitals, so dim them instead of implying health. */
+.node-card.offline .node-metrics { opacity:.5; }
+/* Node IP, shown under the code so a moved machine is easy to spot. */
+.node-ip { font-size:10px; color:var(--mut); margin-top:2px; font-variant-numeric:tabular-nums; }
+
+/* ---- SETUP / DASHBOARD CONTAINERS ------------------------------------------
+   index.html is now a single page holding both surfaces, so the setup form is
+   centred while the dashboard uses the full-width Control Center layout. */
+.setup-wrap { width:100%; display:flex; justify-content:center; }
+body[data-screen="dashboard"] { display:block; padding:0; align-items:stretch; }
+body[data-screen="setup"] .setup-wrap { align-items:center; min-height:100vh; }
+/* The named list of fields still blocking setup (describeConfigGaps). */
+.setup-gaps { margin:8px 0 0; padding-left:20px; font-size:12px; }
+.setup-gaps li { margin:2px 0; }

@@ -30,6 +30,7 @@ import {
   applyConfigToEnv,
   configFileExists,
   configFilePath,
+  describeConfigGaps,
   isConfigComplete,
   normalizeConfig,
   readConfig,
@@ -232,6 +233,59 @@ export function getLanAddresses(): string[] {
   return out;
 }
 
+/**
+ * THE CONFIG PAYLOAD — the single source of truth for what config.json holds.
+ *
+ * Read fresh from disk on every call (no module-level cache), because the GUI
+ * reads it immediately after a save and a cached copy is precisely what leaves
+ * an operator staring at a stale Setup Screen after a successful write.
+ *
+ * `configured` is computed with the SAME predicate the auth gate and the
+ * `/api/system/auth/status` probe use, so the three can never disagree.
+ * `missing` names the fields still blocking it, which turns an unexplained
+ * "setup required" into an actionable instruction.
+ *
+ * The API key and passkey are NEVER returned — only whether they are set, and
+ * only once they pass a minimum length. This payload is what the dashboard
+ * renders, so a real secret must never appear in a browser-visible response.
+ */
+function buildConfigPayload(authenticated: boolean): Record<string, unknown> {
+  const stored = readConfigLenient() ?? normalizeConfig({});
+  const complete = isConfigComplete(readConfig());
+  const apiKey = (stored.NODE_API_KEY ?? "").trim();
+  const pin = (stored.DASHBOARD_PIN ?? "").trim();
+  return {
+    success: true,
+    configured: complete,
+    authenticated,
+    // Diagnostics: separates "no config.json on disk" from "config.json present
+    // but incomplete", and names the exact fields still required.
+    configPresent: configFileExists(),
+    configPath: configFilePath(),
+    missing: complete ? [] : describeConfigGaps(readConfig()),
+    config: {
+      node_role: stored.NODE_ROLE,
+      NODE_ROLE: stored.NODE_ROLE,
+      master_node_url: stored.MASTER_LOCAL_URL,
+      MASTER_LOCAL_URL: stored.MASTER_LOCAL_URL,
+      mothership_url: stored.MOTHERSHIP_URL,
+      MOTHERSHIP_URL: stored.MOTHERSHIP_URL,
+      node_name: stored.NODE_NAME,
+      NODE_NAME: stored.NODE_NAME,
+      // Masked: the real values are write-only from the browser's point of view.
+      NODE_API_KEY: "",
+      apiKeyConfigured: apiKey.length >= 8,
+      dashboard_pin: "",
+      pinConfigured: pin.length >= 4,
+      cloud_link_code: stored.cloud_link_code ?? "",
+      ollama_url: stored.OLLAMA_URL,
+      OLLAMA_URL: stored.OLLAMA_URL,
+      port: stored.PORT,
+      PORT: stored.PORT,
+    },
+  };
+}
+
 /** Builds the Express app (separated from listen() for testability). */
 export function createApp(): Express {
   const app = express();
@@ -407,33 +461,21 @@ export function createApp(): Express {
   });
 
   // GET /api/system/config — current config.json state (API key + PIN masked).
-  app.get("/api/system/config", requireDashboardAuth, (_req: Request, res: Response) => {
-    const stored = readConfigLenient() ?? normalizeConfig({});
-    const apiKey = stored.NODE_API_KEY ?? "";
-    res.json({
-      success: true,
-      configured: isConfigComplete(readConfig()),
-      authenticated: hasDashboardSession(_req),
-      config: {
-        node_role: stored.NODE_ROLE,
-        NODE_ROLE: stored.NODE_ROLE,
-        master_node_url: stored.MASTER_LOCAL_URL,
-        MASTER_LOCAL_URL: stored.MASTER_LOCAL_URL,
-        mothership_url: stored.MOTHERSHIP_URL,
-        MOTHERSHIP_URL: stored.MOTHERSHIP_URL,
-        node_name: stored.NODE_NAME,
-        NODE_NAME: stored.NODE_NAME,
-        NODE_API_KEY: "",
-        apiKeyConfigured: apiKey.trim().length >= 8,
-        dashboard_pin: "",
-        pinConfigured: (stored.DASHBOARD_PIN ?? "").trim().length >= 4,
-        cloud_link_code: stored.cloud_link_code ?? "",
-        ollama_url: stored.OLLAMA_URL,
-        OLLAMA_URL: stored.OLLAMA_URL,
-        port: stored.PORT,
-        PORT: stored.PORT,
-      },
-    });
+  app.get("/api/system/config", requireDashboardAuth, (req: Request, res: Response) => {
+    res.json(buildConfigPayload(hasDashboardSession(req)));
+  });
+
+  /*
+    GET /api/config — the short alias the Control Center boots from.
+
+    Same handler, same payload, same auth gate as /api/system/config. It exists
+    so the dashboard has ONE canonical "what is saved right now" endpoint to
+    read on load and immediately after a save, rather than inferring state from
+    the auth probe. Auth-gated exactly like its twin: the payload reveals the
+    node's name, role and Mothership URL, which is not LAN-public information.
+  */
+  app.get("/api/config", requireDashboardAuth, (req: Request, res: Response) => {
+    res.json(buildConfigPayload(hasDashboardSession(req)));
   });
 
   // GET /api/system/network/scan — LAN auto-discovery for satellite setup.
@@ -506,12 +548,11 @@ export function createApp(): Express {
         message:
           "Configuration saved. Node services re-initializing with new parameters.",
         restartRequired: false,
-        config: {
-          node_role: validated.config.NODE_ROLE,
-          master_node_url: validated.config.MASTER_LOCAL_URL,
-          NODE_NAME: validated.config.NODE_NAME,
-          PORT: validated.config.PORT,
-        },
+        // The freshly-read payload, so the GUI can transition on THIS response
+        // instead of racing a second fetch. `configured` is what the frontend
+        // keys its setup -> dashboard switch off, so it must be computed from
+        // disk after the write, not assumed from a 200.
+        ...buildConfigPayload(true),
       });
     } catch (error) {
       console.error("[API] Failed to save configuration:", error);

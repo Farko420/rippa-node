@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import axios from "axios";
 import { env } from "../config";
 import { localIPv4 } from "../network/discovery";
+import { getSystemVitals } from "./telemetry";
 import {
   applyPeerProvision,
   ensureNodeIdentity,
@@ -124,6 +125,14 @@ export interface NodeMetrics {
   challengesResolved: number;
   /** Uptime in seconds, accumulated between heartbeats. */
   uptimeSeconds: number;
+  /** Host uptime in seconds, reported by the node itself. */
+  systemUptimeSeconds?: number;
+  /** CPU load 0-100 across all cores, sampled on the node. */
+  cpuUsage?: number;
+  /** Physical memory in use, 0-100, sampled on the node. */
+  ramUsage?: number;
+  /** Logical CPU core count, reported by the node. */
+  cpuCores?: number;
   lastStatus: "idle" | "busy";
   lastSeenAt: string;
   registeredAt: string;
@@ -786,6 +795,17 @@ export class SwarmDispatcher {
         loadHandling: loadHandlingScore(record.metrics),
         loadRates,
         metrics: record.metrics,
+        // Flattened system vitals so the Control Center can paint per-node
+        // CPU / RAM / uptime bars straight off the snapshot, without having to
+        // reach into `metrics` (or make one request per node) to do it.
+        cpuUsage: record.metrics.cpuUsage ?? null,
+        ramUsage: record.metrics.ramUsage ?? null,
+        cpuCores: record.metrics.cpuCores ?? null,
+        // Host uptime is what the operator recognises ("up 3 days"); the
+        // accumulated `uptimeSeconds` is swarm bookkeeping and is shown as
+        // efficiency in its own right, so both are kept distinct here.
+        uptimeSeconds: record.metrics.systemUptimeSeconds ?? null,
+        swarmUptimeSeconds: record.metrics.uptimeSeconds ?? 0,
       };
     });
 
@@ -939,6 +959,24 @@ export class SwarmDispatcher {
     );
     this.lastHeartbeatAt = now;
     this.localMetrics.lastSeenAt = new Date(now).toISOString();
+
+    /*
+      SYSTEM VITALS.
+
+      Sampled here rather than only for the Mothership heartbeat so the Master
+      Control Center's per-node CPU / RAM / uptime bars show the satellite's
+      REAL load. Without it the dashboard could only display swarm bookkeeping
+      counters, which say how well a node is doing its job but nothing about
+      whether the machine underneath it is healthy or thrashing.
+
+      `getSystemVitals()` is already wrapped to degrade to safe numbers, so a
+      telemetry failure can never break the pairing cycle below.
+    */
+    const vitals = getSystemVitals();
+    this.localMetrics.cpuUsage = vitals.cpu_usage;
+    this.localMetrics.ramUsage = vitals.ram_usage;
+    this.localMetrics.cpuCores = vitals.cpu_cores;
+    this.localMetrics.systemUptimeSeconds = vitals.system_uptime_seconds;
 
     const response = await axios.post(
       `${pairing.masterUrl.replace(/\/+$/, "")}/api/mesh/heartbeat`,

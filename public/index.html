@@ -6,160 +6,358 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
 <meta http-equiv="Pragma" content="no-cache" />
 <meta http-equiv="Expires" content="0" />
-<title>Rippa Node — Command Center</title>
+<title>Rippa Node &mdash; Master Control Center</title>
 <!--
-  CRITICAL (anti-flicker): inline, render-blocking rules so the screen state is
-  correct on the FIRST paint. `hidden` is applied to every screen container in
-  the markup, and the UA `[hidden]{display:none}` rule is too weak to beat the
-  author `.lock{display:flex}` rule below — so it is reinforced here and in
-  styles.css. app.js removes `hidden` only after GET /api/system/auth/status
-  resolves, which guarantees a single screen transition and no flicker.
+  RIPPA NODE - SINGLE-PAGE COMMAND CENTER.
+
+  ONE document now owns every screen: the boot splash, the passkey lock, the
+  first-run Setup form, and the live Master Control Center.
+
+  WHY ONE DOCUMENT: the dashboard used to live on a separate /dashboard page.
+  Saving the setup form could therefore never transition into it - the operator
+  pressed Save and stayed on the setup screen with no route forward, which is
+  exactly the reported "trapped on setup" bug. Sharing one document lets app.js
+  swap containers in a single synchronous step, with no navigation.
+
+  ANTI-FLICKER CONTRACT: every container below ships with the `hidden`
+  attribute, and styles.css reinforces `[hidden]{display:none!important}`.
+  app.js reveals EXACTLY ONE container per synchronous step, so no screen can
+  paint over another. Do not add a container without `hidden`.
 -->
 <style>
   [hidden] { display: none !important; }
 </style>
 <link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="dashboard.css" />
 </head>
 <body>
 <div class="bg"></div>
 
 <!--
-  BOOT SPLASH — the ONLY element visible on first paint. It is a static,
-  correct-by-construction "checking…" state, so the user never sees a wrong
-  screen flash before the status probe answers. app.js removes `hidden` from
-  exactly one of #lockScreen / #dashCard once /api/system/auth/status resolves
-  and hides this splash in the same synchronous step.
+  BOOT SPLASH - the only element visible on first paint. A static, correct
+  "checking..." state, so a wrong screen can never flash before the probes
+  answer.
 -->
 <div id="bootScreen" class="lock">
   <div class="lock-card">
-    <div class="logo big">◈</div>
+    <div class="logo big">&#9672;</div>
     <h1>Rippa Node</h1>
-    <p class="sub">Checking node status…</p>
+    <p class="sub">Checking node status&hellip;</p>
   </div>
 </div>
 
 <!--
-  FULLSCREEN PASSKEY LOCK — `hidden` by default. Shown ONLY when the node is
-  configured AND the session is not authenticated.
+  PASSKEY LOCK - shown ONLY when the node is configured AND this browser holds
+  no live dashboard session.
 -->
 <div id="lockScreen" class="lock" hidden>
   <div class="lock-card">
-    <div class="logo big">🔒</div>
+    <div class="logo big">&#128274;</div>
     <h1>Node Locked</h1>
     <p class="sub" id="lockSub">Enter the Master passkey to manage this node.</p>
     <input id="unlockPin" type="password" inputmode="numeric" autocomplete="current-password"
       placeholder="Enter Passkey" />
     <div id="lockAlert" class="alert hidden"></div>
-    <button id="unlockBtn" type="button" class="save">🔓 Unlock Command Center</button>
+    <button id="unlockBtn" type="button" class="save">&#128275; Unlock Command Center</button>
   </div>
 </div>
 
-<!-- SETUP SCREEN / DASHBOARD — one configuration surface, two modes. `hidden` by default; it is unhidden ONLY after /api/system/auth/status resolves. body[data-screen] is "setup" (node not configured yet) or "dashboard" (configured + authenticated), and #setupBanner is the visible difference between the two. The fields and the Save endpoint are identical in both modes, so the form is intentionally a single container driven by mode rather than a duplicated markup tree that could drift out of sync. -->
-<main class="card" id="dashCard" hidden>
+<!--
+  SETUP CONTAINER - first-run configuration.
+
+  Shown ONLY while the saved config is incomplete. app.js hides this the moment
+  a complete config exists - both on boot AND after every successful save - so an
+  operator can never be stranded here with a valid configuration on disk. That
+  trap was real: the previous build re-read the config but never left this
+  container, so saving appeared to do nothing.
+-->
+<div id="setupContainer" class="setup-wrap" hidden>
+<main class="card" id="dashCard">
 <header>
-<div class="logo">◈</div>
+<div class="logo">&#9672;</div>
 <div>
 <h1>Rippa Node</h1>
 <p class="sub" id="dashSub">Local Configuration Dashboard</p>
 </div>
-<div id="statusPill" class="pill idle">● checking…</div>
+<div id="statusPill" class="pill idle">&#9679; checking&hellip;</div>
 </header>
 
-<!-- First-run banner: shown only while body[data-screen="setup"]. -->
+<!--
+  BLOCKERS - rendered from the server's `missing` list (describeConfigGaps).
+  This is the actionable half of the setup fix: an incomplete save used to
+  report only `configured: false` with no reason attached, leaving the operator
+  with nothing to act on. The server now names the exact fields still required.
+-->
 <div id="setupBanner" class="alert setup-banner" hidden>
-  <strong>First-time setup.</strong> This node has no <code>config.json</code> yet — fill in your details below and save to start the node services.
+  <strong>Setup incomplete.</strong> This node has no usable <code>config.json</code> yet &mdash; fill in your details below and save to start the node services.
+  <ul id="setupGaps" class="setup-gaps"></ul>
 </div>
 
-
-<!-- SATELLITE → MASTER BRIDGE -->
+<!-- SATELLITE to MASTER BRIDGE -->
 <section id="satBridge" class="bridge hidden">
   <div>
-    <strong>🛰 Satellite Mode</strong>
+    <strong>&#128760; Satellite Mode</strong>
     <p>This node forwards to its Master. Open the full swarm Command Center on the server PC.</p>
     <p class="hint" id="satMasterLabel"></p>
   </div>
   <!--
-    NATIVE ANCHOR, not a <button>. This must be a real <a target="_blank">:
-    a JS-driven `window.open()` is both popup-blocked and prone to being
-    swallowed as a form/default action, which made this control look like it
-    "flickered" the page. A plain link is handled by the browser itself, so
+    NATIVE ANCHOR, not a <button>. It must be a real <a target="_blank">: a
+    JS-driven window.open() is popup-blocked and prone to being swallowed as a
+    form/default action. A plain link is handled by the browser itself, so
     there is no user-gesture requirement and no pop-up blocker to defeat.
-    app.js only ever sets `href` (see applyBridgeHref) — it never listens for
-    clicks on this element.
+    app.js only ever sets `href` (see applyBridgeHref) - never a click handler.
   -->
-  <a id="bridgeLink" class="bridge-link" target="_blank" rel="noopener noreferrer" title="Open the Master Command Center in a new tab">🚀 Open Master Command Center</a>
-  <button id="copyMaster" type="button" class="ghost" title="Copy Master URL">⧉</button>
+  <a id="bridgeLink" class="bridge-link" target="_blank" rel="noopener noreferrer" title="Open the Master Command Center in a new tab">&#128640; Open Master Command Center</a>
+  <button id="copyMaster" type="button" class="ghost" title="Copy Master URL">&#10697;</button>
 </section>
 
 <section class="field">
-<label for="role">Node Role</label>
-<select id="role">
-<option value="master">Master Node (Connects to Cloud)</option>
-<option value="satellite">Satellite Node (Connects to Master)</option>
-</select>
-<p class="hint" id="roleHint">Master connects directly to the Mothership cloud.</p>
+  <label for="role">Node Role</label>
+  <select id="role">
+    <option value="master">Master Node (Connects to Cloud)</option>
+    <option value="satellite">Satellite Node (Connects to Master)</option>
+  </select>
+  <p class="hint" id="roleHint">Master connects directly to the Mothership cloud.</p>
 </section>
 <section class="field" id="mothershipWrap">
-<label for="mothership">Mothership URL</label>
-<input id="mothership" type="url" placeholder="https://rippaadventures.com" />
+  <label for="mothership">Mothership URL</label>
+  <input id="mothership" type="url" placeholder="https://rippaadventures.com" />
 </section>
 <section class="field hidden" id="masterUrlWrap">
     <label for="masterUrl">Master Node</label>
     <div class="discover">
-      <button id="scanBtn" type="button" class="ghost">📡 Scan Local Network</button>
+      <button id="scanBtn" type="button" class="ghost">&#128225; Scan Local Network</button>
       <select id="masterPicker" aria-label="Discovered Master nodes">
-        <option value="">— No Master selected —</option>
+        <option value="">- No Master selected -</option>
       </select>
     </div>
     <input id="masterUrl" type="text" placeholder="http://192.168.1.50:4000" />
     <p class="hint" id="scanState">Scan to find Masters automatically, or type an address below.</p>
 </section>
 <section class="field hidden" id="cloudLinkWrap">
-  <label for="cloudLink">Remote / Cloud Link</label>
-  <input id="cloudLink" type="text" inputmode="numeric" maxlength="6" placeholder="Enter Cloud Link Code" autocomplete="off" />
-  <p class="hint">Use this code to connect over the internet if a VPN or network isolates this device.</p>
+    <label for="cloudLink">Remote / Cloud Link</label>
+    <input id="cloudLink" type="text" inputmode="numeric" maxlength="6" placeholder="Enter Cloud Link Code" autocomplete="off" />
+    <p class="hint">Use this code to connect over the internet if a VPN or network isolates this device.</p>
 </section>
 <section class="field">
-<label for="nodeName">Node Name</label>
-<input id="nodeName" type="text" placeholder="Main Server PC" />
+  <label for="nodeName">Node Name</label>
+  <input id="nodeName" type="text" placeholder="Main Server PC" />
 </section>
 <section class="field">
-<label for="apiKey">Node API Key</label>
-<div class="keyrow">
-<input id="apiKey" type="password" placeholder="Paste key from Admin Fleet Command" autocomplete="off" />
-<button id="toggleKey" type="button" title="Show/hide key">👁</button>
-</div>
-<p class="hint" id="keyState">Key status unknown.</p>
+  <label for="apiKey">Node API Key</label>
+  <div class="keyrow">
+    <input id="apiKey" type="password" placeholder="Paste key from Admin Fleet Command" autocomplete="off" />
+    <button id="toggleKey" type="button" title="Show/hide key">&#128065;</button>
+  </div>
+  <p class="hint" id="keyState">Key status unknown.</p>
 </section>
 <section class="field">
-<label for="dashPin">Dashboard Passkey (LAN lock screen)</label>
-<div class="keyrow">
-<input id="dashPin" type="password" placeholder="Leave blank to keep current passkey" autocomplete="off" />
-<button id="togglePin" type="button" title="Show/hide passkey">👁</button>
-</div>
-<p class="hint" id="pinState">Passkey protects LAN access to this dashboard.</p>
+  <label for="dashPin">Dashboard Passkey (LAN lock screen)</label>
+  <div class="keyrow">
+    <input id="dashPin" type="password" placeholder="Leave blank to keep current passkey" autocomplete="off" />
+    <button id="togglePin" type="button" title="Show/hide passkey">&#128065;</button>
+  </div>
+  <p class="hint" id="pinState">Passkey protects LAN access to this dashboard.</p>
 </section>
 <details class="adv">
-<summary>Advanced</summary>
-<div class="grid2">
-<div class="field">
-<label for="port">Local Port</label>
-<input id="port" type="number" min="1" max="65535" value="4000" />
-</div>
-<div class="field">
-<label for="ollama">Ollama URL</label>
-<input id="ollama" type="url" value="http://127.0.0.1:11434" />
-</div>
-</div>
+  <summary>Advanced</summary>
+  <div class="grid2">
+    <div class="field">
+      <label for="port">Local Port</label>
+      <input id="port" type="number" min="1" max="65535" value="4000" />
+    </div>
+    <div class="field">
+      <label for="ollama">Ollama URL</label>
+      <input id="ollama" type="url" value="http://127.0.0.1:11434" />
+    </div>
+  </div>
 </details>
 <div id="alert" class="alert hidden"></div>
-<button id="save" type="button" class="save">💾 Save &amp; Restart Node</button>
+<button id="save" type="button" class="save">&#128190; Save &amp; Restart Node</button>
 <div class="row2">
-<button id="lockBtn" type="button" class="ghost">🔒 Lock</button>
-<span class="foot">Saved to <code>config.json</code> beside the app. LAN: <code id="lanHint">0.0.0.0</code></span>
+  <button id="lockBtn" type="button" class="ghost">&#128274; Lock</button>
+  <!--
+    Return path for a CONFIGURED node. Shown only once the config is complete, so
+    an operator who opened Settings from the Control Center can go back without a
+    page reload. On a genuinely unconfigured node there is nothing to go back to,
+    so this stays hidden.
+  -->
+  <button id="backToDash" type="button" class="ghost" hidden>&#8594; Back to Command Center</button>
+  <span class="foot">Saved to <code>config.json</code> beside the app. LAN: <code id="lanHint">0.0.0.0</code></span>
 </div>
 </main>
+</div>
+
+<!--
+  DASHBOARD CONTAINER - the Master Control Center.
+
+  Shown ONLY when the saved config is complete AND the session is authenticated.
+  It ships `hidden` and is revealed by app.js in the same synchronous step that
+  hides #setupContainer, so setup and dashboard can never both be painted (the
+  flicker the boot contract exists to prevent).
+
+  This markup deliberately uses the SAME element ids as the standalone /dashboard
+  page, so dashboard.js drives either one unchanged.
+-->
+<div id="dashboardContainer" hidden>
+<div id="ccApp" class="cc-shell">
+  <header class="cc-header">
+    <div class="logo">&#9672;</div>
+    <div class="cc-head-text">
+      <h1>Master Control Center</h1>
+      <p class="sub" id="ccSub">Live swarm topology</p>
+    </div>
+    <div class="cc-code" title="This node's permanent code - pair a Satellite with it once.">
+      <span class="cc-code-label">NODE CODE</span>
+      <code id="ccNodeCode">-</code>
+    </div>
+    <button id="ccSetupBtn" type="button" class="ghost" title="Node settings">&#9881; Setup</button>
+    <button id="ccLock" type="button" class="ghost">&#128274; Lock</button>
+  </header>
+
+  <!-- SUMMARY TILES -->
+  <section class="cc-stats">
+    <div class="tile"><span class="tile-label">Satellites</span><strong id="statTotal">0</strong></div>
+    <div class="tile"><span class="tile-label">Online</span><strong id="statOnline" class="ok">0</strong></div>
+    <div class="tile"><span class="tile-label">Running</span><strong id="statBusy">0</strong></div>
+    <div class="tile"><span class="tile-label">P2P Revoked</span><strong id="statRevoked" class="warn">0</strong></div>
+    <div class="tile"><span class="tile-label">Avg Efficiency</span><strong id="statEff">-</strong></div>
+    <div class="tile" id="otaTile"><span class="tile-label">Fleet Version</span><strong id="statOta">-</strong></div>
+  </section>
+
+  <!-- OTA STRIP: running build vs. the latest published GitHub release. -->
+  <section class="cc-ota" id="ccOta" hidden>
+    <span class="ota-dot"></span>
+    <span id="otaText">Checking for updates...</span>
+    <button id="otaPush" type="button" class="ghost cc-restore" hidden>Push to Swarm Now</button>
+  </section>
+
+  <!-- CONTROL BAR: dispatch a shared task (the Master auto-provisions P2P). -->
+  <section class="cc-control">
+    <input id="taskLabel" type="text" placeholder="Shared task - e.g. verify Lamington NP facts" />
+    <select id="taskLoad" aria-label="Task load">
+      <option value="lite">Lite</option>
+      <option value="normal" selected>Normal</option>
+      <option value="heavy">Heavy</option>
+    </select>
+    <button id="taskRun" type="button" class="save cc-run">&#9654; Assign to Swarm</button>
+  </section>
+  <div id="ccAlert" class="alert hidden"></div>
+<main class="cc-main">
+    <!-- SWARM GRID - one card per satellite: code, IP, status, task, vitals. -->
+    <section class="cc-panel">
+      <h2>Swarm Grid</h2>
+      <p class="hint">Every paired satellite with its live CPU, RAM and uptime. Click a node for full detail.</p>
+      <div id="topology" class="cc-grid"></div>
+      <p id="topologyEmpty" class="cc-empty">
+        No satellites paired yet. On a new node open its dashboard, choose
+        <strong>Satellite</strong>, enter this Master's node code or IP once &mdash; pairing is all that is required.
+      </p>
+    </section>
+
+    <!-- MASTER BRAIN PARITY - the drop zone. -->
+    <section class="cc-panel">
+      <h2>Master Brain Parity</h2>
+      <p class="hint">Load <code>rippa-brain-master.json</code> to give this node the Mothership's knowledge.</p>
+      <div id="brainDrop" class="brain-drop" role="button" tabindex="0"
+           aria-label="Upload a master brain bundle">
+        <div class="brain-drop-inner">
+          <span class="brain-drop-icon" aria-hidden="true">&#9672;</span>
+          <strong id="brainDropTitle">Drop rippa-brain-master.json here</strong>
+          <span class="brain-drop-sub">or click to choose the file</span>
+        </div>
+        <!--
+          Progress is driven by a real progress event while the file is read, so
+          the bar reflects bytes actually consumed rather than a decorative
+          animation. A bundle can be tens of megabytes, so the wait is real.
+        -->
+        <div class="brain-progress" id="brainProgress" hidden>
+          <div class="bar"><div class="bar-fill" id="brainProgressBar" style="width:0%"></div></div>
+          <span class="hint" id="brainProgressText">Reading...</span>
+        </div>
+        <input id="brainFile" type="file" accept="application/json,.json" hidden />
+      </div>
+      <div id="brainStatus" class="brain-status" hidden>
+        <span id="brainBadge" class="brain-badge">-</span>
+        <span id="brainCounts" class="hint"></span>
+      </div>
+      <p id="brainMessage" class="hint" hidden></p>
+    </section>
+
+    <!-- ACTIVE PROCESSES -->
+    <section class="cc-panel">
+      <h2>Active Processes</h2>
+      <p class="hint">Nodes on the same task share a colour and are linked together.</p>
+      <div id="processes" class="cc-proc-list"></div>
+      <p id="processesEmpty" class="cc-empty">No shared tasks running.</p>
+    </section>
+  </main>
+
+</div>
+</div>
+
+
+<!-- SATELLITE DETAIL MODAL -->
+<div id="ccModal" class="lock" hidden>
+  <div class="lock-card cc-modal-card">
+    <button id="ccModalClose" type="button" class="cc-modal-x" title="Close">&#10005;</button>
+    <div class="logo big" id="ccModalLogo">&#128760;</div>
+    <h1 id="ccModalName">Satellite</h1>
+    <p class="sub" id="ccModalCode">-</p>
+
+    <div class="cc-modal-body">
+      <!-- Current task & progress -->
+      <div class="metric-block">
+        <h3>Current Task</h3>
+        <p id="mTask" class="metric-line">Idle</p>
+        <div class="bar"><div id="mBar" class="bar-fill" style="width:0%"></div></div>
+        <p id="mTaskMeta" class="hint">-</p>
+      </div>
+
+      <!-- System vitals: CPU, RAM, uptime - the same figures shown on the card. -->
+      <div class="metric-block">
+        <h3>System Vitals</h3>
+        <div class="load-row"><span>CPU</span><div class="bar"><div class="bar-fill heavy" id="mCpu"></div></div><span id="mCpuVal">-</span></div>
+        <div class="load-row"><span>RAM</span><div class="bar"><div class="bar-fill normal" id="mRam"></div></div><span id="mRamVal">-</span></div>
+        <div class="load-row"><span>Uptime</span><div class="bar"><div class="bar-fill lite" id="mUptime"></div></div><span id="mUptimeVal">-</span></div>
+        <p class="hint" id="mCores">-</p>
+      </div>
+
+      <!-- Efficiency -->
+      <div class="metric-block">
+        <h3>Efficiency Score</h3>
+        <div class="score-row">
+          <div class="score-ring" id="mScoreRing"><span id="mScore">0</span></div>
+          <p class="hint" id="mScoreNote">Uptime + successful task completion.</p>
+        </div>
+      </div>
+
+      <!-- Load handling -->
+      <div class="metric-block">
+        <h3>Load Handling</h3>
+        <div class="load-row"><span>Heavy</span><div class="bar"><div class="bar-fill heavy" id="mHeavy"></div></div><span id="mHeavyVal">-</span></div>
+        <div class="load-row"><span>Normal</span><div class="bar"><div class="bar-fill normal" id="mNormal"></div></div><span id="mNormalVal">-</span></div>
+        <div class="load-row"><span>Lite</span><div class="bar"><div class="bar-fill lite" id="mLite"></div></div><span id="mLiteVal">-</span></div>
+      </div>
+
+      <!-- Problem solving -->
+      <div class="metric-block">
+        <h3>Problem Solving Rate</h3>
+        <p class="metric-line"><strong id="mPsa">0%</strong></p>
+        <p id="mPsaNote" class="hint">Captcha / retry loops resolved without failing the task.</p>
+      </div>
+
+      <!-- Networking -->
+      <div class="metric-block">
+        <h3>Networking</h3>
+        <p class="hint" id="mNet">-</p>
+        <button id="mRestoreP2p" type="button" class="ghost cc-restore" hidden>Restore P2P</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="app.js"></script>
+<script src="dashboard.js"></script>
 </body>
 </html>
-

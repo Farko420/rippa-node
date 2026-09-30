@@ -201,10 +201,38 @@ export async function fetchLatestRelease(repo = GITHUB_REPO): Promise<ReleaseInf
   const token = (process.env.RIPPA_GITHUB_TOKEN || "").trim();
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  const response = await axios.get(
-    `https://api.github.com/repos/${repo}/releases/latest`,
-    { headers, timeout: 20_000 },
-  );
+  /*
+    A 404 IS THE NORMAL, EXPECTED ANSWER until the first release is published —
+    GitHub says "no such resource", not "something is wrong". But axios rejects
+    it as an error, and an unhandled rejection here used to print a raw error
+    stack on every poll, which buried the real log output.
+
+    So: swallow the 404 quietly, say so once in plain language, and let every
+    OTHER failure (401 rate limit, 5xx, DNS, timeout) keep propagating to the
+    caller's catch, which still logs it as a warning.
+  */
+  let response;
+  try {
+    response = await axios.get(`https://api.github.com/repos/${repo}/releases/latest`, {
+      headers,
+      timeout: 20_000,
+      // Treat 404 as a value rather than an exception at the HTTP layer too,
+      // so axios can never reject this response in the first place.
+      validateStatus: (status) => (status === 404 ? true : status >= 200 && status < 300),
+    });
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.status === 404) {
+      console.log("[Updater] No published releases found on GitHub yet.");
+      return null;
+    }
+    throw error;
+  }
+
+  if (response.status === 404) {
+    console.log("[Updater] No published releases found on GitHub yet.");
+    return null;
+  }
+
   return parseLatestRelease(response.data);
 }
 
@@ -319,7 +347,9 @@ export class SwarmUpdater {
     try {
       release = await fetchLatestRelease();
     } catch (error) {
-      // A 404 is the normal state before the first release is published.
+      // 404 is handled inside fetchLatestRelease and returns null, so anything
+      // reaching here is a genuine fault (rate limit, 5xx, DNS, timeout) and is
+      // still worth a warning line.
       console.warn(`[Updater] GitHub check failed — ${describeError(error)}`);
       return;
     }

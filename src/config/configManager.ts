@@ -306,6 +306,31 @@ export function isConfigComplete(cfg: RippaNodeConfig | null | undefined): boole
 }
 
 /**
+ * Names of the fields still blocking `isConfigComplete`, in form order.
+ *
+ * WHY THIS EXISTS: `isConfigComplete` is a boolean, so a node that saved a
+ * config.json which is still missing (say) a valid Mothership URL answers
+ * `configured: false` with no reason attached. The GUI then shows the Setup
+ * Screen forever and the operator has no idea which field to fix — which is
+ * exactly the "stuck on the setup screen" trap this list exists to remove.
+ *
+ * Deliberately derives from the SAME predicates as {@link isConfigComplete} so
+ * the two can never disagree about what is missing.
+ */
+export function describeConfigGaps(cfg: RippaNodeConfig | null | undefined): string[] {
+  if (!cfg) return ["config.json"];
+  const gaps: string[] = [];
+  if (!cfg.NODE_API_KEY || cfg.NODE_API_KEY.trim().length < 8) gaps.push("Node API Key");
+  if (!cfg.NODE_NAME || !cfg.NODE_NAME.trim()) gaps.push("Node Name");
+  if (cfg.NODE_ROLE === "satellite") {
+    if (!isHttpUrl(cfg.MASTER_LOCAL_URL)) gaps.push("Master Node URL");
+  } else if (!isHttpUrl(cfg.MOTHERSHIP_URL)) {
+    gaps.push("Mothership URL");
+  }
+  return gaps;
+}
+
+/**
  * Applies config.json values to `process.env` so the zod schema in `./config`
  * sees them. Keys already present in the true OS environment are left alone
  * unless `force` is set (GUI save = explicit operator intent to override).

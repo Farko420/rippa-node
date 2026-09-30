@@ -5,7 +5,11 @@ const roleHint = $("roleHint"), mothershipWrap = $("mothershipWrap"), masterUrlW
 const statusPill = $("statusPill"), keyState = $("keyState"), alertBox = $("alert"), saveBtn = $("save");
 const dashPin = $("dashPin"), pinState = $("pinState");
 const lockScreen = $("lockScreen"), dashCard = $("dashCard"), unlockPin = $("unlockPin");
-const bootScreen = $("bootScreen"), setupBanner = $("setupBanner");
+const bootScreen = $("bootScreen"), setupBanner = $("setupBanner"), setupGaps = $("setupGaps");
+// The setup form and the Master Control Center are SEPARATE containers in
+// index.html. Keeping them distinct is what lets a successful save actually
+// leave the setup screen instead of re-rendering it.
+const setupContainer = $("setupContainer"), dashboardContainer = $("dashboardContainer");
 const unlockBtn = $("unlockBtn"), lockAlert = $("lockAlert"), lockSub = $("lockSub");
 const satBridge = $("satBridge"), satMasterLabel = $("satMasterLabel");
 const bridgeLink = $("bridgeLink"), copyMasterBtn = $("copyMaster"), lockBtn = $("lockBtn");
@@ -20,10 +24,18 @@ let masterBridgeUrl = "";
  * Which screen is currently authoritative: "boot" | "setup" | "locked" | "dashboard".
  *
  * This is the single source of truth for screen visibility. Every container
- * (#bootScreen, #lockScreen, #dashCard) ships with the `hidden` attribute in
- * index.html, and `showScreen()` is the only function allowed to reveal one —
- * it always hides the others in the same synchronous step, so a screen can
- * never be painted over another (the Lock -> Setup flicker).
+ * (#bootScreen, #lockScreen, #setupContainer, #dashboardContainer) ships with the
+ * `hidden` attribute in index.html, and `showScreen()` is the only function
+ * allowed to reveal one - it always hides the others in the same synchronous
+ * step, so a screen can never be painted over another (the Lock -> Setup
+ * flicker).
+ *
+ * THE SETUP TRAP, EXPLICITLY: `setup` and `dashboard` are DIFFERENT containers.
+ * The setup form lives in #setupContainer and the Master Control Center lives in
+ * #dashboardContainer. An earlier build pointed both modes at the same
+ * #dashCard element, so "showing the dashboard" just re-showed the config form
+ * and a successful save appeared to do nothing. They are now separate, and
+ * transitioning means hiding one and showing the other.
  */
 
 /**
@@ -35,38 +47,52 @@ let masterBridgeUrl = "";
  * are kept so stale cached markup or CSS can never leave two screens visible
  * at the same time.
  *
+ * `display:block` is set explicitly for the dashboard because the Control
+ * Center's own layout rules expect a block container.
+ *
  * @param {"boot"|"setup"|"locked"|"dashboard"} screen
  */
 function showScreen(screen) {
   currentScreen = screen;
-  const setup = screen === "setup";
-  const locked = screen === "locked";
-  const dashboard = screen === "dashboard";
-  const booting = screen === "boot";
-  const set = (el, visible) => {
+  const set = (el, visible, display) => {
     if (!el) return;
     if (visible) {
       el.removeAttribute("hidden");
       el.classList.remove("hidden");
-      el.style.removeProperty("display");
+      el.style.display = display || "";
     } else {
       el.setAttribute("hidden", "");
       el.classList.add("hidden");
       el.style.display = "none";
     }
   };
-  set(bootScreen, booting);
-  set(lockScreen, locked);
-  set(dashCard, setup || dashboard);
-  if (setupBanner) set(setupBanner, setup);
+  set(bootScreen, screen === "boot");
+  set(lockScreen, screen === "locked");
+  // Setup and Dashboard are mutually exclusive containers. Showing one always
+  // hides the other in the same synchronous step - this is the fix for the
+  // operator being stranded on the setup screen after a successful save.
+  set(setupContainer, screen === "setup", "flex");
+  set(dashboardContainer, screen === "dashboard", "block");
+  if (setupBanner) setupBanner.hidden = screen !== "setup";
   // Expose the mode for CSS/inspection; handy when diagnosing a flicker.
   try { if (document.body) document.body.setAttribute("data-screen", screen); } catch (err) { /* noop */ }
-  if (locked) {
+  if (screen === "locked") {
     setTimeout(() => { try { if (unlockPin) unlockPin.focus(); } catch (err) { /* noop */ } }, 50);
   }
 }
 
 let currentScreen = "boot";
+
+/**
+ * True once the operator has explicitly opened the settings on a CONFIGURED
+ * node (the Control Center's "Setup" button).
+ *
+ * While set, load() will not auto-advance to the dashboard, so the form stays on
+ * screen while it is being read. It is cleared the moment the operator lands on
+ * the dashboard through any other path, so the trap escape hatch is always armed
+ * except during a deliberate settings visit.
+ */
+let userPinnedToSetup = false;
 
 /**
  * Last config loaded from /api/system/config, kept as the authoritative source
@@ -384,6 +410,41 @@ if (lockBtn) lockBtn.addEventListener("click", async () => {
   showLocked();
 });
 
+// CROSS-SCRIPT HOOKS for dashboard.js.
+//
+// The merged index.html loads both scripts as plain (non-module) scripts: they
+// share one global scope but there is no import boundary between them. Exposing
+// these two transitions lets the Control Center's Lock and Setup buttons move
+// between containers in place, instead of each navigating away and re-running the
+// whole boot probe from scratch.
+//
+// Both are optional and guarded on the dashboard side: the standalone
+// /dashboard page has no lock screen or setup form, so there is nothing to show.
+window.RippaShowLocked = showLocked;
+
+// "Back to Command Center" — the inverse of RippaShowSetup. Clears the settings
+// pin so the trap escape hatch is armed again, then reveals the dashboard.
+const backToDash = $("backToDash");
+if (backToDash) {
+  backToDash.addEventListener("click", () => {
+    userPinnedToSetup = false;
+    showScreen("dashboard");
+    try { if (typeof window.RippaControlCenterStart === "function") window.RippaControlCenterStart(); } catch (err) { /* noop */ }
+    try { void refreshRole(); } catch (err) { /* noop */ }
+  });
+}
+window.RippaShowSetup = async () => {
+  // Pin to setup so load()'s trap escape hatch does not immediately bounce the
+  // operator back to the dashboard they deliberately navigated away from.
+  userPinnedToSetup = true;
+  showScreen("setup");
+  // Re-read the saved config so the form shows current values, not stale ones.
+  // showScreen("setup") is re-asserted afterwards so a slow read cannot leave
+  // the operator looking at a half-rendered form.
+  try { await load(); } catch (err) { /* the screen is already correct */ }
+  showScreen("setup");
+};
+
 /**
  * BOOT SEQUENCER — the only place a screen is chosen from server state.
  *
@@ -425,8 +486,13 @@ async function checkAuth() {
       return false;
     }
     // Configured + authenticated -> Dashboard.
+    // Clear the settings pin here: reaching the dashboard through the normal
+    // boot path means any deliberate "view settings" visit is over, so the trap
+    // escape hatch must be armed again for the next config read.
+    userPinnedToSetup = false;
     showScreen("dashboard");
     showUnlocked();
+    try { if (typeof window.RippaControlCenterStart === "function") window.RippaControlCenterStart(); } catch (err) { /* noop */ }
     return true;
   } catch (e) {
     showLocked("Could not verify node status — is it online?");
@@ -434,9 +500,44 @@ async function checkAuth() {
   }
 }
 
+/**
+ * Renders the server's `missing` list into the setup banner.
+ *
+ * Without this the setup screen said only "setup required" with nothing to act
+ * on. The server now names the specific fields still blocking a complete
+ * config, so an operator can see exactly what to fill in.
+ */
+function renderSetupGaps(missing) {
+  if (!setupGaps) return;
+  const list = Array.isArray(missing) ? missing.filter(Boolean) : [];
+  setupGaps.innerHTML = "";
+  if (list.length === 0) {
+    // Configured: leave the list empty so a stale list can never linger.
+    if (setupBanner) {
+      setupBanner.innerHTML =
+        "<strong>Setup incomplete.</strong> This node has no usable <code>config.json</code> yet &mdash; fill in your details below and save to start the node services.";
+    }
+    return;
+  }
+  for (const item of list) {
+    const li = document.createElement("li");
+    li.textContent = item;
+    setupGaps.appendChild(li);
+  }
+  if (setupBanner) {
+    setupBanner.insertAdjacentHTML(
+      "beforeend",
+      ` <span class="hint">Still required: ${list.join(", ")}.</span>`,
+    );
+  }
+}
+
 async function load() {
   try {
-    const res = await fetch("/api/system/config", { credentials: "same-origin", headers: authHeaders() });
+    // GET /api/config - the canonical "what is saved right now" read. The server
+    // recomputes `configured` from config.json on every call, so this can never
+    // return a stale cached copy after a save.
+    const res = await fetch("/api/config", { credentials: "same-origin", headers: authHeaders() });
     if (res.status === 401) {
       // The session expired between the boot probe and this fetch. Only drop to
       // the Lock Screen if we were showing the authenticated dashboard — during
@@ -453,7 +554,7 @@ async function load() {
     if (role) role.value = c.node_role || c.NODE_ROLE || "master";
     if (mothership) mothership.value = c.mothership_url || c.MOTHERSHIP_URL || "https://rippaadventures.com";
     if (masterUrl) { masterUrl.value = c.master_node_url || c.MASTER_LOCAL_URL || ""; masterBridgeUrl = masterUrl.value; }
-    // The authoritative master_node_url from /api/system/config becomes the
+    // The authoritative master_node_url from the config payload becomes the
     // bridge anchor's href. The browser opens it natively — no click handler.
     applyBridgeHref(c.master_node_url || c.MASTER_LOCAL_URL || "");
     if (cloudLink) cloudLink.value = c.cloud_link_code || c.CLOUD_LINK_CODE || "";
@@ -466,6 +567,35 @@ async function load() {
     if (keyState) keyState.textContent = c.apiKeyConfigured ? "✓ API key is configured." : "⚠ No API key saved yet.";
     if (pinState) pinState.textContent = c.pinConfigured ? "✓ Passkey is set. Leave blank to keep it." : "⚠ No passkey set — set one now.";
     if (statusPill) { statusPill.textContent = data.configured ? "● configured" : "● setup required"; statusPill.className = "pill " + (data.configured ? "ok" : "warn"); }
+    renderSetupGaps(data.missing);
+
+    // The return path only exists on a CONFIGURED node — on an unconfigured one
+    // there is no dashboard to return to, so the button stays hidden rather than
+    // offering a dead end.
+    const backBtn = $("backToDash");
+    if (backBtn) backBtn.hidden = !data.configured;
+
+    /*
+      THE ESCAPE HATCH FROM THE SETUP TRAP.
+
+      Re-evaluated on EVERY config read, not just at boot. If the saved config is
+      now complete but the operator is sitting on the setup screen (because the
+      save landed after the last screen decision, or because they were sent here
+      by a stale tab), this hides #setupContainer and shows #dashboardContainer
+      immediately.
+
+      `userPinnedToSetup` suppresses this ONLY while the operator has explicitly
+      asked to view the settings (the Control Center's "Setup" button). Without
+      that guard, deliberately opening the settings of a configured node would
+      bounce straight back to the dashboard on the very next read — the mirror
+      image of the original trap, and just as confusing.
+    */
+    if (data.configured && currentScreen === "setup" && !userPinnedToSetup) {
+      if (data.authenticated) {
+        showScreen("dashboard");
+        try { if (typeof window.RippaControlCenterStart === "function") window.RippaControlCenterStart(); } catch (err) { /* noop */ }
+      }
+    }
     const lan = $("lanHint");
     if (lan) lan.textContent = location.host + " (bound 0.0.0.0)";
   } catch (e) {
@@ -508,10 +638,37 @@ if (saveBtn) saveBtn.addEventListener("click", async () => {
       const msgs = (data.errors || []).map((e) => e.path + ": " + e.message).join("\n") || data.message || "Save failed";
       showAlert(msgs, "err");
     } else {
-      showAlert("✓ " + data.message, "ok");
+      /*
+        LEAVE THE SETUP SCREEN.
+
+        The POST response now carries the freshly-read config payload, so
+        `configured` here reflects what is ACTUALLY on disk. If the save produced
+        a complete config we transition immediately; if it did not, we stay put
+        and show exactly which fields are still missing.
+
+        This is the direct fix for the reported trap: previously the save
+        succeeded, the alert said so, and the screen never changed - the
+        operator was left on the form with a valid config.json beside it.
+      */
       if (apiKey) apiKey.value = "";
       if (dashPin) dashPin.value = "";
       await load();
+      if (data.configured) {
+        showAlert("✓ " + data.message, "ok");
+        userPinnedToSetup = false;
+        showScreen("dashboard");
+        try { if (typeof window.RippaControlCenterStart === "function") window.RippaControlCenterStart(); } catch (err) { /* noop */ }
+      } else {
+        // Still incomplete. Say why, and name the fields.
+        const gaps = Array.isArray(data.missing) ? data.missing : [];
+        renderSetupGaps(gaps);
+        showAlert(
+          "Saved, but setup is not complete yet." +
+            (gaps.length ? " Still required: " + gaps.join(", ") + "." : ""),
+          "err",
+        );
+        showScreen("setup");
+      }
     }
   } catch (e) {
     try { showAlert("Save failed: " + (e && e.message ? e.message : e), "err"); } catch (err2) { /* noop */ }

@@ -127,6 +127,42 @@ async function loadBrainStatus() {
   }
 }
 
+/**
+ * Reads a File with a real progress bar.
+ *
+ * A master brain bundle can be tens of megabytes, and `file.text()` gives the
+ * operator a frozen drop zone for the whole read with no explanation. This
+ * reports genuine byte progress via FileReader's `progress` event, so the bar
+ * moves because bytes were actually consumed rather than on a decorative timer.
+ */
+function readFileWithProgress(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onprogress = (event) => {
+      if (event.lengthComputable && typeof onProgress === "function") {
+        onProgress(event.loaded / event.total);
+      }
+    };
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("The file could not be read."));
+    reader.readAsText(file);
+  });
+}
+
+/** Shows, moves and hides the drop zone's progress bar. */
+function setBrainProgress(percent, text) {
+  const wrap = $("brainProgress");
+  const bar = $("brainProgressBar");
+  const label = $("brainProgressText");
+  if (percent === null) {
+    if (wrap) wrap.hidden = true;
+    return;
+  }
+  if (wrap) wrap.hidden = false;
+  if (bar) bar.style.width = Math.max(0, Math.min(100, percent)) + "%";
+  if (label && text) label.textContent = text;
+}
+
 async function uploadBrainFile(file) {
   const drop = $("brainDrop");
   const title = $("brainDropTitle");
@@ -139,20 +175,34 @@ async function uploadBrainFile(file) {
   drop.classList.add("busy");
   title.textContent = "Reading " + file.name + "…";
   setBrainMessage("");
+  // Indeterminate until the first progress event arrives, so the bar is present
+  // and visibly "working" even for a file small enough to read in one tick.
+  setBrainProgress(4, "Reading " + file.name + "…");
 
   let parsed;
   try {
     // A bundle can be tens of megabytes, so this parse is the slow part of the
-    // whole interaction and the UI says so rather than appearing to hang.
-    parsed = JSON.parse(await file.text());
+    // whole interaction and the UI reports it rather than appearing to hang.
+    const text = await readFileWithProgress(file, (fraction) => {
+      setBrainProgress(fraction * 100, "Reading " + (fraction * 100).toFixed(0) + "%…");
+    });
+    setBrainProgress(100, "Parsing bundle…");
+    parsed = JSON.parse(text);
   } catch (err) {
     drop.classList.remove("busy");
-    title.textContent = "Drop the brain bundle here";
-    setBrainMessage("That file is not valid JSON — it may be truncated.", "error");
+    title.textContent = "Drop rippa-brain-master.json here";
+    setBrainProgress(null);
+    setBrainMessage(
+      err instanceof SyntaxError
+        ? "That file is not valid JSON — it may be truncated."
+        : "The file could not be read: " + ((err && err.message) || String(err)),
+      "error",
+    );
     return;
   }
 
   title.textContent = "Loading…";
+  setBrainProgress(100, "Uploading to the node…");
   try {
     const { response, data } = await api("/api/brain/upload-backup", {
       method: "POST",
@@ -174,11 +224,14 @@ async function uploadBrainFile(file) {
     setBrainMessage(String((err && err.message) || err), "error");
   } finally {
     drop.classList.remove("busy");
-    title.textContent = "Drop the brain bundle here";
-    const input = $("brainFile");
+    title.textContent = "Drop rippa-brain-master.json here";
     // Cleared so re-picking the SAME file fires `change` again — otherwise a
     // second attempt after a fix appears to do nothing at all.
+    const input = $("brainFile");
     if (input) input.value = "";
+    // Leave the completed bar up briefly so the success state is legible before
+    // the zone returns to its idle appearance.
+    setTimeout(() => setBrainProgress(null), 1200);
   }
 }
 
@@ -269,6 +322,59 @@ function renderSummary(summary) {
  * Draws the topology grid — one card per satellite, by Node Name.
  * Clicking a card opens the detail modal.
  */
+/**
+ * Formats a duration in seconds as a compact human string ("3d 4h", "12m 08s").
+ *
+ * Used for the uptime readouts. Hours are dropped when there are days, and
+ * seconds are dropped when there are hours, because a card has room for roughly
+ * eight characters and "4d 03:12:47" would not fit legibly.
+ */
+function formatUptime(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (total < 60) return total + "s";
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return minutes + "m " + String(total % 60).padStart(2, "0") + "s";
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + "h " + String(minutes % 60).padStart(2, "0") + "m";
+  const days = Math.floor(hours / 24);
+  return days + "d " + String(hours % 24).padStart(2, "0") + "h";
+}
+
+/**
+ * Maps host uptime onto a 0-100 scale for the bar.
+ *
+ * The bar is a *relative* health indicator, not a percentage of anything: 24h
+ * of uptime is a good sign for a node that is meant to run continuously, and the
+ * scale saturates there. Showing "42%" for 10 hours would imply a score the
+ * number has no meaning for, so the raw duration in the readout carries the
+ * actual figure and the bar only conveys "new vs. established".
+ */
+function uptimePercent(seconds) {
+  const value = Number(seconds);
+  if (!isFinite(value) || value <= 0) return null;
+  return Math.min(100, (value / (24 * 3600)) * 100);
+}
+
+/**
+ * One labelled vitals bar (CPU / RAM / uptime) for a node card.
+ *
+ * A node that has not reported a figure yet (an older build, or a satellite
+ * still mid-handshake) renders an explicit "-" rather than a fake 0% bar —
+ * a zero-width bar next to "0%" would read as "idle and healthy" when the truth
+ * is "no data", which is the opposite of what a health readout should do.
+ */
+function vitalsRow(kind, label, percent, value) {
+  const hasData = typeof percent === "number" && isFinite(percent);
+  const width = hasData ? Math.max(0, Math.min(100, percent)) : 0;
+  return (
+    '<div class="nm-row ' + kind + '">' +
+      '<span class="nm-label">' + label + "</span>" +
+      '<div class="bar"><div class="bar-fill" style="width:' + width + '%"></div></div>' +
+      '<span class="nm-val">' + (hasData ? value : "—") + "</span>" +
+    "</div>"
+  );
+}
+
 function renderTopology(satellites) {
   const grid = $("topology");
   const empty = $("topologyEmpty");
@@ -288,6 +394,10 @@ function renderTopology(satellites) {
     const accent = task ? taskColor(task.id) : "";
     if (accent) card.style.setProperty("--accent", accent);
 
+    // Node IP, so a moved or re-addressed machine is obvious at a glance.
+    const endpoint = satellite.endpoint || {};
+    const ip = endpoint.ipAddress || "";
+
     card.innerHTML =
       '<div class="node-accent"' + (accent ? ' style="background:' + accent + '"' : "") + "></div>" +
       '<div class="node-top">' +
@@ -295,12 +405,22 @@ function renderTopology(satellites) {
         '<span class="node-name">' + esc(satellite.nodeName) + "</span>" +
       "</div>" +
       '<div class="node-code">' + esc(satellite.nodeCode) + "</div>" +
+      (ip ? '<div class="node-ip">' + esc(ip) + "</div>" : "") +
       '<div class="node-task">' + (task ? esc(task.label) : "Idle") + "</div>" +
       '<div class="node-badges">' +
         '<span class="badge ' + (task ? "busy" : "") + '">' + (task ? esc(task.load) : "idle") + "</span>" +
         '<span class="badge ' + (satellite.p2pRevoked ? "relay" : "p2p") + '">' +
           (satellite.p2pRevoked ? "master-relay" : "P2P") + "</span>" +
         '<span class="badge">' + (satellite.efficiency ?? 0) + "% eff</span>" +
+      "</div>" +
+      // LIVE NODE METRICS — CPU, RAM and uptime, straight from the satellite's
+      // own telemetry. These answer "is this machine healthy", which the swarm
+      // counters above cannot.
+      '<div class="node-metrics">' +
+        vitalsRow("cpu", "CPU", satellite.cpuUsage, Math.round(satellite.cpuUsage ?? 0) + "%") +
+        vitalsRow("ram", "RAM", satellite.ramUsage, Math.round(satellite.ramUsage ?? 0) + "%") +
+        vitalsRow("uptime", "UP", uptimePercent(satellite.uptimeSeconds),
+          formatUptime(satellite.uptimeSeconds)) +
       "</div>";
 
     card.addEventListener("click", () => openSatellite(satellite.nodeCode));
@@ -431,6 +551,22 @@ function renderSatelliteDetail(satellite) {
     "Uptime " + Math.round(metrics.uptimeSeconds || 0) + "s · " +
       (metrics.tasksSucceeded || 0) + " succeeded / " +
       ((metrics.tasksFailed || 0) + (metrics.tasksTimedOut || 0)) + " not completed",
+  );
+
+  // --- System vitals (the same figures shown on the swarm grid card) ---
+  const hasCpu = typeof satellite.cpuUsage === "number" && isFinite(satellite.cpuUsage);
+  const hasRam = typeof satellite.ramUsage === "number" && isFinite(satellite.ramUsage);
+  setBar("mCpu", hasCpu ? satellite.cpuUsage : 0);
+  setText("mCpuVal", hasCpu ? Math.round(satellite.cpuUsage) + "%" : "—");
+  setBar("mRam", hasRam ? satellite.ramUsage : 0);
+  setText("mRamVal", hasRam ? Math.round(satellite.ramUsage) + "%" : "—");
+  setBar("mUptime", uptimePercent(satellite.uptimeSeconds) || 0);
+  setText("mUptimeVal", formatUptime(satellite.uptimeSeconds));
+  setText(
+    "mCores",
+    satellite.cpuCores
+      ? satellite.cpuCores + " logical cores · host uptime " + formatUptime(satellite.uptimeSeconds)
+      : "Host uptime " + formatUptime(satellite.uptimeSeconds),
   );
 
   // --- Load handling metrics ---
@@ -651,9 +787,26 @@ if (lockBtn) {
     try {
       await api("/api/system/auth/logout", { method: "POST", body: "{}" });
     } catch (err) {
-      /* navigate anyway — the lock screen enforces access server-side */
+      /* continue anyway — the lock screen enforces access server-side */
     }
-    window.location.href = "/";
+    // On the merged index.html the Lock Screen is already in this document, so
+    // app.js can reveal it directly. A full navigation would work too, but it
+    // would throw away the page and re-run the whole boot probe for no reason.
+    // The standalone /dashboard page has no lock screen, so it navigates home.
+    if (window.RippaShowLocked) {
+      window.RippaShowLocked();
+    } else {
+      window.location.href = "/";
+    }
+  });
+}
+
+// "Setup" returns to the config form without leaving the page (merged page only;
+// the standalone dashboard uses an <a href="/">, which this button is not).
+const setupBtn = $("ccSetupBtn");
+if (setupBtn) {
+  setupBtn.addEventListener("click", () => {
+    if (window.RippaShowSetup) window.RippaShowSetup();
   });
 }
 
@@ -665,17 +818,46 @@ if (labelInput) {
   });
 }
 
-void refresh();
-// OTA status is slower-moving than the topology, so it polls on its own slower
-// cadence rather than piggy-backing on every 5s snapshot refresh.
-void refreshUpdater();
-setInterval(() => void refreshUpdater(), 60_000);
+/*
+ * CONTROL CENTER STARTUP — idempotent, and called by app.js.
 
-// The brain panel is wired once, not on every 5s refresh: the drop zone holds DOM
-// listeners and a hidden file input, and re-binding them every five seconds would
-// be both wasteful and a way to end up with two drop handlers firing per drop.
-wireBrainPanel();
+ * index.html now embeds the dashboard inside #dashboardContainer, so this file
+ * loads on a page that may still be showing the Setup Screen. Auto-starting the
+ * 5s poll immediately would fire authenticated requests from a screen the
+ * operator never opened — and, worse, the first 401 would bounce them to "/",
+ * reloading the page. So the poll only begins once app.js reveals the dashboard.
+ *
+ * On the standalone /dashboard page there is no #dashboardContainer, and the
+ * page IS the dashboard, so it starts itself immediately (the original
+ * behaviour, and the path that keeps that page working unchanged).
+ *
+ * Exposed on `window` because app.js is a separate classic script with no module
+ * boundary to import across.
+ */
+let controlCenterStarted = false;
+function startControlCenter() {
+  // Guard against a second call: two poll loops would double every request and
+  // render each snapshot twice.
+  if (controlCenterStarted) return;
+  controlCenterStarted = true;
 
-// Polls for the life of the page; no teardown hook is needed because the
-// document is discarded wholesale when the operator navigates away.
-setInterval(() => void refresh(), REFRESH_MS);
+  void refresh();
+  // OTA status is slower-moving than the topology, so it polls on its own slower
+  // cadence rather than piggy-backing on every 5s snapshot refresh.
+  void refreshUpdater();
+  setInterval(() => void refreshUpdater(), 60_000);
+
+  // The brain panel is wired once, not on every 5s refresh: the drop zone holds
+  // DOM listeners and a hidden file input, and re-binding them every five seconds
+  // would be both wasteful and a way to end up with two drop handlers firing per
+  // drop.
+  wireBrainPanel();
+
+  // Polls for the life of the page; no teardown hook is needed because the
+  // document is discarded wholesale when the operator navigates away.
+  setInterval(() => void refresh(), REFRESH_MS);
+}
+window.RippaControlCenterStart = startControlCenter;
+
+// Standalone /dashboard: this document IS the Control Center, so start now.
+if (!$("dashboardContainer")) startControlCenter();
