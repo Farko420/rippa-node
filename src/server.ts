@@ -237,6 +237,47 @@ export function createApp(): Express {
   const app = express();
 
   /*
+    CROSS-ORIGIN ACCESS FOR THE MESH API — AND ONLY FOR IT.
+
+    A Capacitor WebView's origin is `http://localhost` (Android) or
+    `capacitor://localhost` (iOS). Neither matches a Master Node reached by LAN IP
+    or hostname, so EVERY request a phone satellite makes is cross-origin and is
+    refused by the browser's same-origin policy before it reaches a route. Without
+    this block the satellite feature cannot work at all, and the symptom is an
+    opaque network error in the phone's console rather than anything on the node.
+
+    SCOPED TO `/api/mesh/*` DELIBERATELY, and that scope is the security decision.
+    The node also serves the dashboard PIN, `POST /api/system/config` (which writes
+    the node's configuration) and the static GUI. None of those may be reachable
+    from a browser on the LAN that merely happens to be on the same subnet, and a
+    blanket `Access-Control-Allow-Origin: *` would put all of them in reach. The
+    mesh API is the one surface a satellite genuinely needs cross-origin, and it is
+    guarded by the mesh key — so this widens WHO can ask, not WHAT they can do.
+
+    `Vary: Origin` is present because these responses are per-origin, and without
+    it a shared cache could serve one origin's CORS headers to another.
+
+    The mesh routes themselves authenticate independently: `/api/mesh/result` and
+    `/api/mesh/peer-outcome` require a valid mesh key, and the dashboard
+    (`/api/system/*`, `/dashboard`) is PIN-gated and not in this scope.
+  */
+  app.use("/api/mesh", (req: Request, res: Response, next: NextFunction) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Mesh-Key, Authorization");
+    res.setHeader("Access-Control-Max-Age", "600");
+    res.setHeader("Vary", "Origin");
+    // A preflight must be ANSWERED, not passed to the router — there is no
+    // OPTIONS handler below, so without this the preflight would 404 and the real
+    // request would never be sent.
+    if (req.method === "OPTIONS") {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  /*
     THE BRAIN BUNDLE PARSER, REGISTERED BEFORE THE GLOBAL ONE.
 
     `express.json()`'s DEFAULT LIMIT IS 100 kB, and a brain bundle is orders of
