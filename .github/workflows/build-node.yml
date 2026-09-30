@@ -1,0 +1,121 @@
+name: build-node
+
+# Every push to main compiles the portable .exe and publishes it to a rolling
+# "latest" release. The fleet's Master polls this release hourly and rolls the
+# whole swarm forward automatically — no operator action anywhere.
+on:
+  push:
+    branches: [main]
+  # Allows a manual re-run (e.g. after fixing a failed build) from the UI.
+  workflow_dispatch:
+  # Also run when a version is manually edited in package.json.
+  release:
+    types: [published]
+
+permissions:
+  contents: write # required to create/update a release and upload assets
+
+# A newer push to main always wins; never cancel a release upload midway,
+# because that can leave a release pointing at a partial asset.
+concurrency:
+  group: build-node-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build rippa-node.exe and publish release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # npm ci is preferred over npm install for reproducibility, but it fails
+      # without a lockfile in sync; fall back so the build is never blocked.
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "npm ci failed - falling back to npm install"
+            npm install
+          }
+
+      # Bump the patch version so the fleet's isVersionNewer() comparison sees a
+      # genuinely newer release on every push. The bumped version is committed
+      # back so package.json stays the single source of truth for the app.
+      - name: Bump version
+        id: version
+        shell: pwsh
+        run: |
+          $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+          $parts = $pkg.version.Split('.')
+          $major = [int]$parts[0]
+          $minor = [int]$parts[1]
+          $patch = [int]$parts[2] + 1
+          $newVersion = "$major.$minor.$patch"
+          npm version $newVersion --no-git-tag-version --allow-same-version
+          $pkg.version = $newVersion
+          $pkg | ConvertTo-Json -Depth 10 | Set-Content package.json
+          Write-Host "Building version $newVersion"
+          "version=$newVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Build the portable .exe
+        shell: pwsh
+        run: npm run package
+
+      - name: Verify the artifact exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist\rippa-node.exe)) {
+            Write-Error "dist\rippa-node.exe was not produced by npm run package"
+            exit 1
+          }
+          $size = (Get-Item dist\rippa-node.exe).Length
+          Write-Host ("Artifact size: {0:N1} MB" -f ($size / 1MB))
+          if ($size -lt 1MB) {
+            Write-Error "Artifact is implausibly small - refusing to publish"
+            exit 1
+          }
+
+      # Ship the checksum with the release so the updater can verify the binary
+      # it downloads instead of trusting size + PE magic alone.
+      - name: Compute SHA-256
+        id: checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist\rippa-node.exe -Algorithm SHA256).Hash.ToLower()
+          Write-Host "SHA256: $hash"
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Commit the version bump
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: bump version to ${{ steps.version.outputs.version }}"
+          file_pattern: package.json
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Rolling tag: always points at the newest build.
+          tag_name: latest
+          name: rippa-node ${{ steps.version.outputs.version }}
+          prerelease: false
+          draft: false
+          generate_release_notes: true
+          body: |
+            Automated build of `rippa-node.exe` (version `${{ steps.version.outputs.version }}`).
+
+            SHA-256: `${{ steps.checksum.outputs.sha256 }}`
+
+            The Master node polls this release hourly and broadcasts the update to
+            every paired satellite automatically.
+          files: |
+            dist/rippa-node.exe
+          fail_on_unmatched_files: true

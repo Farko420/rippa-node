@@ -17,6 +17,13 @@ import {
 } from "./config/nodeAuth";
 import { SwarmDispatcher, type LoadClass, type TaskOutcome } from "./services/swarmDispatcher";
 import {
+  SwarmUpdater,
+  handleUpdateTrigger,
+  isPackagedExe,
+  parseUpdateTrigger,
+} from "./services/updater";
+import { isVersionNewer } from "./version";
+import {
   DEFAULT_DASHBOARD_PIN,
   applyConfigToEnv,
   configFileExists,
@@ -80,6 +87,20 @@ const dispatcher = new SwarmDispatcher();
 /** The shared dispatcher used by the mesh API routes. */
 export function getDispatcher(): SwarmDispatcher {
   return dispatcher;
+}
+
+/**
+ * The GitHub OTA updater for this node.
+ *
+ * Owned by the server so the `/api/mesh/update-trigger` route and the boot
+ * sequence drive the SAME instance — two updaters would mean two competing
+ * download/swap attempts and a double `process.exit(0)`.
+ */
+const swarmUpdater = new SwarmUpdater(dispatcher);
+
+/** The shared OTA updater used by the mesh routes and by index.ts. */
+export function getSwarmUpdater(): SwarmUpdater {
+  return swarmUpdater;
 }
 
 /** Registers the re-initializer run after a GUI config save. */
@@ -673,7 +694,62 @@ export function createApp(): Express {
     });
   });
 
-  // Local Web GUI — static Settings UI from public/.
+  // POST /api/mesh/update-trigger — the Master tells this Satellite to update.
+  //
+  // This is the most security-sensitive mesh route: it ends with the node
+  // replacing its own binary. It is therefore guarded by the mesh key AND by
+  // strict payload validation (command, semver, http(s) URL only), so neither a
+  // spoofed body nor a compromised peer can make a node swap its executable.
+  app.post("/api/mesh/update-trigger", async (req: Request, res: Response) => {
+    if (!dispatcher.authenticate(meshKeyOf(req))) {
+      res.status(401).json({ success: false, message: "Invalid or missing mesh key." });
+      return;
+    }
+    const trigger = parseUpdateTrigger(req.body);
+    if (!trigger) {
+      res.status(400).json({
+        success: false,
+        message: "Malformed SWARM_UPDATE_TRIGGER payload — ignoring.",
+      });
+      return;
+    }
+
+    const outcome = await handleUpdateTrigger(swarmUpdater, trigger);
+    res.status(outcome.accepted ? 202 : 409).json({
+      success: outcome.accepted,
+      version: trigger.version,
+      message: outcome.message,
+    });
+  });
+
+// GET /api/mesh/updater — OTA status for the dashboard.
+  app.get("/api/mesh/updater", requireDashboardAuth, (_req: Request, res: Response) => {
+    const latest = swarmUpdater.getLatest();
+    res.json({
+      success: true,
+      currentVersion: APP_VERSION,
+      latest,
+      updateAvailable: latest ? isVersionNewer(latest.version) : false,
+      selfReplaceable: isPackagedExe(),
+      onlineSatellites: dispatcher.listOnlineSatellites().length,
+    });
+  });
+
+  // POST /api/mesh/broadcast-update — Master pushes the known release now.
+  app.post("/api/mesh/broadcast-update", requireDashboardAuth, async (_req: Request, res: Response) => {
+    const latest = swarmUpdater.getLatest();
+    if (!latest) {
+      res.status(409).json({
+        success: false,
+        message: "No release has been detected yet — waiting for the first GitHub check.",
+      });
+      return;
+    }
+    const delivered = await swarmUpdater.broadcast(latest);
+    res.json({ success: true, delivered, version: latest.version });
+  });
+
+// Local Web GUI — static Settings UI from public/.
   const publicDir = resolvePublicDir();
   if (publicDir) {
     app.use(express.static(publicDir));

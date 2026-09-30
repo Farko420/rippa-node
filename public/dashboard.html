@@ -41,6 +41,14 @@
     <div class="tile"><span class="tile-label">Running</span><strong id="statBusy">0</strong></div>
     <div class="tile"><span class="tile-label">P2P Revoked</span><strong id="statRevoked" class="warn">0</strong></div>
     <div class="tile"><span class="tile-label">Avg Efficiency</span><strong id="statEff">—</strong></div>
+    <div class="tile" id="otaTile"><span class="tile-label">Fleet Version</span><strong id="statOta">—</strong></div>
+  </section>
+
+  <!-- OTA STRIP: running build vs. the latest published GitHub release. -->
+  <section class="cc-ota" id="ccOta" hidden>
+    <span class="ota-dot"></span>
+    <span id="otaText">Checking for updates…</span>
+    <button id="otaPush" type="button" class="ghost cc-restore" hidden>Push to Swarm Now</button>
   </section>
 
   <!-- CONTROL BAR: dispatch a shared task (the Master auto-provisions P2P). -->

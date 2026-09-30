@@ -27,7 +27,7 @@ async function main(): Promise<void> {
   const { env, reloadEnv } = configModule;
   const { closeDeepBrain, initializeDeepBrain } = require("./db/database") as typeof import("./db/database");
   const serverModule = require("./server") as typeof import("./server");
-  const { startServer, onConfigChange, getDispatcher } = serverModule;
+  const { startServer, onConfigChange, getDispatcher, getSwarmUpdater } = serverModule;
   const { SwarmClient } = require("./network/SwarmClient") as typeof import("./network/SwarmClient");
   const { SyncManager } = require("./network/SyncManager") as typeof import("./network/SyncManager");
   const { Orchestrator } = require("./agent/Orchestrator") as typeof import("./agent/Orchestrator");
@@ -57,6 +57,13 @@ async function main(): Promise<void> {
   // monitors its satellites, a Satellite polls for work.
   const dispatcher = getDispatcher();
   dispatcher.start();
+
+  // GitHub OTA: the Master polls GitHub hourly and broadcasts any new release
+  // to the fleet. Satellites do not poll — they act on the trigger they receive.
+  const swarmUpdater = getSwarmUpdater();
+  if (isConfigComplete(readCurrentConfig())) {
+    swarmUpdater.start();
+  }
   let deepBrainOpen = false;
   const openDeepBrain = (): void => {
     if (env.NODE_ROLE === "master") {
@@ -102,6 +109,7 @@ async function main(): Promise<void> {
   const stopNodeServices = async (): Promise<void> => {
     beacon.stop(); // release the UDP discovery port before rebinding
     dispatcher.stop();
+    swarmUpdater.stop();
     if (orchestrator) {
       await orchestrator.stop();
       orchestrator = null;
@@ -133,6 +141,7 @@ async function main(): Promise<void> {
     // The dispatcher reads NODE_ROLE, so a role change must restart it with the
     // new mode (Master monitor loop vs. Satellite poll loop).
     dispatcher.start();
+    swarmUpdater.start();
     console.log("[Boot] Re-initialization complete.");
   });
 

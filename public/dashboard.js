@@ -338,6 +338,78 @@ async function refresh() {
   }
 }
 
+/**
+ * Renders the OTA strip from /api/mesh/updater.
+ *
+ * Deliberately non-blocking: a failed or absent updater response only hides the
+ * strip — the live topology and process views must never be held up by it.
+ */
+async function refreshUpdater() {
+  const strip = $("ccOta");
+  const tile = $("statOta");
+  try {
+    const { response, data } = await api("/api/mesh/updater");
+    if (!response.ok || !data.success) return;
+
+    const current = data.currentVersion || "—";
+    if (tile) tile.textContent = "v" + current;
+
+    if (!strip) return;
+    strip.hidden = false;
+    strip.classList.remove("up-to-date", "available");
+
+    if (data.updateAvailable && data.latest) {
+      strip.classList.add("available");
+      $("otaText").textContent =
+        "Update available: v" + current + " → v" + data.latest.version +
+        " — the Master rolls the fleet forward automatically within the hour.";
+      // Only the Master can push; satellites have nothing to broadcast to.
+      const push = $("otaPush");
+      if (push) push.hidden = !(data.onlineSatellites > 0);
+    } else {
+      strip.classList.add("up-to-date");
+      $("otaText").textContent =
+        data.latest
+          ? "Fleet is up to date on v" + current + " (latest published: v" + data.latest.version + ")."
+          : "Running v" + current + " — no published release detected yet.";
+    }
+  } catch (err) {
+    /* updater unavailable — leave the topology panels untouched */
+  }
+}
+
+/** Asks the Master to broadcast the known release immediately. */
+async function pushUpdate() {
+  const button = $("otaPush");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Pushing…";
+  }
+  try {
+    const { response, data } = await api("/api/mesh/broadcast-update", {
+      method: "POST",
+      body: "{}",
+    });
+    if (!response.ok || !data.success) {
+      showAlert(data.message || "Update push failed.", "err");
+    } else {
+      showAlert(
+        "Broadcast " + data.version + " to " + data.delivered + " online satellite(s).",
+        "ok",
+      );
+    }
+  } catch (err) {
+    showAlert("Update push failed: " + err.message, "err");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Push to Swarm Now";
+    }
+  }
+}
+
+// --- POLLING + ACTIONS ------------------------------------------------------
+
 /** Assigns a shared task; the Master auto-provisions the sibling payloads. */
 async function assignTask() {
   const button = $("taskRun");
@@ -399,6 +471,9 @@ if (closeBtn) closeBtn.addEventListener("click", closeSatellite);
 const restoreBtn = $("mRestoreP2p");
 if (restoreBtn) restoreBtn.addEventListener("click", () => void restoreP2p());
 
+const otaBtn = $("otaPush");
+if (otaBtn) otaBtn.addEventListener("click", () => void pushUpdate());
+
 // Clicking the modal backdrop closes it; clicking the card does not.
 const modal = $("ccModal");
 if (modal) {
@@ -432,6 +507,11 @@ if (labelInput) {
 }
 
 void refresh();
+// OTA status is slower-moving than the topology, so it polls on its own slower
+// cadence rather than piggy-backing on every 5s snapshot refresh.
+void refreshUpdater();
+setInterval(() => void refreshUpdater(), 60_000);
+
 // Polls for the life of the page; no teardown hook is needed because the
 // document is discarded wholesale when the operator navigates away.
 setInterval(() => void refresh(), REFRESH_MS);

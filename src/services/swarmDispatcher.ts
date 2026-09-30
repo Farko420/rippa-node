@@ -838,6 +838,24 @@ export class SwarmDispatcher {
     const satellites = this.getSnapshot()["satellites"] as Array<Record<string, unknown>>;
     return satellites.find((entry) => entry["nodeCode"] === normalizeNodeCode(nodeCode)) ?? null;
   }
+
+  /**
+   * Every satellite that is currently reachable, for fleet-wide operations such
+   * as an OTA broadcast.
+   *
+   * Offline nodes are deliberately excluded: pushing an update to a machine that
+   * cannot answer would burn the timeout and delay the nodes that CAN be
+   * updated. An offline node picks the new release up on its next boot.
+   */
+  listOnlineSatellites(): Array<{ nodeCode: string; nodeName: string; endpoint: PeerEndpoint }> {
+    return [...this.registry.values()]
+      .filter((record) => !this.isOffline(record))
+      .map((record) => ({
+        nodeCode: record.nodeCode,
+        nodeName: record.nodeName,
+        endpoint: record.endpoint,
+      }));
+  }
 // =========================================================================
   // SATELLITE — PAIRING, POLLING & REPORTING
   // =========================================================================
