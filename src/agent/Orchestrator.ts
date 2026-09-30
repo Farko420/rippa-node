@@ -1,5 +1,4 @@
 import { SwarmClient, type SwarmTask } from "../network/SwarmClient";
-import { env } from "../config";
 import {
   insertRawLore,
   insertVerifiedKnowledge,
@@ -15,6 +14,7 @@ import { clearCurrentProcess, setCurrentProcess } from "../services/heartbeat";
 import { executeSkill } from "../services/skillExecutor";
 import { healTask } from "../services/taskManager";
 import { startLocalAiDiscovery, type LocalAiStatus } from "../services/localAi";
+import { runIdleVerification } from "../services/idleVerification";
 
 /**
  * AUTONOMOUS AGENT ORCHESTRATOR.
@@ -172,7 +172,7 @@ export class Orchestrator {
     const tasks = await this.swarm.fetchTasks();
 
     if (tasks.length === 0) {
-      await this.runDiscoveryMode();
+      await this.runIdleMode();
       return;
     }
 
@@ -282,27 +282,56 @@ export class Orchestrator {
   }
 
   /**
-   * DISCOVERY MODE — autonomous learning when there is no queued work.
+   * IDLE MODE — what the node does with an empty queue.
    *
-   *   1. Round-robin the seed URLs, skipping anything already in `raw_lore`.
-   *   2. Scrape the next source headlessly (Playwright) → `raw_lore`.
-   *   3. Extract a structured fact with Ollama.
-   *   4. Persist to `verified_knowledge` only when confidence > 0.7.
+   * Two autonomous sources of work, in priority order:
    *
-   * Master-only (satellites are stateless) and throttled to one source
-   * every DISCOVERY_INTERVAL_MS.
+   *   1. RE-VERIFY the mirror's most overdue place (the idle engine). This runs
+   *      FIRST because it is the work with a real expiry: a place record that
+   *      was true when it synced is slowly becoming false, and re-checking the
+   *      backlog beats discovering somewhere new when there is already stale
+   *      knowledge on disk.
+   *   2. DISCOVER a new seed source, the existing scrape-and-extract loop.
+   *
+   * The discovery throttle is shared between them, so a run that just re-verified
+   * does not immediately follow up with a discovery scrape as well.
    */
-  private async runDiscoveryMode(): Promise<void> {
-    if (env.NODE_ROLE !== "master") {
-      return; // satellites have no Deep Brain to write to
-    }
-
+  private async runIdleMode(): Promise<void> {
     const now = Date.now();
     if (now - this.lastDiscoveryAt < DISCOVERY_INTERVAL_MS) {
-      return; // throttle autonomous scraping
+      return; // throttle autonomous work
     }
     this.lastDiscoveryAt = now;
 
+    const verification = await runIdleVerification(this.scraper, this.ollama);
+    if (verification.checked) {
+      this.swarm.setStatus("busy");
+      setCurrentProcess(`verify:${verification.place?.name ?? "place"}`);
+      try {
+        console.log(`[Orchestrator] Idle verify: ${verification.message}`);
+      } finally {
+        this.swarm.setStatus("idle");
+        clearCurrentProcess();
+      }
+      return; // one page load per idle window; discovery gets the next slot
+    }
+    console.log(`[Orchestrator] Idle verify: ${verification.message}`);
+
+    await this.runDiscoveryPass();
+  }
+
+  /**
+   * DISCOVERY PASS — autonomous learning when the mirror is up to date.
+   *
+   *   1. Round-robin the seed URLs, skipping anything already in `raw_lore`.
+   *   2. Scrape the next source headlessly (Playwright) -> `raw_lore`.
+   *   3. Extract a structured fact with Ollama.
+   *   4. Persist to `verified_knowledge` only when confidence > 0.7.
+   *
+   * Master-only (satellites are stateless). The throttling and the "no Deep
+   * Brain" guard live in {@link runIdleMode}, which is the only caller.
+   */
+  private async runDiscoveryPass(): Promise<void> {
     // Pick the next not-yet-scraped seed (round-robin over the pending set).
     const scraped = new Set(selectScrapedSourceUrls());
     const pending = SEED_URLS.filter((url) => !scraped.has(url));

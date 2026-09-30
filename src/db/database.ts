@@ -96,7 +96,13 @@ const TABLES_SQL = `
     lng           REAL,
     category_ids  TEXT,   -- JSON array, as the cloud stores it
     source_url    TEXT,
-    synced_at     TEXT NOT NULL DEFAULT (datetime('now'))
+    synced_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    -- NULL means "this node has never verified this place against the live
+    -- site". That is deliberately NOT the same as synced_at above, which only
+    -- records that the cloud's copy arrived. The idle verification engine orders
+    -- by this column so never-checked and long-stale places surface first, and
+    -- NULLs sort first under ORDER BY last_verified ASC.
+    last_verified TEXT
   );
 
   CREATE TABLE IF NOT EXISTS brain_categories (
@@ -165,6 +171,8 @@ const INDEXES_SQL = `
   CREATE INDEX IF NOT EXISTS idx_brain_chunks_place  ON brain_chunks(place_id);
   CREATE INDEX IF NOT EXISTS idx_brain_chunks_cat    ON brain_chunks(category COLLATE NOCASE);
   CREATE INDEX IF NOT EXISTS idx_brain_roads_kind    ON brain_road_features(kind);
+  -- The idle verification engine's hot path: oldest-verified-first.
+  CREATE INDEX IF NOT EXISTS idx_brain_places_stale   ON brain_places(last_verified);
 `;
 
 let instance: Database.Database | null = null;
@@ -192,6 +200,15 @@ export function initializeDeepBrain(): Database.Database | null {
   if (!verifiedColumns.some((column) => column.name === "synced")) {
     instance.exec("ALTER TABLE verified_knowledge ADD COLUMN synced INTEGER NOT NULL DEFAULT 0");
     console.log("[Deep Brain] Migrated verified_knowledge: added 'synced' column.");
+  }
+
+  // Same for the idle verification engine's staleness marker. CREATE TABLE IF
+  // NOT EXISTS silently leaves an existing table alone, so an already-deployed
+  // node needs the ALTER or the engine would fail on a missing column forever.
+  const placeColumns = instance.pragma("table_info(brain_places)") as Array<{ name: string }>;
+  if (!placeColumns.some((column) => column.name === "last_verified")) {
+    instance.exec("ALTER TABLE brain_places ADD COLUMN last_verified TEXT");
+    console.log("[Deep Brain] Migrated brain_places: added 'last_verified' column.");
   }
 
   instance.exec(INDEXES_SQL);
@@ -269,4 +286,49 @@ export function markKnowledgeSynced(ids: number[]): void {
   getDeepBrain()
     .prepare(`UPDATE verified_knowledge SET synced = 1 WHERE id IN (${placeholders})`)
     .run(...ids);
+}
+
+/** A mirrored place, reduced to what a verification task needs. */
+export interface StalePlaceRow {
+  id: string;
+  name: string;
+  /** The live page to re-check. Null when the cloud never recorded a source. */
+  source_url: string | null;
+  town: string | null;
+  state: string | null;
+  summary: string | null;
+  last_verified: string | null;
+}
+
+/**
+ * THE IDLE VERIFICATION QUERY.
+ *
+ * Returns the places whose facts have gone longest without a check —
+ * never-verified ones first (NULL sorts first in SQLite), then the stalest.
+ *
+ * `synced_at` is deliberately NOT used here: it records when the cloud's copy
+ * ARRIVED, which says nothing about whether the underlying page still says what
+ * the mirror claims. A place can be freshly synced and still months out of date.
+ *
+ * Places with no `source_url` are excluded — there is no page to re-check, so
+ * scheduling a "verify" task for one would burn a scrape slot to re-fetch
+ * nothing, forever.
+ */
+export function selectStalePlaces(limit: number): StalePlaceRow[] {
+  return getDeepBrain()
+    .prepare(
+      `SELECT id, name, source_url, town, state, summary, last_verified
+         FROM brain_places
+        WHERE source_url IS NOT NULL AND source_url <> ''
+        ORDER BY last_verified ASC
+        LIMIT ?`,
+    )
+    .all(limit) as StalePlaceRow[];
+}
+
+/** Stamps a place as freshly verified, so the engine stops re-checking it. */
+export function markPlaceVerified(id: string, at = new Date().toISOString()): void {
+  getDeepBrain()
+    .prepare("UPDATE brain_places SET last_verified = ? WHERE id = ?")
+    .run(at, id);
 }

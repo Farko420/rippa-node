@@ -31,6 +31,7 @@ async function main(): Promise<void> {
   const { startServer, onConfigChange, getDispatcher, getSwarmUpdater } = serverModule;
   const { SwarmClient } = require("./network/SwarmClient") as typeof import("./network/SwarmClient");
   const { SyncManager } = require("./network/SyncManager") as typeof import("./network/SyncManager");
+  const { BrainDeltaSync } = require("./network/BrainDeltaSync") as typeof import("./network/BrainDeltaSync");
   const { Orchestrator } = require("./agent/Orchestrator") as typeof import("./agent/Orchestrator");
   const { readConfig } = require("./config/configManager") as typeof import("./config/configManager");
 
@@ -79,6 +80,7 @@ async function main(): Promise<void> {
   // --- 3-5. Node services (heartbeat, sync, orchestrator) — live handles. ---
   let swarm: import("./network/SwarmClient").SwarmClient | null = null;
   let syncManager: import("./network/SyncManager").SyncManager | null = null;
+  let brainDeltaSync: import("./network/BrainDeltaSync").BrainDeltaSync | null = null;
   let orchestrator: import("./agent/Orchestrator").Orchestrator | null = null;
 
   // LAN discovery beacon — advertised by Masters so Satellites can auto-detect.
@@ -129,6 +131,10 @@ async function main(): Promise<void> {
     swarm.startHeartbeat();
     syncManager = new SyncManager(swarm);
     syncManager.start();
+    // Pull half of brain parity: keeps this node's mirror of the cloud's
+    // knowledge current. Master-only; a no-op until a bundle has been loaded.
+    brainDeltaSync = new BrainDeltaSync(swarm);
+    brainDeltaSync.start();
     orchestrator = new Orchestrator(swarm);
     orchestrator.start();
 
@@ -152,6 +158,10 @@ async function main(): Promise<void> {
     if (syncManager) {
       syncManager.stop();
       syncManager = null;
+    }
+    if (brainDeltaSync) {
+      brainDeltaSync.stop();
+      brainDeltaSync = null;
     }
     if (swarm) {
       swarm.stopHeartbeat();

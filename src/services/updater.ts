@@ -128,7 +128,12 @@ export function isPackagedExe(): boolean {
   return packaged && path.basename(process.execPath).toLowerCase().endsWith(".exe");
 }
 
-/** The directory holding the running executable, or null in dev mode. */
+/** Reads a version out of a semver-looking string, or null. */
+function extractVersion(text: string): string | null {
+  const match = /v?(\d+\.\d+\.\d+)/.exec(text);
+  return match ? match[1] : null;
+}
+
 /**
  * Parses the GitHub releases payload into the one release we care about.
  *
@@ -141,10 +146,19 @@ export function parseLatestRelease(payload: unknown): ReleaseInfo | null {
   const tag = typeof release.tag_name === "string" ? release.tag_name.trim() : "";
   if (!tag) return null;
 
-  // The rolling "latest" tag is a moving pointer, not a version. Fall back to
-  // the highest versioned tag so the comparison always has a concrete number.
-  const versionMatch = /^v?(\d+\.\d+\.\d+)/.exec(tag);
-  if (!versionMatch) return null;
+  // The workflow publishes to a ROLLING tag ("latest"), which is a moving pointer
+  // rather than a version, so the tag alone cannot drive the comparison. Fall
+  // back to the version the build stamped into the release name/body. Without this
+  // fallback every release is rejected and the fleet never updates.
+  const body = typeof release.body === "string" ? release.body : "";
+  const version =
+    extractVersion(tag) ??
+    extractVersion(typeof release.name === "string" ? release.name : "") ??
+    extractVersion(body);
+  if (!version) {
+    console.warn(`[Updater] Release "${tag}" carries no version — ignoring.`);
+    return null;
+  }
 
   const asset = (release.assets ?? []).find(
     (candidate) =>
@@ -158,13 +172,16 @@ export function parseLatestRelease(payload: unknown): ReleaseInfo | null {
     return null;
   }
 
+  // The workflow publishes the SHA-256 in the release body. Honouring it here is
+  // what turns the download-time integrity check from dead code into a real one.
+  const sha256 = /sha-?256:\s*`?([0-9a-f]{64})`?/i.exec(body)?.[1];
+
   return {
     tag,
-    version: versionMatch[1],
+    version,
     downloadUrl: asset.browser_download_url,
-    ...(typeof release.body === "string" && release.body.trim()
-      ? { notes: release.body.trim().slice(0, 500) }
-      : {}),
+    ...(sha256 ? { sha256: sha256.toLowerCase() } : {}),
+    ...(body.trim() ? { notes: body.trim().slice(0, 500) } : {}),
   };
 }
 
@@ -217,6 +234,7 @@ export function installDir(): string | null {
 /** Minimal shape of the GitHub releases API response. */
 interface GithubRelease {
   tag_name?: string;
+  name?: string;
   body?: string;
   assets?: ReleaseAsset[];
 }

@@ -278,6 +278,34 @@ export class SwarmClient {
   }
 
   /**
+   * Asks the Mothership for brain records changed since `since`.
+   *
+   * Returns the delta payload unchanged, or `null` when the endpoint is absent,
+   * errors, or answers with something that is not an object. `null` is
+   * deliberately indistinguishable from "nothing changed" at the call site in
+   * most cases — a delta-sync service that has never run and one that just found
+   * no changes should both simply do nothing, and neither should ever be able to
+   * damage the local mirror. The cursor is only advanced by a successful apply.
+   */
+  async fetchBrainDelta(since: string | null): Promise<Record<string, unknown> | null> {
+    try {
+      const { data } = await this.client.get("/api/brain/delta", {
+        params: since ? { since } : {},
+      });
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        console.warn("[Swarm] /api/brain/delta returned an unusable payload.");
+        return null;
+      }
+      return data as Record<string, unknown>;
+    } catch (error) {
+      // 404 is the normal state until the Mothership ships the endpoint; it
+      // must not spam the log every 12 hours as an error.
+      console.warn(`[Swarm] Brain delta fetch failed — ${describeError(error)}`);
+      return null;
+    }
+  }
+
+  /**
    * Registers this node as an `AI_CAPABLE_NODE` with the Mothership.
    *
    * Sent when local-model discovery changes state, so the cloud can route heavy

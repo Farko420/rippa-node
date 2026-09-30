@@ -5,7 +5,10 @@ name: build-node
 # whole swarm forward automatically — no operator action anywhere.
 on:
   push:
-    branches: [main]
+    # The repo's default branch is currently `master`; `main` is kept so the
+    # workflow still fires if the default is ever renamed. Without both, a push
+    # produces no build and OTA has nothing to publish.
+    branches: [main, master]
   # Allows a manual re-run (e.g. after fixing a failed build) from the UI.
   workflow_dispatch:
   # Also run when a version is manually edited in package.json.
@@ -108,10 +111,14 @@ jobs:
           name: rippa-node ${{ steps.version.outputs.version }}
           prerelease: false
           draft: false
-          generate_release_notes: true
+          # Auto-generated notes are NOT enabled: they get prepended to `body`
+          # and can change shape between runs. The updater parses the version and
+          # SHA-256 out of this body, so it must stay byte-stable.
+          generate_release_notes: false
           body: |
-            Automated build of `rippa-node.exe` (version `${{ steps.version.outputs.version }}`).
+            Automated build of `rippa-node.exe`.
 
+            rippa-node-version: `${{ steps.version.outputs.version }}`
             SHA-256: `${{ steps.checksum.outputs.sha256 }}`
 
             The Master node polls this release hourly and broadcasts the update to
