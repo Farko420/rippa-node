@@ -63,6 +63,165 @@ function hideAlert() {
   if (box) box.classList.add("hidden");
 }
 
+// --- MASTER BRAIN PARITY ----------------------------------------------------
+//
+// THE FILE IS READ HERE AND SENT AS JSON, NOT AS A MULTIPART UPLOAD. The endpoint
+// takes a parsed bundle, so parsing it in the browser means the operator sees a
+// clear "that file is not JSON" before anything is sent, and the server receives
+// the same bytes either way. A multipart FormData path would add a second parse
+// site for no benefit.
+
+/** Refuses a file that is obviously not a bundle, before it is read. */
+function looksLikeBundle(name) {
+  return /\.json$/i.test(name || "");
+}
+
+function setBrainBadge(text, kind) {
+  const badge = $("brainBadge");
+  if (!badge) return;
+  badge.textContent = text;
+  badge.className = "brain-badge" + (kind ? " brain-badge-" + kind : "");
+}
+
+function setBrainMessage(text, kind) {
+  const box = $("brainMessage");
+  if (!box) return;
+  if (!text) {
+    box.hidden = true;
+    return;
+  }
+  box.textContent = text;
+  box.className = "hint" + (kind ? " brain-" + kind : "");
+  box.hidden = false;
+}
+
+/** Renders the "1:1 Brain Parity Locked" badge from a load or a status read. */
+function renderBrainState(payload) {
+  const status = $("brainStatus");
+  if (!status) return;
+  const counts = (payload && payload.counts) || {};
+  const places = counts.places || 0;
+  if (places > 0) {
+    setBrainBadge("1:1 Brain Parity Locked", null);
+  } else {
+    setBrainBadge("No brain loaded", "empty");
+  }
+  $("brainCounts").textContent =
+    places > 0
+      ? places.toLocaleString() +
+        " places · " +
+        (counts.knowledge_chunks || 0).toLocaleString() +
+        " knowledge chunks" +
+        (payload && payload.lastSync ? " · synced " + payload.lastSync.slice(0, 19).replace("T", " ") + "Z" : "")
+      : "Drop a bundle from Admin → Rippa Labs to give this node the Mothership's knowledge.";
+  status.hidden = false;
+}
+
+async function loadBrainStatus() {
+  try {
+    const { data } = await api("/api/brain/status");
+    if (data && data.success) renderBrainState(data);
+  } catch (err) {
+    // A satellite has no Deep Brain at all, and that is not worth shouting about
+    // on a Master Control Center — the panel simply stays empty.
+  }
+}
+
+async function uploadBrainFile(file) {
+  const drop = $("brainDrop");
+  const title = $("brainDropTitle");
+  if (!drop || !title) return;
+  if (!looksLikeBundle(file.name)) {
+    setBrainMessage("That does not look like a brain bundle — expected a .json file.", "error");
+    return;
+  }
+
+  drop.classList.add("busy");
+  title.textContent = "Reading " + file.name + "…";
+  setBrainMessage("");
+
+  let parsed;
+  try {
+    // A bundle can be tens of megabytes, so this parse is the slow part of the
+    // whole interaction and the UI says so rather than appearing to hang.
+    parsed = JSON.parse(await file.text());
+  } catch (err) {
+    drop.classList.remove("busy");
+    title.textContent = "Drop the brain bundle here";
+    setBrainMessage("That file is not valid JSON — it may be truncated.", "error");
+    return;
+  }
+
+  title.textContent = "Loading…";
+  try {
+    const { response, data } = await api("/api/brain/upload-backup", {
+      method: "POST",
+      body: JSON.stringify(parsed),
+    });
+    if (response.ok && data && data.success) {
+      renderBrainState(data);
+      const warnings = (data.warnings || []).length;
+      setBrainMessage(
+        data.message + (warnings ? " " + warnings + " row(s) were skipped — see the server log." : ""),
+        warnings ? "warn" : null,
+      );
+    } else {
+      setBrainBadge("Load refused", "error");
+      setBrainMessage((data && data.message) || "The node refused the bundle.", "error");
+    }
+  } catch (err) {
+    setBrainBadge("Upload failed", "error");
+    setBrainMessage(String((err && err.message) || err), "error");
+  } finally {
+    drop.classList.remove("busy");
+    title.textContent = "Drop the brain bundle here";
+    const input = $("brainFile");
+    // Cleared so re-picking the SAME file fires `change` again — otherwise a
+    // second attempt after a fix appears to do nothing at all.
+    if (input) input.value = "";
+  }
+}
+
+function wireBrainPanel() {
+  const drop = $("brainDrop");
+  const input = $("brainFile");
+  if (!drop || !input) return;
+
+  drop.addEventListener("click", () => input.click());
+  drop.addEventListener("keydown", (event) => {
+    // The zone is a div with role="button", so it must answer the keyboard or it
+    // is a control a keyboard user cannot reach.
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      input.click();
+    }
+  });
+  input.addEventListener("change", () => {
+    const file = input.files && input.files[0];
+    if (file) void uploadBrainFile(file);
+  });
+
+  ["dragenter", "dragover"].forEach((name) =>
+    drop.addEventListener(name, (event) => {
+      event.preventDefault(); // without this the browser navigates to the file
+      drop.classList.add("dragging");
+    }),
+  );
+  ["dragleave", "drop"].forEach((name) =>
+    drop.addEventListener(name, (event) => {
+      event.preventDefault();
+      drop.classList.remove("dragging");
+    }),
+  );
+  drop.addEventListener("drop", (event) => {
+    const files = event.dataTransfer && event.dataTransfer.files;
+    const file = files && files[0];
+    if (file) void uploadBrainFile(file);
+  });
+
+  void loadBrainStatus();
+}
+
 // --- HELPERS ----------------------------------------------------------------
 
 /** Deterministic task colour so a task looks the same on every render. */
@@ -511,6 +670,11 @@ void refresh();
 // cadence rather than piggy-backing on every 5s snapshot refresh.
 void refreshUpdater();
 setInterval(() => void refreshUpdater(), 60_000);
+
+// The brain panel is wired once, not on every 5s refresh: the drop zone holds DOM
+// listeners and a hidden file input, and re-binding them every five seconds would
+// be both wasteful and a way to end up with two drop handlers firing per drop.
+wireBrainPanel();
 
 // Polls for the life of the page; no teardown hook is needed because the
 // document is discarded wholesale when the operator navigates away.

@@ -100,3 +100,26 @@
 .cc-ota.available .ota-dot { background:var(--acc); }
 .cc-ota #otaText { flex:1; }
 .cc-ota .cc-restore { width:auto; margin-top:0; white-space:nowrap; }
+/* Master Brain Parity — drop zone, success badge, error line.
+   Colours reuse the panel variables above rather than introducing new ones, so the
+   drop zone follows the Control Center's light/dark treatment automatically. */
+.brain-drop { margin-top:12px; border:2px dashed var(--line); border-radius:12px; padding:26px 16px;
+  text-align:center; cursor:pointer; background:var(--card);
+  transition:border-color .15s ease, background .15s ease; }
+.brain-drop:hover, .brain-drop:focus-visible { border-color:var(--acc); outline:none; }
+.brain-drop.dragging { border-color:var(--acc); background:rgba(56,189,248,.08); }
+.brain-drop.busy { opacity:.6; pointer-events:none; }
+.brain-drop-inner { display:flex; flex-direction:column; align-items:center; gap:4px; }
+.brain-drop-icon { font-size:22px; color:var(--acc); }
+.brain-drop-inner strong { font-size:13px; }
+.brain-drop-sub { font-size:11px; color:var(--mut); }
+
+.brain-status { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px; }
+.brain-badge { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px;
+  font-size:11px; font-weight:700; letter-spacing:.02em;
+  background:rgba(16,185,129,.14); color:var(--ok); border:1px solid var(--ok); }
+.brain-badge.brain-badge-empty { background:rgba(148,163,184,.14); color:var(--mut); border-color:var(--mut); }
+.brain-badge.brain-badge-error { background:rgba(239,68,68,.14); color:var(--bad); border-color:var(--bad); }
+#brainMessage { margin-top:10px; }
+#brainMessage.brain-error { color:var(--bad); }
+#brainMessage.brain-warn { color:var(--warn); }

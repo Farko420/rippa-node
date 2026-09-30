@@ -62,6 +62,90 @@ const TABLES_SQL = `
     synced           INTEGER NOT NULL DEFAULT 0,
     created_at       TEXT    NOT NULL DEFAULT (datetime('now'))
   );
+
+  -- ---------------------------------------------------------------------------
+  -- THE MASTER BRAIN MIRROR (migration target: RIPPA_BRAIN_BUNDLE_V1)
+  -- ---------------------------------------------------------------------------
+  -- A node's own scraped knowledge lives in raw_lore / verified_knowledge above.
+  -- These four tables are something different and deliberately separate: they hold
+  -- a COPY of what the Mothership already knows, so a freshly-built node can
+  -- answer offline questions instead of starting empty.
+  --
+  -- SEPARATE TABLES, NOT EXTRA COLUMNS ON verified_knowledge. The two have
+  -- opposite lifecycles and opposite owners. verified_knowledge is written by this
+  -- node's LLM and trickles UP to the cloud; brain_places is written wholesale by
+  -- the cloud and never trickles anywhere. Merging them would mean every bundle
+  -- load had to decide which side owns a row that both believe they own, and the
+  -- first upload that got it wrong would either duplicate places or delete the
+  -- node's own findings.
+  --
+  -- EVERY ID IS THE CLOUD'S ID, and that is what makes the mirror a mirror: the
+  -- primary key is the same locations.id, so a second upload replaces rather
+  -- than accumulates, and "1:1 parity" is a fact that can be checked rather than
+  -- an impression.
+  CREATE TABLE IF NOT EXISTS brain_places (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    slug          TEXT,
+    summary       TEXT,
+    description   TEXT,
+    town          TEXT,
+    region        TEXT,
+    state         TEXT,
+    lat           REAL,
+    lng           REAL,
+    category_ids  TEXT,   -- JSON array, as the cloud stores it
+    source_url    TEXT,
+    synced_at     TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS brain_categories (
+    id        TEXT PRIMARY KEY,
+    label     TEXT,
+    synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- A tag and its members are ONE ROW, not a tag table plus a join table. The
+  -- bundle carries membership as an array on the tag, and mirroring that shape
+  -- avoids a second table plus N inserts for what is read as a single unit.
+  CREATE TABLE IF NOT EXISTS brain_tags (
+    id         TEXT PRIMARY KEY,
+    label      TEXT NOT NULL,
+    place_ids  TEXT,   -- JSON array
+    synced_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS brain_chunks (
+    id          TEXT PRIMARY KEY,
+    place_id    TEXT,   -- nullable: a learned fact need not belong to a place
+    category    TEXT,
+    text        TEXT NOT NULL,
+    source_url  TEXT,
+    confidence  REAL,
+    synced_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS brain_road_features (
+    id        TEXT PRIMARY KEY,
+    name      TEXT,
+    kind      TEXT,
+    lat       REAL,
+    lng       REAL,
+    synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- THE SYNC CURSOR, in its own table rather than a file beside the database.
+  --
+  -- A sidecar JSON file was the obvious first choice and it is the wrong one: the
+  -- database is the thing being written, so a cursor kept outside it can claim a
+  -- sync that a crashed transaction never committed. Inside the same transaction
+  -- as the rows, "the cursor says 12:04" and "the rows are as of 12:04" cannot
+  -- disagree — which is the entire point of storing it at all.
+  CREATE TABLE IF NOT EXISTS brain_sync_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `;
 
 // Indexes are created separately so column migrations can run in between
@@ -71,6 +155,16 @@ const INDEXES_SQL = `
   CREATE INDEX IF NOT EXISTS idx_raw_lore_category ON raw_lore(category);
   CREATE INDEX IF NOT EXISTS idx_verified_knowledge_category ON verified_knowledge(category);
   CREATE INDEX IF NOT EXISTS idx_verified_knowledge_synced   ON verified_knowledge(synced);
+
+  -- The mirror's hot paths. Place lookup by name is the one that matters: a node
+  -- answering "is there a waterfall near X" is doing a LIKE over this table, and
+  -- without an index that scan is the entire cost of the feature.
+  CREATE INDEX IF NOT EXISTS idx_brain_places_name   ON brain_places(name COLLATE NOCASE);
+  CREATE INDEX IF NOT EXISTS idx_brain_places_town   ON brain_places(town COLLATE NOCASE);
+  CREATE INDEX IF NOT EXISTS idx_brain_places_state  ON brain_places(state COLLATE NOCASE);
+  CREATE INDEX IF NOT EXISTS idx_brain_chunks_place  ON brain_chunks(place_id);
+  CREATE INDEX IF NOT EXISTS idx_brain_chunks_cat    ON brain_chunks(category COLLATE NOCASE);
+  CREATE INDEX IF NOT EXISTS idx_brain_roads_kind    ON brain_road_features(kind);
 `;
 
 let instance: Database.Database | null = null;

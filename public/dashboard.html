@@ -75,6 +75,27 @@
       </p>
     </section>
 
+    <!-- MASTER BRAIN PARITY — drop a RIPPA_BRAIN_BUNDLE_V1 file to give this node
+         the Mothership's knowledge without a cold start. -->
+    <section class="cc-panel" id="brainPanel">
+      <h2>Master Brain Parity</h2>
+      <p class="hint">Drop a <code>rippa-brain-master-*.json</code> bundle from Admin &rarr; Rippa Labs to load it here.</p>
+      <div id="brainDrop" class="brain-drop" tabindex="0" role="button"
+           aria-label="Upload a master brain bundle">
+        <div class="brain-drop-inner">
+          <span class="brain-drop-icon" aria-hidden="true">◈</span>
+          <strong id="brainDropTitle">Drop the brain bundle here</strong>
+          <span class="brain-drop-sub">or click to choose the file</span>
+        </div>
+        <input id="brainFile" type="file" accept="application/json,.json" hidden />
+      </div>
+      <div id="brainStatus" class="brain-status" hidden>
+        <span id="brainBadge" class="brain-badge">—</span>
+        <span id="brainCounts" class="hint"></span>
+      </div>
+      <p id="brainMessage" class="hint" hidden></p>
+    </section>
+
     <!-- ACTIVE PROCESSES -->
     <section class="cc-panel">
       <h2>Active Processes</h2>

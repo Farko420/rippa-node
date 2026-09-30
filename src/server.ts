@@ -16,6 +16,8 @@ import {
   type PeerEndpoint,
 } from "./config/nodeAuth";
 import { SwarmDispatcher, type LoadClass, type TaskOutcome } from "./services/swarmDispatcher";
+import { getBrainCounts, getSyncCursor, ingestBrainBundle } from "./services/brainIngest";
+import { getDeepBrain } from "./db/database";
 import {
   SwarmUpdater,
   handleUpdateTrigger,
@@ -233,6 +235,28 @@ export function getLanAddresses(): string[] {
 /** Builds the Express app (separated from listen() for testability). */
 export function createApp(): Express {
   const app = express();
+
+  /*
+    THE BRAIN BUNDLE PARSER, REGISTERED BEFORE THE GLOBAL ONE.
+
+    `express.json()`'s DEFAULT LIMIT IS 100 kB, and a brain bundle is orders of
+    magnitude larger than that — 50,000 places with summaries is tens of megabytes.
+    Express matches middleware in registration order, so the global parser below
+    would answer 413 "Payload Too Large" before the brain route's handler ever ran,
+    and the feature would look broken in a way that is very hard to diagnose from
+    the client: the browser would report "upload failed" and the server log would
+    show a 413 from a middleware nobody remembers registering.
+
+    So the large-limit parser is registered FIRST and scoped to this one path. Every
+    other route keeps the 100 kB default, which is a real protection against a
+    malicious client parking megabytes of JSON in the node's heap on a Raspberry
+    Pi — widening it globally for the convenience of one route would remove that
+    from every other endpoint on the LAN.
+  */
+  app.use(
+    "/api/brain",
+    express.json({ limit: "256mb", type: ["application/json", "application/*+json"] }),
+  );
   app.use(express.json());
 
   // Liveness probe for the Mothership / local monitoring.
@@ -639,6 +663,96 @@ export function createApp(): Express {
   // GET /api/mesh/snapshot — everything the Control Center renders.
   app.get("/api/mesh/snapshot", requireDashboardAuth, (_req: Request, res: Response) => {
     res.json({ success: true, ...dispatcher.getSnapshot() });
+  });
+
+  // ── MASTER BRAIN PARITY ──────────────────────────────────────────────────
+
+  /*
+    GET /api/brain/status — what the node currently knows.
+
+    Dashboard-authed like every other mutating-adjacent route, and deliberately
+    NOT open: the counts and the sync cursor are a map of what this machine knows
+    about Australia, which on a node that has been paired to a real Mothership is
+    a non-trivial slice of the production catalogue. It is not member data, but it
+    is not nothing either, and the LAN is not a trusted place.
+  */
+  app.get("/api/brain/status", requireDashboardAuth, (_req: Request, res: Response) => {
+    try {
+      res.json({
+        success: true,
+        lastSync: getSyncCursor(),
+        counts: getBrainCounts(),
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: `Could not read the brain: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  });
+
+  /*
+    POST /api/brain/upload-backup — load a RIPPA_BRAIN_BUNDLE_V1 file.
+
+    THREE GUARDS, and each is a decision about a different kind of wrong input:
+
+      requireDashboardAuth  the body is the place catalogue. An unauthenticated
+                            POST here would let anything on the LAN overwrite this
+                            node's knowledge — including with an empty file.
+      validateBundle        the file may not be a bundle at all. It arrived by
+                            drag-and-drop from a human's Downloads folder, and
+                            nothing about that path makes it trustworthy.
+      force (optional)      an explicitly older bundle is allowed, but only on
+                            request. The default is to refuse a rollback the
+                            operator did not ask for.
+
+    SATELLITES GET A CLEAN 400 RATHER THAN A CRASH. `getDeepBrain()` throws on a
+    non-master node, and the Deep Brain is master-only by design. A satellite
+    receiving this POST should be told so plainly, not handed a stack trace.
+  */
+  app.post("/api/brain/upload-backup", requireDashboardAuth, (req: Request, res: Response) => {
+    let deepBrain: unknown;
+    try {
+      deepBrain = getDeepBrain();
+    } catch {
+      res.status(400).json({
+        success: false,
+        message:
+          "This node has no local brain (satellites are stateless). Run this on the Master node.",
+      });
+      return;
+    }
+    void deepBrain;
+
+    const body = req.body as unknown;
+    if (body === undefined || body === null) {
+      res.status(400).json({ success: false, message: "No file contents were received." });
+      return;
+    }
+
+    // `force` is a query flag rather than body content on purpose: the body is the
+    // bundle, and letting a flag ride inside the document would mean the thing we
+    // are being asked to trust is also the thing that relaxes the check on it.
+    const force = String(req.query["force"] ?? "") === "true";
+
+    try {
+      const result = ingestBrainBundle(body, { force });
+      // A REFUSAL IS 400, NOT 500. Nothing is broken — the file was understood and
+      // deliberately not applied — and the dashboard renders `message` either way,
+      // so the operator reads the same sentence in both cases.
+      res.status(result.ok ? 200 : 400).json({
+        success: result.ok,
+        message: result.message,
+        lastSync: result.lastSync,
+        counts: result.counts,
+        warnings: result.warnings,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: `Upload failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
   });
 
   // GET /api/mesh/satellite/:code — detail payload for the modal.
