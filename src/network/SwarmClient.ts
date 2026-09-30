@@ -1,6 +1,13 @@
 import axios, { type AxiosInstance } from "axios";
 import { schedule, type ScheduledTask } from "node-cron";
 import { env } from "../config";
+import {
+  buildHeartbeatTelemetry,
+  executePendingCommands,
+  parsePendingCommands,
+  type CommandHandlers,
+  type EfficiencyInput,
+} from "../services/heartbeat";
 
 /**
  * SWARM CLIENT — secure connection between this node and the Cloudflare Mothership.
@@ -9,11 +16,32 @@ import { env } from "../config";
 
 export type NodeStatus = "idle" | "busy";
 
+/** Snake_case field names are part of the Mothership's wire contract. */
 export interface HeartbeatPayload {
   nodeName: string;
   role: "master" | "satellite";
   status: NodeStatus;
   timestamp: string;
+  /** CPU load 0-100 across all cores. */
+  cpu_usage: number;
+  /** Physical memory in use, 0-100. */
+  ram_usage: number;
+  /** Free physical memory in bytes. */
+  ram_free_bytes: number;
+  /** Total physical memory in bytes. */
+  ram_total_bytes: number;
+  /** Host uptime in seconds. */
+  system_uptime_seconds: number;
+  /** Logical CPU core count. */
+  cpu_cores: number;
+  /** This process's RSS in bytes (what Task Manager shows). */
+  process_memory_bytes: number;
+  /** The task in flight, or null when idle. */
+  current_process: ReturnType<typeof buildHeartbeatTelemetry>["current_process"];
+  /** 0-100 from successful/total task attempts. */
+  efficiency_score: number;
+  /** Node codes currently linked peer-to-peer. */
+  connected_satellites: string[];
 }
 
 export interface SwarmTask {
@@ -43,6 +71,16 @@ export class SwarmClient {
   private heartbeatTask: ScheduledTask | null = null;
   private status: NodeStatus = "idle";
   private updateSignal: UpdateSignalHandler | null = null;
+
+  /**
+   * Node codes currently linked peer-to-peer, reported as `connected_satellites`.
+   * Supplied by the host (the swarm registry owns the truth).
+   */
+  private connectedSatellites: () => string[] = () => [];
+  /** The host's own task counters, reported as `efficiency_score`. */
+  private efficiency: () => EfficiencyInput = () => ({ succeeded: 0, total: 0 });
+  /** Remote-command executor hooks, supplied by the host. */
+  private commandHandlers: CommandHandlers | null = null;
 
   constructor() {
     this.client = axios.create({
@@ -96,23 +134,74 @@ export class SwarmClient {
     }
   }
 
+  /**
+   * Supplies the telemetry sources the heartbeat payload needs.
+   *
+   * Wired by index.ts once the dispatcher is up, so `SwarmClient` stays free of
+   * any dependency on the swarm registry.
+   */
+  setTelemetrySources(sources: {
+    connectedSatellites?: () => string[];
+    efficiency?: () => EfficiencyInput;
+    commandHandlers?: CommandHandlers;
+  }): void {
+    if (sources.connectedSatellites) this.connectedSatellites = sources.connectedSatellites;
+    if (sources.efficiency) this.efficiency = sources.efficiency;
+    if (sources.commandHandlers) this.commandHandlers = sources.commandHandlers;
+  }
+
   async sendHeartbeat(): Promise<void> {
+    // Snapshot every provider before awaiting, so a provider that throws cannot
+    // prevent the heartbeat from being sent at all.
+    let connectedSatellites: string[] = [];
+    let efficiency: EfficiencyInput = { succeeded: 0, total: 0 };
+    try {
+      connectedSatellites = this.connectedSatellites() ?? [];
+    } catch {
+      /* provider unavailable — report an empty list */
+    }
+    try {
+      efficiency = this.efficiency() ?? { succeeded: 0, total: 0 };
+    } catch {
+      /* provider unavailable — fall back to the neutral default */
+    }
+
     const payload: HeartbeatPayload = {
       nodeName: env.NODE_NAME,
       role: env.NODE_ROLE,
       status: this.status,
       timestamp: new Date().toISOString(),
+      ...buildHeartbeatTelemetry(connectedSatellites, efficiency),
     };
 
     try {
       const { data } = await this.client.post("/api/swarm/heartbeat", payload);
-      console.log(`[Swarm] Heartbeat sent (status: ${this.status})`);
+      console.log(
+        `[Swarm] Heartbeat sent (status: ${this.status}, cpu ${payload.cpu_usage}%, ` +
+          `ram ${payload.ram_usage}%, efficiency ${payload.efficiency_score}%)`,
+      );
       // The Mothership can piggyback an update notice on the heartbeat reply,
       // which is how a pushed release reaches the swarm within seconds.
       const advertised = parseLatestVersion(data);
       if (advertised) {
         console.log(`[Swarm] Mothership advertises version ${advertised.version}.`);
         this.updateSignal?.(advertised);
+      }
+
+      // Remote command queue. Executed AFTER the update signal so an advertised
+      // release and a FORCE_UPDATE cannot both start two competing downloads.
+      const commands = parsePendingCommands(data);
+      if (commands.length > 0) {
+        if (!this.commandHandlers) {
+          console.warn(
+            "[Swarm] Mothership sent pending commands but no handler is wired — ignoring.",
+          );
+        } else {
+          const executed = await executePendingCommands(commands, this.commandHandlers);
+          if (executed.length > 0) {
+            console.log(`[Swarm] Executed remote command(s): ${executed.join(", ")}.`);
+          }
+        }
       }
     } catch (error) {
       console.warn(`[Swarm] Heartbeat failed — ${describeError(error)}`);

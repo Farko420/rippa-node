@@ -11,6 +11,7 @@ import { OllamaClient } from "./OllamaClient";
 import { OtaUpdater } from "../update/OtaUpdater";
 import { APP_VERSION } from "../version";
 import { schedule, type ScheduledTask } from "node-cron";
+import { clearCurrentProcess, setCurrentProcess } from "../services/heartbeat";
 
 /**
  * AUTONOMOUS AGENT ORCHESTRATOR.
@@ -159,6 +160,9 @@ export class Orchestrator {
 
   private async handleTask(task: SwarmTask): Promise<void> {
     this.swarm.setStatus("busy");
+    // Mirrored into the heartbeat so the Mothership sees the live task in Task
+    // Manager terms, not just a busy/idle flag.
+    setCurrentProcess(task.type || task.id || "task");
     try {
       switch (task.type) {
         // TODO: wire real handlers as they are built, e.g.:
@@ -171,6 +175,7 @@ export class Orchestrator {
       }
     } finally {
       this.swarm.setStatus("idle");
+      clearCurrentProcess();
     }
   }
 
@@ -211,6 +216,7 @@ export class Orchestrator {
     this.seedCursor += 1;
 
     this.swarm.setStatus("busy");
+    setCurrentProcess(`discovery:${new URL(url).hostname}`);
     try {
       console.log(`[Orchestrator] Discovery: scraping ${url}`);
       const { text } = await this.scraper.scrape(url);
@@ -246,6 +252,7 @@ export class Orchestrator {
       this.lastDiscoveryAt = Date.now() - (DISCOVERY_INTERVAL_MS - DISCOVERY_RETRY_MS);
     } finally {
       this.swarm.setStatus("idle");
+      clearCurrentProcess();
     }
   }
 }

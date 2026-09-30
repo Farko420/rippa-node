@@ -1,5 +1,6 @@
 import { ensureConfiguration, isConfigComplete, openDashboard } from "./config/configManager";
 import { APP_VERSION } from "./version";
+import { startVitalsSampler } from "./services/telemetry";
 
 // Deeper fatal-error stacks (the default of 10 frames hides the caller module).
 (Error as { stackTraceLimit?: number }).stackTraceLimit = 60;
@@ -91,6 +92,40 @@ async function main(): Promise<void> {
     }
     if (swarm) return; // already running
     swarm = new SwarmClient();
+
+    // CPU load needs two samples separated by an interval, so the sampler
+    // must be running before the first heartbeat to report a real figure.
+    startVitalsSampler();
+
+    // Wire the rich heartbeat telemetry + remote command execution. The swarm
+    // dispatcher owns the registry, so it supplies the P2P link list and the
+    // node's own task counters; the handlers below close the loop on commands.
+    swarm.setTelemetrySources({
+      connectedSatellites: () => {
+        // A Master reports the satellites it manages; a satellite reports the
+        // siblings it is currently meshed with.
+        const siblings = dispatcher.listOnlineSatellites();
+        return siblings.length > 0
+          ? siblings.map((satellite) => satellite.nodeCode)
+          : require("./config/nodeAuth").listPeers().map((peer: { nodeCode: string }) => peer.nodeCode);
+      },
+      efficiency: () => {
+        const metrics = dispatcher.getLocalMetrics();
+        const succeeded = metrics.tasksSucceeded || 0;
+        const total = succeeded + (metrics.tasksFailed || 0) + (metrics.tasksTimedOut || 0);
+        return { succeeded, total };
+      },
+      commandHandlers: {
+        restartNode: () => shutdown("REMOTE_COMMAND"),
+        forceUpdate: () => swarmUpdater.checkNow(),
+        setP2pEnabled: async (enabled: boolean) => {
+          // Persisted through nodeAuth so the choice survives a restart.
+          require("./config/nodeAuth").setP2pEnabled(enabled);
+        },
+        isP2pEnabled: () => require("./config/nodeAuth").p2pEnabled(),
+      },
+    });
+
     swarm.startHeartbeat();
     syncManager = new SyncManager(swarm);
     syncManager.start();
