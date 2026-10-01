@@ -771,11 +771,36 @@ export function createApp(): Express {
       res.status(400).json({ success: false, message: "This node is not a Master." });
       return;
     }
-    if (!dispatcher.authenticate(meshKeyOf(req))) {
-      res.status(401).json({ success: false, message: "Invalid or missing mesh key." });
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    /*
+      A REFUSED HEARTBEAT CARRIES ITS OWN RECOVERY INSTRUCTIONS.
+
+      The response used to be a bare `401 {success:false}`, which told a
+      satellite nothing it could act on. It retried the same dead credential
+      every 10 seconds, forever, and the fleet view showed a permanently red node
+      whose only remedy was an operator editing config.json by hand. The
+      dispatcher now classifies the key and returns a `syncReset` the satellite
+      can act on immediately — and, for a node it recognises as holding the
+      recently-rotated key, the current key so it rejoins with no operator step
+      at all.
+
+      The status stays 401: the request genuinely was not authenticated, and the
+      body is advice, not an authorisation. Nothing here is a workaround for
+      authentication — `syncReset` is only ever read by the caller on a response
+      it was refused by.
+    */
+    const auth = dispatcher.authenticateOrReset(
+      meshKeyOf(req),
+      String(body["nodeCode"] ?? ""),
+    );
+    if (!auth.ok) {
+      res.status(401).json({
+        success: false,
+        message: "Invalid or missing mesh key.",
+        syncReset: auth.reset,
+      });
       return;
     }
-    const body = (req.body ?? {}) as Record<string, unknown>;
     try {
       const result = dispatcher.handleHeartbeat({
         nodeCode: String(body["nodeCode"] ?? ""),
@@ -833,7 +858,71 @@ export function createApp(): Express {
     });
   });
 
-  // POST /api/mesh/result — Satellite reports a finished task.
+  // POST /api/mesh/key-sync — Master pushes a rotated key to a Satellite.
+  //
+  // AUTHENTICATED WITH THE NEW KEY, not the old one. That is deliberate: the
+  // whole point of the push is to get the new key onto nodes, so the request that
+  // carries it must be provable as coming from the Master that issued it. A node
+  // still on the old key cannot accept this call directly — it reaches the new
+  // key through the `syncReset` reply on its next heartbeat instead, which is
+  // what keeps this endpoint from being a way to push a key to anything that can
+  // reach the port.
+  app.post("/api/mesh/key-sync", (req: Request, res: Response) => {
+    if (env.NODE_ROLE === "master") {
+      res.status(400).json({ success: false, message: "This node is a Master and issues keys." });
+      return;
+    }
+    if (!dispatcher.authenticate(meshKeyOf(req))) {
+      // A satellite being pushed a key it has already adopted is idempotent, so
+      // a duplicate delivery is harmless — but it still has to be the Master.
+      res.status(401).json({ success: false, message: "Invalid or missing mesh key." });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const updated = dispatcher.applyKeySync({
+      meshKey: String(body["meshKey"] ?? ""),
+      issuedBy: String(body["issuedBy"] ?? ""),
+    });
+    res.json({
+      success: true,
+      updated,
+      message: updated
+        ? "Mesh key updated — this node stays in lockstep with the Master."
+        : "Mesh key already current.",
+    });
+  });
+
+// POST /api/mesh/purge — operator-triggered cleanup of stale fleet entries.
+  //
+  // Dashboard-authenticated, and master-only: it deletes registry rows. The
+  // automatic prunes (revoked nodes, nodes silent for six hours) need no
+  // operator involvement, but an operator who has just decommissioned a machine
+  // and wants the Swarm Grid to reflect that now should not have to wait for a
+  // timer or restart the node.
+  app.post("/api/mesh/purge", requireDashboardAuth, (req: Request, res: Response) => {
+    if (env.NODE_ROLE !== "master") {
+      res.status(400).json({ success: false, message: "Only a Master holds the fleet registry." });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const requested = Array.isArray(body["nodeCodes"])
+      ? (body["nodeCodes"] as string[])
+      : [];
+    const purged = dispatcher.purgeNodes(
+      requested.length > 0 ? requested : dispatcher.pruneForgottenNodes(),
+      requested.length > 0 ? "removed by the operator" : "no contact for 6 hours",
+    );
+    res.json({
+      success: true,
+      purged,
+      message:
+        purged.length > 0
+          ? `Removed ${purged.length} unregistered node(s): ${purged.join(", ")}`
+          : "No unregistered nodes to purge.",
+    });
+  });
+
+// POST /api/mesh/result — Satellite reports a finished task.
   app.post("/api/mesh/result", (req: Request, res: Response) => {
     if (!dispatcher.authenticate(meshKeyOf(req))) {
       res.status(401).json({ success: false, message: "Invalid or missing mesh key." });

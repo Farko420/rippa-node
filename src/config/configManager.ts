@@ -67,6 +67,27 @@ export interface RippaNodeConfig {
   MESH_KEY?: string;
   /** Node code of the Master that issued MESH_KEY (diagnostic only). */
   MESH_KEY_ISSUER?: string;
+  /*
+    MESH KEY ROTATION STATE.
+
+    These three fields are what make a key rotation survivable. The Master keeps
+    the key it replaced in MESH_KEY_PREVIOUS for a grace period, so a Satellite
+    that is mid-heartbeat when the rotation lands still recognises itself and can
+    be handed the new key instead of being 401'd into silence. MESH_KEY_REVOKED
+    holds keys the cloud explicitly withdrew; a node presenting one is never
+    silently upgraded, because a withdrawn key means the cloud has decided that
+    node's access should end rather than be repaired.
+
+    Do NOT add rotation state to IDENTITY_ASSOCIATIONS in ./nodeAuth — a key
+    rotation is not an identity change, and clearing these on regenerate would
+    re-open exactly the lock-out they exist to prevent.
+  */
+  /** Key replaced by the most recent rotation, kept for the grace window. */
+  MESH_KEY_PREVIOUS?: string;
+  /** ISO timestamp the previous key stopped being authoritative. */
+  MESH_KEY_ROTATED_AT?: string;
+  /** Keys explicitly withdrawn by Rippa AI (never auto-upgraded). */
+  MESH_KEY_REVOKED?: string[];
   /** False when the Master revoked P2P and forces master-relay reporting. */
   P2P_ENABLED?: boolean;
   /** Sibling endpoints auto-filled by the Master (never typed by a user). */
@@ -211,6 +232,20 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
     PAIRED_MASTER_AT: pickString(record, "PAIRED_MASTER_AT") || undefined,
     MESH_KEY: pickString(record, "MESH_KEY") || undefined,
     MESH_KEY_ISSUER: pickString(record, "MESH_KEY_ISSUER") || undefined,
+    /*
+      ROTATION STATE IS CARRIED THROUGH HERE, for the same reason SATELLITE_REGISTRY
+      is: `writeConfig` normalises and writes what this function returns — it does
+      not merge. A rotation that lost MESH_KEY_PREVIOUS on the next save would
+      strand every satellite that was still holding the old key, which is the
+      exact failure this state exists to prevent.
+    */
+    MESH_KEY_PREVIOUS: pickString(record, "MESH_KEY_PREVIOUS") || undefined,
+    MESH_KEY_ROTATED_AT: pickString(record, "MESH_KEY_ROTATED_AT") || undefined,
+    MESH_KEY_REVOKED: Array.isArray(record["MESH_KEY_REVOKED"])
+      ? (record["MESH_KEY_REVOKED"] as unknown[]).filter(
+          (key): key is string => typeof key === "string" && key.trim().length > 0,
+        )
+      : [],
     P2P_ENABLED: record["P2P_ENABLED"] === false ? false : true,
     PEER_MESH: normalizePeers(record["PEER_MESH"]),
     /*

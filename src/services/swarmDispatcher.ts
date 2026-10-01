@@ -6,24 +6,32 @@ import { localIPv4 } from "../network/discovery";
 import { getSystemVitals } from "./telemetry";
 import {
   applyPeerProvision,
+  classifyMeshKey,
   ensureNodeIdentity,
   getMeshKey,
   getPairing,
+  getRevokedMeshKeys,
   isValidNodeCode,
   listPeers,
   loadRegistry,
   normalizeNodeCode,
   p2pEnabled,
   peerCandidateUrls,
+  purgePeerMesh,
+  revokeMeshKeys,
+  rotateMeshKey,
   saveMeshKey,
   savePairing,
   saveRegistry,
   selfEndpoint,
   setP2pEnabled,
   verifyMeshKey,
+  type MeshKeyStatus,
   type PeerEndpoint,
   type PersistedSatelliteRecord,
 } from "../config/nodeAuth";
+import { publishNodeEvent } from "./nodeEvents";
+import type { MeshKeySyncDirective } from "./meshKeySync";
 
 /**
  * RIPPA NODE AI — AUTO-PROVISIONING & P2P ROUTING.
@@ -64,6 +72,33 @@ const MONITOR_INTERVAL_MS = 15_000;
 const MESH_HTTP_TIMEOUT_MS = 8_000;
 /** A satellite silent for this long is marked offline in the UI. */
 const SATELLITE_OFFLINE_AFTER_MS = 45_000;
+
+/**
+ * How long a satellite stays in the registry after it was last seen.
+ *
+ * DISTINCT FROM `SATELLITE_OFFLINE_AFTER_MS` ON PURPOSE. "Offline" is a live
+ * state — a laptop that is asleep must still appear in the Swarm Grid, because
+ * it is still paired and the cloud's `connected_satellites` is about peering,
+ * not reachability. But a node that has not been heard from in hours is
+ * different: it is a decommissioned or re-homed machine whose code nobody
+ * claimed, and those are exactly the entries that accumulate into a fleet view
+ * full of permanent "not a registered node" warnings.
+ *
+ * Deliberately long (6 hours) so a node merely powered off overnight survives,
+ * and pruning only removes what is genuinely abandoned.
+ */
+const SATELLITE_FORGET_AFTER_MS = 6 * 60 * 60_000;
+
+/**
+ * How long to wait before repeating an identical authentication complaint.
+ *
+ * A satellite presenting a stale key retries every 10 seconds. Logging each one
+ * turns a single stale credential into 360 identical lines an hour, which buries
+ * every other message in the console and in the dashboard's warning strip. The
+ * first failure is always reported; subsequent identical ones are counted and
+ * summarised, so the condition stays visible without being a firehose.
+ */
+const AUTH_WARNING_THROTTLE_MS = 5 * 60_000;
 
 /**
  * Adaptive fallback thresholds. When the failure ratio of a node's recent P2P
@@ -184,6 +219,56 @@ export interface PairingResult {
   masterEndpoint: PeerEndpoint;
   /** The Master's permanent node code. */
   masterCode: string;
+}
+
+/**
+ * What happened when a Rippa AI key-sync directive was applied.
+ *
+ * Returned rather than logged-and-discarded so the caller (and the verification
+ * harness) can assert on the outcome: a rotation that silently failed to reach
+ * the fleet looks identical from the outside to one that worked.
+ */
+export interface MeshKeySyncResult {
+  /** True when the active mesh key was replaced. */
+  rotated: boolean;
+  /** True when revoked keys were recorded (even if they were already known). */
+  revokedKeysApplied: boolean;
+  /** Node codes removed from the registry and peer list. */
+  purgedNodes: string[];
+  /** Satellites successfully pushed the new key to. */
+  notified: number;
+  /** Satellites the push did not reach (offline, or blocked). */
+  failed: number;
+}
+
+/**
+ * The reply a Master sends to a satellite it could not authenticate.
+ *
+ * WHY NOT JUST A 401. A bare 401 tells a satellite nothing except "no", so it
+ * retries the same dead credential forever and the operator sees a permanently
+ * red node. `syncReset` gives the satellite an actionable recovery path and
+ * tells it explicitly not to treat this as fatal.
+ *
+ * `meshKey` is deliberately OPTIONAL and is only ever populated for a caller
+ * that proved it once held a current key (see {@link SwarmDispatcher.authenticateOrReset}).
+ * An unauthenticated caller gets `reauthRequired` and must go through the
+ * pairing handshake — otherwise any process that can reach the port could
+ * simply ask for the fleet credential.
+ */
+export interface SyncResetPayload {
+  /** Machine-readable reason, e.g. "stale-key" | "revoked-key" | "unknown-key". */
+  reason: string;
+  /** True when the satellite should re-run the pairing handshake. */
+  reauthRequired: boolean;
+  /**
+   * The active mesh key. Present ONLY when the caller proved prior membership by
+   * presenting a recently-rotated (not revoked) key.
+   */
+  meshKey?: string;
+  /** The Master's node code, so the satellite can confirm it reached the right node. */
+  masterCode: string;
+  /** Human-readable explanation, safe to log on the satellite. */
+  message: string;
 }
 // --- METRICS MATH -----------------------------------------------------------
 
@@ -336,6 +421,14 @@ export class SwarmDispatcher {
   private pairingInFlight = false;
   /** Master-only: debounce timer for registry writes to config.json. */
   private persistTimer: NodeJS.Timeout | null = null;
+  /**
+   * Master-only: throttles repeated "stale credential" log lines.
+   *
+   * Keyed by `nodeCode + status` so two different nodes failing for different
+   * reasons are never collapsed into one suppressed message — throttling must
+   * reduce repetition, not hide distinct problems.
+   */
+  private readonly authWarnings = new Map<string, { at: number; count: number }>();
 
   private monitorTimer: NodeJS.Timeout | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
@@ -375,7 +468,24 @@ export class SwarmDispatcher {
     if (this.isMaster) {
       // The mesh key is minted once and handed to every Satellite at pairing
       // time; it authenticates all sibling traffic afterwards.
-      if (!this.meshKey) this.meshKey = `mesh-${crypto.randomUUID()}`;
+      /*
+        READ THE PERSISTED KEY FIRST — this line was `if (!this.meshKey) this.meshKey = mint`,
+        which is a latent lock-out bug this comment already describes.
+
+        `this.meshKey` starts as "" on every process start, so the guard was
+        ALWAYS true and the Master minted a brand-new key on every single boot.
+        The very next line then persisted that new key, so the two halves of the
+        comment below were true in the worst possible way: each restart
+        invalidated the credential every paired satellite was still holding. The
+        symptom is precisely the one being chased here — satellites suddenly
+        failing authentication, tasks idle, and a fleet view full of nodes that
+        appear registered but cannot check in.
+
+        Reading from config.json before minting is what the comment has always
+        said happens; this makes the code match it. `applyMothershipSync` remains
+        the only sanctioned way for the ACTIVE key to change.
+      */
+      this.meshKey = getMeshKey() || `mesh-${crypto.randomUUID()}`;
       /*
         PERSISTED, NOT REGENERATED PER BOOT — this was the "Master shows 0
         satellites" bug. The key used to be a fresh random string on every
@@ -527,6 +637,134 @@ export class SwarmDispatcher {
     return this.isMaster
       ? Boolean(this.meshKey) && this.meshKey === candidate
       : verifyMeshKey(candidate);
+  }
+
+  /**
+   * MASTER: classifies a key a satellite presented.
+   *
+   * The Master's in-memory key is authoritative, so `valid` is decided against
+   * it rather than against config.json. The `stale` / `revoked` / `unknown`
+   * verdicts come from the persisted rotation state, which is written by
+   * {@link applyMothershipSync}.
+   */
+  classifyPresentedKey(candidate: string | undefined): MeshKeyStatus {
+    if (!this.isMaster) return verifyMeshKey(candidate) ? "valid" : "unknown";
+    const presented = String(candidate ?? "").trim();
+    if (!presented) return "missing";
+    if (this.meshKey && this.meshKey === presented) return "valid";
+    if (getRevokedMeshKeys().includes(presented)) return "revoked";
+
+    // `classifyMeshKey` reads the persisted key; on the Master the in-memory
+    // value is the live one, so only the stale/revoked branches are delegated.
+    const status = classifyMeshKey(presented);
+    return status === "valid" ? "unknown" : status;
+  }
+
+  /**
+   * MASTER: authenticates a satellite, and on failure explains how to recover.
+   *
+   * THE SECURITY CONTRACT, and it is the important part of this change.
+   *
+   * A `stale` key — one this node rotated out within the grace window — is
+   * PROOF that the caller was recently authenticated. It is therefore safe, and
+   * correct, to hand that caller the active key in the reply: it is exactly the
+   * satellite the rotation was meant to re-provision, and the alternative is that
+   * it stays locked out until an operator touches it by hand.
+   *
+   * An `unknown` or `missing` key proves nothing. Those callers get the same
+   * machine-readable reset so their client can re-pair automatically, but NOT
+   * the key itself — otherwise anything that can reach the port could read the
+   * fleet credential out of a rejected request and then use it.
+   *
+   * A `revoked` key is never upgraded, in either direction. Rippa AI withdrew
+   * that credential deliberately, and quietly restoring it would override a
+   * decision the operator's own control panel made.
+   */
+  authenticateOrReset(
+    candidate: string | undefined,
+    nodeCode = "",
+  ): { ok: true } | { ok: false; status: MeshKeyStatus; reset: SyncResetPayload } {
+    const status = this.classifyPresentedKey(candidate);
+    if (status === "valid") return { ok: true };
+
+    const code = normalizeNodeCode(nodeCode) || nodeCode || "unknown node";
+    const reset = this.buildSyncReset(code, status);
+    this.logAuthWarning(code, status, reset.message);
+    return { ok: false, status, reset };
+  }
+
+  /**
+   * Builds the recovery payload for an unauthenticated satellite.
+   *
+   * Split out from {@link authenticateOrReset} so the same shape can be produced
+   * for a node that has vanished from the registry (see
+   * {@link applyMothershipSync}) without going through a failed authentication.
+   */
+  buildSyncReset(nodeCode: string, status: MeshKeyStatus): SyncResetPayload {
+    const masterCode = this.nodeCode;
+    const base = { masterCode, reauthRequired: true };
+
+    if (status === "stale") {
+      // Prior membership proven — hand over the current key so the satellite can
+      // rejoin on its next poll with no operator involvement.
+      return {
+        ...base,
+        reason: "stale-key",
+        meshKey: this.getMeshKeyOrEmpty(),
+        message:
+          `Mesh key rotated by Rippa AI. ${nodeCode} presented the previous key and has ` +
+          `been issued the active one automatically — no reconfiguration needed.`,
+      };
+    }
+    if (status === "revoked") {
+      return {
+        ...base,
+        reason: "revoked-key",
+        message:
+          `The key presented by ${nodeCode} was revoked by Rippa AI and cannot be renewed. ` +
+          `Re-pair to join the swarm under the current identity.`,
+      };
+    }
+    if (status === "missing") {
+      return {
+        ...base,
+        reason: "missing-key",
+        message: `${nodeCode} sent no mesh key. Re-pair to join the swarm.`,
+      };
+    }
+    return {
+      ...base,
+      reason: "unknown-key",
+      message:
+        `${nodeCode} presented a key this Master does not recognise — it is not a registered ` +
+        `node. Re-pair to be issued the active mesh key.`,
+    };
+  }
+
+  /**
+   * Logs an authentication problem at most once per throttle window.
+   *
+   * The suppressed count is reported when the window reopens, so a node that has
+   * been failing for an hour reads as "N suppressed attempts" rather than as a
+   * single isolated event — the count is the diagnostic, and dropping it would
+   * make a permanently broken node look like a momentary blip.
+   */
+  private logAuthWarning(nodeCode: string, status: MeshKeyStatus, message: string): void {
+    const key = `${nodeCode}:${status}`;
+    const now = Date.now();
+    const previous = this.authWarnings.get(key);
+
+    if (previous && now - previous.at < AUTH_WARNING_THROTTLE_MS) {
+      previous.count += 1;
+      return;
+    }
+
+    const suppressed = previous?.count ?? 0;
+    this.authWarnings.set(key, { at: now, count: 0 });
+    console.warn(
+      `[Swarm] ${message}` +
+        (suppressed > 0 ? ` (${suppressed} further attempt(s) suppressed)` : ""),
+    );
   }
 
   /** The endpoint this node advertises to its peers. */
@@ -980,11 +1218,211 @@ export class SwarmDispatcher {
     for (const record of this.registry.values()) {
       this.evaluateP2pHealth(record);
     }
+
+    /*
+      PRUNE NODES THAT HAVE GONE AWAY FOR GOOD.
+
+      Runs here rather than on a separate timer so it shares the monitor's
+      cadence and stops whenever the dispatcher stops. `pruneForgottenNodes` only
+      acts on nodes silent for six hours, so a sleeping machine is untouched —
+      this exists to clear decommissioned and re-homed nodes that would otherwise
+      sit in the Swarm Grid permanently generating "not a registered node"
+      warnings with nothing left to authenticate against.
+    */
+    this.pruneForgottenNodes();
   }
 
   /** True when the node has been silent long enough to count as offline. */
   isOffline(record: SatelliteRecord): boolean {
     return Date.now() - (Date.parse(record.metrics.lastSeenAt) || 0) > SATELLITE_OFFLINE_AFTER_MS;
+  }
+
+  /**
+   * Applies a key-sync directive received from Rippa AI on the heartbeat.
+   *
+   * MASTER-ONLY, and deliberately so. A satellite's credential belongs to the
+   * Master that issued it; taking a new one from the cloud would let the cloud
+   * silently promote itself to the authority for a peer-to-peer mesh it is not
+   * part of. Only the Master rotates, and it then propagates the change to its
+   * own satellites over the authenticated channel.
+   *
+   * ORDER MATTERS HERE:
+   *   1. revocations first, so a key the cloud withdrew is never briefly active;
+   *   2. rotate + persist, so config.json and memory agree before anything is sent;
+   *   3. purge stale nodes, so removed machines leave the fleet view;
+   *   4. broadcast last, and only when something actually changed — waking the
+   *      fleet to re-provision an identical key would be pure noise.
+   */
+  async applyMothershipSync(directive: MeshKeySyncDirective): Promise<MeshKeySyncResult> {
+    const result: MeshKeySyncResult = {
+      rotated: false,
+      revokedKeysApplied: false,
+      purgedNodes: [],
+      notified: 0,
+      failed: 0,
+    };
+
+    if (!this.isMaster) {
+      // Not an error — just inapplicable. Returned quietly so a satellite's
+      // heartbeat log never shows a failure it cannot act on.
+      return result;
+    }
+
+    if (directive.revokedKeys.length > 0) {
+      const known = new Set(getRevokedMeshKeys());
+      revokeMeshKeys(directive.revokedKeys);
+      result.revokedKeysApplied = true;
+      const fresh = directive.revokedKeys.filter((key) => !known.has(key));
+      if (fresh.length > 0) {
+        console.warn(
+          `[Swarm] Rippa AI revoked ${fresh.length} mesh key(s); nodes holding them must re-pair.`,
+        );
+      }
+    }
+
+    if (directive.meshKey) {
+      const previous = this.meshKey;
+      // `rotateMeshKey` persists the predecessor, which is what lets a satellite
+      // still on the old key be recognised as `stale` rather than as a stranger.
+      if (rotateMeshKey(directive.meshKey, directive.issuedBy || this.nodeCode)) {
+        this.meshKey = directive.meshKey.trim();
+        result.rotated = true;
+        console.log(
+          `[Swarm] Mesh key synchronised from Rippa AI (${this.nodeCode}); ` +
+            `the previous key stays valid for the grace window so the fleet can rejoin.`,
+        );
+
+        // The push is sent with the NEW key, which only nodes that adopt it can
+        // authenticate — so this is what makes the rotation converge even when a
+        // satellite missed the grace window entirely.
+        const push = await this.broadcastMeshKey(this.meshKey, previous);
+        result.notified = push.notified;
+        result.failed = push.failed;
+
+        // Surfaced to the dashboard so the operator sees the fleet re-keying
+        // rather than discovering it later as "why did everything re-pair?".
+        publishNodeEvent({
+          kind: "info",
+          command: "MESH_KEY_SYNCED",
+          title: "Swarm Key Synchronised",
+          detail:
+            `Rippa AI issued a new mesh key. ${push.notified} satellite(s) updated` +
+            (push.failed > 0 ? `, ${push.failed} will pick it up on their next poll.` : "."),
+        });
+      }
+    }
+
+    if (directive.revokedNodes.length > 0) {
+      result.purgedNodes = this.purgeNodes(directive.revokedNodes, "revoked by Rippa AI");
+    }
+
+    return result;
+  }
+
+  /**
+   * Pushes the active mesh key to every reachable satellite.
+   *
+   * Uses the same `meshPost` helper as task provisioning, so LAN-then-Cloud-Link
+   * fallback and P2P-health scoring come for free, and a node that is genuinely
+   * unreachable is counted rather than thrown at the caller.
+   */
+  private async broadcastMeshKey(
+    meshKey: string,
+    previousKey: string,
+  ): Promise<{ notified: number; failed: number }> {
+    const targets = this.listOnlineSatellites();
+    if (targets.length === 0) return { notified: 0, failed: 0 };
+
+    const outcomes = await Promise.allSettled(
+      targets.map((target) =>
+        meshPost(
+          peerCandidateUrls(target.endpoint),
+          "/api/mesh/key-sync",
+          {
+            nodeCode: target.nodeCode,
+            meshKey,
+            // Sent so a satellite can tell a rotation from a re-provision and
+            // log the transition instead of silently changing credential.
+            previousKey: previousKey || null,
+            issuedBy: this.nodeCode,
+          },
+          meshKey,
+        ),
+      ),
+    );
+
+    let notified = 0;
+    let failed = 0;
+    for (const outcome of outcomes) {
+      if (outcome.status === "fulfilled" && outcome.value.ok) notified += 1;
+      else failed += 1;
+    }
+    if (failed > 0) {
+      // Expected for anything mid-sleep; the next poll re-syncs it.
+      console.log(
+        `[Swarm] ${failed}/${targets.length} satellite(s) did not take the new key directly; ` +
+          `they will be issued it on their next heartbeat.`,
+      );
+    }
+    return { notified, failed };
+  }
+
+  /**
+   * Removes node codes from the registry and the persisted peer list.
+   *
+   * Called for nodes Rippa AI reports as unregistered, and by
+   * {@link pruneForgottenNodes} for nodes that have been silent for hours. Both
+   * are cases where the entry is noise: it can no longer authenticate, it can no
+   * longer be reached, and leaving it in place is what produces a fleet view
+   * permanently reporting nodes that do not exist.
+   */
+  purgeNodes(nodeCodes: Iterable<string>, reason: string): string[] {
+    const removed: string[] = [];
+    for (const raw of nodeCodes) {
+      const code = normalizeNodeCode(raw);
+      if (!code || code === this.nodeCode) continue;
+      if (this.registry.delete(code)) {
+        removed.push(code);
+        this.dropTasksFor(code);
+      }
+    }
+    if (removed.length === 0) return [];
+
+    // Peers are the satellite's own view of its siblings; clearing the revoked
+    // ones here stops the removed machines continuing to appear in provisioning
+    // payloads on every other node.
+    purgePeerMesh(removed);
+    this.persistRegistry();
+    console.log(`[Swarm] Purged ${removed.length} node(s) (${reason}): ${removed.join(", ")}`);
+    return removed;
+  }
+
+  /** Releases any task held by a purged node so it is not stuck "running". */
+  private dropTasksFor(nodeCode: string): void {
+    for (const [taskId, task] of this.tasks) {
+      if (!task.assignees.includes(nodeCode)) continue;
+      task.assignees = task.assignees.filter((code) => code !== nodeCode);
+      if (task.assignees.length === 0) this.tasks.delete(taskId);
+    }
+  }
+
+  /**
+   * MASTER: forgets nodes that have been silent for a long time.
+   *
+   * DISTINCT FROM `runMonitorCycle`, which only marks nodes offline. This one
+   * actually deletes them, and only after six hours of silence, so a sleeping
+   * tablet keeps its place in the Swarm Grid while a decommissioned machine
+   * stops generating warnings forever.
+   *
+   * @returns the codes that were purged, so the caller can report them.
+   */
+  pruneForgottenNodes(): string[] {
+    if (!this.isMaster) return [];
+    const cutoff = Date.now() - SATELLITE_FORGET_AFTER_MS;
+    const abandoned = [...this.registry.values()]
+      .filter((record) => (Date.parse(record.metrics.lastSeenAt) || 0) < cutoff)
+      .map((record) => record.nodeCode);
+    return this.purgeNodes(abandoned, "no contact for 6 hours");
   }
 
   /**
@@ -1179,6 +1617,88 @@ export class SwarmDispatcher {
   }
 
   /**
+ * SATELLITE: adopts a mesh key pushed by the Master.
+ *
+ * Called from `POST /api/mesh/key-sync`. The zero-config promise is that the
+ * operator never re-enters a key after a rotation, so this has to persist the
+ * new credential and stay online without a restart — which is exactly why it
+ * calls `rotateMeshKey` (keeping the old one for the grace window) rather than
+ * overwriting the field and orphaning the in-flight request.
+ *
+ * A no-op when the key is unchanged, so a repeated broadcast costs nothing.
+ *
+ * @returns true when the local credential actually changed.
+ */
+applyKeySync(payload: { meshKey?: string; issuedBy?: string }): boolean {
+  const next = String(payload?.meshKey ?? "").trim();
+  if (!next || !rotateMeshKey(next, payload?.issuedBy || this.nodeCode)) return false;
+
+  console.log(
+    `[Swarm] Mesh key updated by ${payload?.issuedBy || "the Master"} — the fleet is back in lockstep.`,
+  );
+  // Peer endpoints learned under the old key may include nodes the Master has
+  // since dropped, so they are re-derived from the next heartbeat rather than
+  // trusted to still be current.
+  publishNodeEvent({
+    kind: "info",
+    command: "MESH_KEY_UPDATED",
+    title: "Swarm Key Updated",
+    detail: `This node adopted the new mesh key from ${payload?.issuedBy || "the Master"}.`,
+  });
+  return true;
+}
+
+/**
+ * SATELLITE: applies a `syncReset` sent by the Master when our key was refused.
+ *
+ * THE RECOVERY LOOP. Previously a rejected heartbeat was a bare 401, so the
+ * satellite could do nothing but retry the same dead credential every 10 seconds
+ * and the dashboard showed a permanently red node with no way out but an
+ * operator's manual intervention. There are now two automatic exits:
+ *
+ *   - the Master included the current key (it recognised us as holding the
+ *     recently-rotated one) — adopt it and carry straight on;
+ *   - it did not, and asked us to re-authenticate — run the pairing handshake,
+ *     which is the one route that is allowed to issue a credential to a node
+ *     that no longer holds a valid one.
+ *
+ * @returns true when the node ended up with a usable key.
+ */
+async recoverFromSyncReset(
+  reset: SyncResetPayload | null | undefined,
+  pairing = getPairing(),
+): Promise<boolean> {
+  if (!reset) return false;
+  const masterCode = reset.masterCode || pairing?.masterCode || "";
+
+  if (reset.meshKey && rotateMeshKey(reset.meshKey, masterCode || "mothership")) {
+    console.log(`[Swarm] Master re-issued the mesh key — re-authenticated (${reset.reason}).`);
+    return true;
+  }
+
+  // No key was handed over, so the credential has to be re-acquired from the
+  // Master through the pairing handshake. Guarded with the same in-flight latch
+  // `ensurePaired` uses, so a Master that keeps sending resets cannot turn into
+  // a re-pair attempt on every poll.
+  if (!pairing || this.pairingInFlight) return false;
+  this.pairingInFlight = true;
+  try {
+    console.warn(`[Swarm] Re-authenticating with the Master (${reset.reason}): ${reset.message}`);
+    await this.pairWithMaster(pairing.masterUrl);
+    return true;
+  } catch (error) {
+    console.warn(
+      `[Swarm] Re-authentication failed — ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return false;
+  } finally {
+    this.pairingInFlight = false;
+  }
+}
+
+/**
    * SATELLITE: asks the Master for work and posts a heartbeat in one request.
    *
    * The Master's reply carries the assignment plus any sibling endpoints, so
@@ -1215,19 +1735,45 @@ export class SwarmDispatcher {
     this.localMetrics.cpuCores = vitals.cpu_cores;
     this.localMetrics.systemUptimeSeconds = vitals.system_uptime_seconds;
 
-    const response = await axios.post(
-      `${pairing.masterUrl.replace(/\/+$/, "")}/api/mesh/heartbeat`,
-      {
-        nodeCode: this.nodeCode,
-        nodeName: env.NODE_NAME,
-        ipAddress: self.ipAddress,
-        port: self.port,
-        cloudLinkUrl: self.cloudLinkUrl,
-        metrics: this.localMetrics,
-        p2pEnabled: p2pEnabled(),
-      },
-      { timeout: MESH_HTTP_TIMEOUT_MS, headers: { "X-Mesh-Key": getMeshKey() } },
-    );
+    let response;
+    try {
+      response = await axios.post(
+        `${pairing.masterUrl.replace(/\/+$/, "")}/api/mesh/heartbeat`,
+        {
+          nodeCode: this.nodeCode,
+          nodeName: env.NODE_NAME,
+          ipAddress: self.ipAddress,
+          port: self.port,
+          cloudLinkUrl: self.cloudLinkUrl,
+          metrics: this.localMetrics,
+          p2pEnabled: p2pEnabled(),
+        },
+        { timeout: MESH_HTTP_TIMEOUT_MS, headers: { "X-Mesh-Key": getMeshKey() } },
+      );
+    } catch (error) {
+      /*
+        A REFUSED HEARTBEAT IS NOW A RECOVERY SIGNAL, NOT A DEAD END.
+
+        The Master answers a stale or unknown key with a `syncReset` payload
+        instead of a bare 401, which is the only thing that lets a satellite
+        whose credential went stale recover by itself. Axios throws on the 4xx,
+        so the body is read off the error here rather than the response.
+
+        Recovering succeeds without restarting the poll cycle, so the node is
+        working again on its very next tick. A Master that merely happens to be
+        offline throws a network error with no response body, and is ignored —
+        that case is genuinely transient and the next cycle handles it.
+      */
+      const body = axios.isAxiosError(error)
+        ? ((error.response?.data ?? {}) as Record<string, unknown>)
+        : {};
+      const reset = (body["syncReset"] ?? null) as SyncResetPayload | null;
+      if (reset) {
+        await this.recoverFromSyncReset(reset, pairing);
+        return;
+      }
+      throw error;
+    }
 
     const data = (response.data ?? {}) as Record<string, unknown>;
     const task = (data["task"] ?? null) as SwarmAssignment | null;

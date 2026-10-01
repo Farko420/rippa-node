@@ -272,6 +272,135 @@ export function saveMeshKey(key: string, issuedBy: string): void {
   persist({ MESH_KEY: key.trim(), MESH_KEY_ISSUER: issuedBy });
 }
 
+/**
+ * Replaces the active mesh key with one supplied by Rippa AI.
+ *
+ * THE OLD KEY IS RETAINED, not discarded. A rotation is almost never atomic
+ * across a fleet: satellites are polling on a 10s interval, so between the
+ * Master's key changing and each satellite's next heartbeat there is a window
+ * in which nodes are holding a key this node no longer accepts. Keeping the
+ * predecessor lets {@link classifyMeshKey} recognise those nodes as "stale"
+ * instead of "stranger" and hand them the new key, which is what turns a
+ * rotation from a fleet-wide outage into a silent, self-healing update.
+ *
+ * @returns true when the active key actually changed (a no-op rotation is not
+ *          re-broadcast, so the fleet is not woken for nothing).
+ */
+export function rotateMeshKey(key: string, issuedBy: string): boolean {
+  const next = key.trim();
+  const current = getMeshKey();
+  if (!next || next === current) return false;
+  persist({
+    MESH_KEY: next,
+    MESH_KEY_ISSUER: issuedBy,
+    MESH_KEY_PREVIOUS: current,
+    MESH_KEY_ROTATED_AT: new Date().toISOString(),
+  });
+  return true;
+}
+
+/** Keys Rippa AI has explicitly withdrawn. */
+export function getRevokedMeshKeys(): string[] {
+  const raw = read()?.MESH_KEY_REVOKED;
+  return Array.isArray(raw) ? raw.filter((key): key is string => typeof key === "string") : [];
+}
+
+/**
+ * Records keys the cloud withdrew, so a node presenting one is never silently
+ * upgraded to the active key.
+ *
+ * A revoked key is a deliberate decision by Rippa AI that a credential should
+ * stop working. Quietly repairing it would override that decision, so the
+ * revoked list is treated as terminal — see {@link classifyMeshKey}.
+ */
+export function revokeMeshKeys(keys: string[]): string[] {
+  const cleaned = keys.map((key) => key.trim()).filter((key) => key.length > 0);
+  if (cleaned.length === 0) return getRevokedMeshKeys();
+  const merged = [...new Set([...getRevokedMeshKeys(), ...cleaned])];
+  persist({ MESH_KEY_REVOKED: merged });
+  return merged;
+}
+
+/** How the Master classified a key a satellite presented. */
+export type MeshKeyStatus =
+  /** The key is the active one. */
+  | "valid"
+  /** The key was rotated out but is still inside the grace window. */
+  | "stale"
+  /** Rippa AI withdrew this key; the node must re-authenticate, not upgrade. */
+  | "revoked"
+  /** Nothing about this key is recognised. */
+  | "unknown"
+  /** No key was presented at all. */
+  | "missing";
+
+/**
+ * How long a rotated-out key keeps identifying its holder.
+ *
+ * Long enough to cover several missed poll cycles on a flaky LAN link, short
+ * enough that the predecessor is not a permanent second valid credential. The
+ * key is only ever used to RECOGNISE a returning node and hand it the new key —
+ * it never authorises a request on its own, so this window carries no extra
+ * access.
+ */
+export const MESH_KEY_GRACE_MS = 30 * 60_000;
+
+/**
+ * Classifies a presented mesh key.
+ *
+ * THE POINT OF THE DISTINCTION. Before this existed the Master could only answer
+ * "valid" or "not valid", so every satellite holding a rotated-out key looked
+ * identical to a stranger probing the port, and both got the same silent 401.
+ * Separating `stale` from `unknown` is what lets the mesh heal a legitimate node
+ * automatically while still refusing to hand the fleet key to anyone who cannot
+ * show they ever held one.
+ */
+export function classifyMeshKey(candidate: string | undefined): MeshKeyStatus {
+  const presented = String(candidate ?? "").trim();
+  if (!presented) return "missing";
+  if (verifyMeshKey(presented)) return "valid";
+
+  if (getRevokedMeshKeys().includes(presented)) return "revoked";
+
+  const stored = read();
+  const previous = (stored?.MESH_KEY_PREVIOUS || "").trim();
+  if (previous && previous === presented) {
+    const rotatedAt = Date.parse(stored?.MESH_KEY_ROTATED_AT || "") || 0;
+    // A previous key with no rotation timestamp is not trusted: without the age
+    // there is no way to know it is still inside the grace window.
+    if (rotatedAt > 0 && Date.now() - rotatedAt <= MESH_KEY_GRACE_MS) return "stale";
+  }
+  return "unknown";
+}
+
+/**
+ * Drops sibling endpoints for node codes that are no longer part of the mesh.
+ *
+ * WHY PURGE RATHER THAN MARK. A revoked or stale peer left in PEER_MESH keeps
+ * appearing in the dashboard's peer list and in every provisioning payload,
+ * which is how a fleet ends up showing nodes that were removed weeks ago. The
+ * Master is the sole authority on fleet membership, so when it says a code is
+ * gone, the endpoint is removed outright rather than flagged.
+ *
+ * @returns the codes that were actually removed, for logging and the UI.
+ */
+export function purgePeerMesh(nodeCodes: Iterable<string>): string[] {
+  const drop = new Set<string>();
+  for (const raw of nodeCodes) {
+    const code = normalizeNodeCode(raw);
+    if (code) drop.add(code);
+  }
+  if (drop.size === 0) return [];
+
+  const self = currentNodeIdentity()?.code ?? "";
+  const kept = listPeers().filter(
+    (peer) => !drop.has(peer.nodeCode) && peer.nodeCode !== self,
+  );
+  const removed = [...drop].filter((code) => code !== self);
+  persist({ PEER_MESH: kept });
+  return removed;
+}
+
 /** Constant-time comparison of a presented mesh key against the stored one. */
 export function verifyMeshKey(candidate: string | undefined): boolean {
   const expected = getMeshKey();

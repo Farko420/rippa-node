@@ -9,6 +9,7 @@ import {
   type CommandHandlers,
   type EfficiencyInput,
 } from "../services/heartbeat";
+import { parseMeshKeySync, type MeshKeySyncDirective } from "../services/meshKeySync";
 
 /**
  * SWARM CLIENT â€” secure connection between this node and the Cloudflare Mothership.
@@ -96,6 +97,17 @@ export type UpdateSignalHandler = (info: LatestVersionInfo) => void;
 export type TaskDispatchHandler = (tasks: SwarmTask[]) => void;
 
 /**
+ * Fired when the Mothership's heartbeat reply carries a mesh-key rotation
+ * instruction. Owned by the swarm dispatcher, which owns the registry and the
+ * credential. Master-only in practice — a satellite has nothing to rotate.
+ *
+ * The handler is invoked fire-and-forget: a rotation can involve network calls
+ * to the whole fleet, and a rejection here must never turn a successful
+ * heartbeat into a reported failure.
+ */
+export type MeshKeySyncHandler = (directive: MeshKeySyncDirective) => void;
+
+/**
  * THE QUARANTINE INGESTION ROUTE — where an autonomous discovery is filed for
  * review by the Mothership rather than trusted into `verified_knowledge`.
  */
@@ -162,6 +174,8 @@ export class SwarmClient {
   private updateSignal: UpdateSignalHandler | null = null;
   /** Fired when the Mothership pushes work down the heartbeat channel. */
   private taskDispatch: TaskDispatchHandler | null = null;
+  /** Fired when the heartbeat reply carries a mesh-key rotation instruction. */
+  private meshKeySync: MeshKeySyncHandler | null = null;
   /**
    * Set once the Mothership has answered 404/405 on the quarantine route, after
    * which discoveries go straight to {@link FORAGE_FALLBACK_PATH}. See
@@ -299,6 +313,39 @@ export class SwarmClient {
         this.updateSignal?.(advertised);
       }
 
+      /*
+        MESH KEY ROTATION, read off the same reply.
+
+        Checked early — before commands and tasks — because a rotation is the
+        instruction that changes what every subsequent request is allowed to
+        present. Acting on it late would mean one more heartbeat sent with a key
+        the fleet had already moved on from.
+
+        `parseMeshKeySync` returns null for the normal case of a reply carrying
+        no instruction at all, so this is a no-op on essentially every heartbeat.
+        The handler is dispatched fire-and-forget: rotating involves pushing to
+        the fleet, and a slow or throwing handler must not mark a healthy
+        heartbeat as failed.
+      */
+      const directive = parseMeshKeySync(data);
+      if (directive) {
+        console.log(
+          `[Swarm] Mesh key sync directive received from Rippa AI` +
+            (directive.meshKey ? " (new key issued)." : " (fleet membership corrected)."),
+        );
+        if (this.meshKeySync) {
+          try {
+            this.meshKeySync(directive);
+          } catch (error) {
+            console.warn(`[Swarm] Mesh key sync failed — ${describeError(error)}`);
+          }
+        } else {
+          console.warn(
+            "[Swarm] Rippa AI sent a mesh key directive but no handler is wired — ignoring.",
+          );
+        }
+      }
+
       // Remote command queue. Executed AFTER the update signal so an advertised
       // release and a FORCE_UPDATE cannot both start two competing downloads.
       const commands = parsePendingCommands(data);
@@ -355,6 +402,18 @@ export class SwarmClient {
    */
   setTaskDispatchHandler(handler: TaskDispatchHandler | null): void {
     this.taskDispatch = handler;
+  }
+
+  /**
+   * Registers the handler fired when the Mothership rotates the mesh key.
+   *
+   * Wired by index.ts to the swarm dispatcher, which is the only component that
+   * owns the credential and the registry. Kept as a setter rather than a
+   * constructor argument so `SwarmClient` stays constructible in isolation by
+   * the verification harness, which drives it with a stub dispatcher.
+   */
+  setMeshKeySyncHandler(handler: MeshKeySyncHandler | null): void {
+    this.meshKeySync = handler;
   }
 
   /**
