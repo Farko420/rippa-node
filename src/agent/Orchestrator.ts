@@ -57,10 +57,17 @@ export interface AdminCommandDeps {
   /** Enables or disables mesh routing. */
   setP2pEnabled: (enabled: boolean) => Promise<void> | void;
   /**
-   * Reports an admin command back to the Mothership before it is carried out.
-   * Optional so a host with no uplink can omit it entirely.
+   * Reports an admin command back to the Mothership so its queue entry is
+   * retired. Optional so a host with no uplink can omit it entirely.
+   *
+   * The `context` argument is the same shape the heartbeat executor supplies —
+   * notably the command id, without which the cloud cannot clear the entry.
    */
-  acknowledgeCommand?: (command: RemoteCommandName, detail: string) => Promise<void> | void;
+  acknowledgeCommand?: (
+    command: RemoteCommandName,
+    detail: string,
+    context?: { commandId?: string; status?: "completed" | "failed" | "in_progress" },
+  ) => Promise<void> | void;
 }
 
 export class Orchestrator {
@@ -274,6 +281,11 @@ export class Orchestrator {
       [
         {
           id: `task:${task.id}`,
+          // The raw task id, NOT the namespaced dedup key above. That key is
+          // correct locally but would be meaningless upstream: the Mothership
+          // filed this entry as `task.id`, so acknowledging `task:<id>` would
+          // match nothing and the admin task would be re-dispatched forever.
+          ackId: task.id,
           command,
           ...(typeof requested === "boolean" ? { args: { enabled: requested } } : {}),
         },

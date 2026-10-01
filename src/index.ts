@@ -133,25 +133,30 @@ async function main(): Promise<void> {
       acknowledging before the swap, applies on both paths at once. A second copy
       is how these two channels drifted apart in the first place.
     */
-    const acknowledgeUpstream = async (command: string, detail: string): Promise<void> => {
+    const acknowledgeUpstream = async (
+      command: string,
+      detail: string,
+      context?: { commandId?: string; status?: "completed" | "failed" | "in_progress" },
+    ): Promise<void> => {
       /*
-        SENT AS A PROFILE SUBMISSION, WHICH IS THE ROUTE THAT ALWAYS EXISTS.
+        POSTED TO THE DEDICATED ACK ROUTE, CARRYING THE COMMAND ID.
 
-        `/api/swarm/submit` is the endpoint every deployment already accepts, so
-        this cannot 404 the way an un-shipped dedicated ack route would — and a
-        404 here would leave the command looking un-acknowledged forever. The
-        command name and detail ride along so the fleet dashboard can show which
-        command this node accepted rather than an opaque record.
+        This used to be a plain profile submission to `/api/swarm/submit` with no
+        id attached. A profile submission is a *record*; it does not clear a
+        queue. The Mothership had no way to know which entry the node had just
+        finished, so it kept the entry queued and re-sent it on the next
+        heartbeat — the "Skipping already-executed command" loop. Acknowledging
+        through `/api/node/ack` with the id is what actually retires it.
+
+        `client.acknowledgeRemoteCommand` owns the route fallback chain and the
+        final profile-submission fallback, so this stays a one-liner and the
+        behaviour is identical on every command channel.
       */
-      await client.submitProfile({
-        kind: "admin_command_result",
+      await client.acknowledgeRemoteCommand({
+        commandId: context?.commandId,
         command,
-        status: "completed",
-        nodeName: env.NODE_NAME,
-        role: env.NODE_ROLE,
-        appVersion: APP_VERSION,
         detail,
-        reportedAt: new Date().toISOString(),
+        ...(context?.status ? { status: context.status } : {}),
       });
     };
 

@@ -13,7 +13,7 @@ import { ROOT, check, results } from "./verify-harness.mjs";
 const load = (rel) => import(pathToFileURL(path.join(ROOT, rel)).href);
 
 // --- 6. Admin command spellings --------------------------------------------
-const { parsePendingCommands, executePendingCommands, adminCommandForTaskType } = await load(
+const { parsePendingCommands, executePendingCommands, adminCommandForTaskType, resetExecutedCommands } = await load(
   "dist/services/heartbeat.js"
 );
 
@@ -134,6 +134,231 @@ await executePendingCommands([{ id: "ack-3", command: "FORCE_UPDATE" }], {
   },
 });
 check("an unreachable Mothership does not block the update", stillRan);
+
+// --- 7b. Queue retirement (the "Skipping already-executed command" loop) -------
+/*
+ * The reported symptom: the node logged "Skipping already-executed command" on
+ * every heartbeat, forever, because nothing ever told the Mothership the command
+ * was done. The local dedup set stopped it RE-RUNNING but was invisible to the
+ * cloud, so the queue entry was never retired and came back every 30 seconds.
+ *
+ * These checks pin the retirement signal: an executed, re-sent, or failed
+ * command must all produce an acknowledgement carrying the id the cloud needs.
+ */
+const ackBase = {
+  restartNode: () => {},
+  forceUpdate: () => true,
+  setP2pEnabled: () => {},
+  isP2pEnabled: () => true,
+};
+
+// A re-sent command must NOT re-run, but MUST be acknowledged so it leaves the
+// queue. Before the fix this path returned silently and the loop was permanent.
+resetExecutedCommands();
+const loopAcks = [];
+const rerunHandlers = {
+  ...ackBase,
+  acknowledgeCommand: (command, detail, context) => loopAcks.push({ command, detail, context }),
+};
+await executePendingCommands([{ id: "loop-1", command: "TOGGLE_P2P" }], rerunHandlers);
+const afterFirst = loopAcks.length;
+const again = await executePendingCommands([{ id: "loop-1", command: "TOGGLE_P2P" }], rerunHandlers);
+check(
+  "a re-sent command is not re-executed",
+  again.length === 0,
+  `returned ${again.length}`,
+);
+check(
+  "a re-sent command IS acknowledged so the Mothership retires it (loop fix)",
+  loopAcks.length > afterFirst && /already executed/.test(loopAcks[afterFirst].detail),
+  JSON.stringify(loopAcks[afterFirst]),
+);
+check(
+  "the re-send acknowledgement carries the command_id the cloud matches on",
+  loopAcks[afterFirst]?.context?.commandId === "loop-1",
+  JSON.stringify(loopAcks[afterFirst]?.context),
+);
+
+// The ack must be rate-limited, or a Mothership with no ack route turns a log
+// loop into a network loop — one POST per heartbeat, forever.
+const beforeThrottle = loopAcks.length;
+await executePendingCommands([{ id: "loop-1", command: "TOGGLE_P2P" }], rerunHandlers);
+await executePendingCommands([{ id: "loop-1", command: "TOGGLE_P2P" }], rerunHandlers);
+check(
+  "repeat re-sends do not re-ack on every heartbeat (rate limited)",
+  loopAcks.length === beforeThrottle,
+  `${loopAcks.length - beforeThrottle} extra acks`,
+);
+
+// TOGGLE_P2P never acknowledged at all before, so its entry was never retired.
+resetExecutedCommands();
+const toggleAcks = [];
+await executePendingCommands([{ id: "p2p-1", command: "TOGGLE_P2P" }], {
+  ...ackBase,
+  acknowledgeCommand: (command, detail, context) => toggleAcks.push({ command, detail, context }),
+});
+check(
+  "TOGGLE_P2P is acknowledged when it completes",
+  toggleAcks.length === 1 && toggleAcks[0].command === "TOGGLE_P2P",
+  JSON.stringify(toggleAcks),
+);
+check(
+  "the completion acknowledgement carries the command_id",
+  toggleAcks[0]?.context?.commandId === "p2p-1" && toggleAcks[0]?.context?.status === "completed",
+  JSON.stringify(toggleAcks[0]?.context),
+);
+
+// A FAILED command must be retired too, or the same loop restarts on a command
+// already known to be unrunnable here.
+resetExecutedCommands();
+const failAcks = [];
+await executePendingCommands([{ id: "fail-1", command: "TOGGLE_P2P" }], {
+  ...ackBase,
+  setP2pEnabled: () => {
+    throw new Error("p2p subsystem unavailable");
+  },
+  acknowledgeCommand: (command, detail, context) => failAcks.push({ command, detail, context }),
+});
+check(
+  "a failed command is acknowledged as failed (not left looping upstream)",
+  failAcks.length === 1 && failAcks[0].context?.status === "failed" && /failed/.test(failAcks[0].detail),
+  JSON.stringify(failAcks),
+);
+
+// The shutting-down commands must acknowledge BEFORE they exit, and must not
+// then claim completion from beyond the grave.
+resetExecutedCommands();
+const restartAcks = [];
+await executePendingCommands([{ id: "restart-1", command: "RESTART_NODE" }], {
+  ...ackBase,
+  acknowledgeCommand: (command, detail, context) => restartAcks.push({ command, detail, context }),
+});
+check(
+  "RESTART_NODE is acknowledged in_progress before it exits",
+  restartAcks.length === 1 && restartAcks[0].context?.status === "in_progress" && restartAcks[0].context?.commandId === "restart-1",
+  JSON.stringify(restartAcks),
+);
+
+// A refused update is reported honestly, and is not then overwritten by a
+// generic "executed" ack that would contradict it.
+resetExecutedCommands();
+const refused2 = [];
+await executePendingCommands([{ id: "ack-4", command: "FORCE_UPDATE" }], {
+  ...ackBase,
+  forceUpdate: () => false,
+  acknowledgeCommand: (command, detail, context) => refused2.push({ command, detail, context }),
+});
+check(
+  "a refused update is acknowledged exactly twice (in_progress, then failed)",
+  refused2.length === 2 && refused2[1].context?.status === "failed" && refused2[1].context?.commandId === "ack-4",
+  JSON.stringify(refused2.map((a) => a.context?.status)),
+);
+
+// The id is the key the cloud matches the ack on, so it must be read from every
+// spelling a Mothership uses — not just `id`.
+check(
+  "a command filed as command_id keeps its id for the acknowledgement",
+  parsePendingCommands({ pending_commands: [{ command_id: "cmd-77", command: "TOGGLE_P2P" }] })[0]?.id === "cmd-77",
+  JSON.stringify(parsePendingCommands({ pending_commands: [{ command_id: "cmd-77", command: "TOGGLE_P2P" }] })),
+);
+check(
+  "a command filed as commandId keeps its id too",
+  parsePendingCommands({ pending_commands: [{ commandId: "cmd-78", command: "TOGGLE_P2P" }] })[0]?.id === "cmd-78",
+);
+
+// --- 7c. The ack actually hits the wire, with the id ---------------------------
+/*
+ * The checks above prove the executor EMITS an acknowledgement. These prove the
+ * acknowledgement REACHES THE MOTHERSHIP on the dedicated route carrying the
+ * command_id — the thing that actually clears the queue entry, and the part
+ * that was entirely missing before (the old path POSTed a profile with no id to
+ * a route that does not clear queues).
+ *
+ * A real HTTP server stands in for the Mothership so the full axios path,
+ * including the route fallback chain, is exercised rather than a stub.
+ */
+const httpMod = await import("node:http");
+const osMod = await import("node:os");
+const received = [];
+// Toggled mid-test to simulate a Mothership that has not shipped the dedicated
+// ack route, so the fallback chain is exercised for real rather than assumed.
+let ackRouteMissing = false;
+const ackServer = httpMod.createServer((req, res) => {
+  let body = "";
+  req.on("data", (c) => (body += c));
+  req.on("end", () => {
+    received.push({ url: req.url, body: body ? JSON.parse(body) : {} });
+    const missing = ackRouteMissing && req.url === "/api/node/ack";
+    res.writeHead(missing ? 404 : 200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: true }));
+  });
+});
+await new Promise((r) => ackServer.listen(0, "127.0.0.1", r));
+const ackPort = ackServer.address().port;
+
+process.env.RIPPA_CONFIG_ROOT = fs.mkdtempSync(path.join(osMod.tmpdir(), "rippa-ack-"));
+const prevUrl = process.env.MOTHERSHIP_URL;
+const prevKey = process.env.NODE_API_KEY;
+const prevRole = process.env.NODE_ROLE;
+const prevMaster = process.env.MASTER_LOCAL_URL;
+process.env.MOTHERSHIP_URL = `http://127.0.0.1:${ackPort}`;
+process.env.NODE_API_KEY = "verify-ack-key-0001";
+process.env.NODE_ROLE = "satellite";
+process.env.MASTER_LOCAL_URL = "http://127.0.0.1:5199";
+
+const { SwarmClient } = await load("dist/network/SwarmClient.js");
+const ackClient = new SwarmClient();
+const acked = await ackClient.acknowledgeRemoteCommand({
+  commandId: "cmd-1234",
+  command: "FORCE_UPDATE",
+  detail: "executed",
+});
+check("the command acknowledgement succeeds against a live endpoint", acked === true);
+
+const primary = received.find((r) => r.url === "/api/node/ack");
+check("the ack is POSTed to the dedicated /api/node/ack route", Boolean(primary), JSON.stringify(received.map((r) => r.url)));
+check(
+  "the ack body carries command_id (what clears the queue entry)",
+  primary?.body?.command_id === "cmd-1234",
+  JSON.stringify(primary?.body),
+);
+check(
+  "the ack identifies the command and its outcome",
+  primary?.body?.command === "FORCE_UPDATE" && primary?.body?.status === "completed" && primary?.body?.completed === true,
+  JSON.stringify(primary?.body),
+);
+
+received.length = 0;
+// A Mothership that has not shipped the dedicated route must not break the node.
+ackRouteMissing = true;
+const fellBack = await ackClient.acknowledgeRemoteCommand({
+  commandId: "cmd-5678",
+  command: "TOGGLE_P2P",
+  detail: "executed",
+});
+check(
+  "an ack route that 404s falls through to the next route",
+  fellBack === true && received.some((r) => r.url === "/api/swarm/commands/ack"),
+  JSON.stringify(received.map((r) => r.url)),
+);
+check(
+  "the fallback ack still carries command_id",
+  received.find((r) => r.url === "/api/swarm/commands/ack")?.body?.command_id === "cmd-5678",
+);
+
+received.length = 0;
+ackServer.close();
+const unreachable = await ackClient.acknowledgeRemoteCommand({
+  commandId: "cmd-9999",
+  command: "RESTART_NODE",
+  detail: "accepted",
+});
+check("an unreachable Mothership does not throw from the ack path", unreachable === false);
+
+if (prevUrl === undefined) delete process.env.MOTHERSHIP_URL; else process.env.MOTHERSHIP_URL = prevUrl;
+if (prevKey === undefined) delete process.env.NODE_API_KEY; else process.env.NODE_API_KEY = prevKey;
+if (prevRole === undefined) delete process.env.NODE_ROLE; else process.env.NODE_ROLE = prevRole;
+if (prevMaster === undefined) delete process.env.MASTER_LOCAL_URL; else process.env.MASTER_LOCAL_URL = prevMaster;
 
 // --- 8. Swap script generation -------------------------------------------------
 // The script is what actually replaces the binary, so its contents are the

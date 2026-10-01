@@ -121,6 +121,37 @@ export const FORAGE_QUARANTINE_PATH = "/api/brain/quarantine";
 export const FORAGE_FALLBACK_PATH = "/api/swarm/submit";
 
 /**
+ * COMMAND ACKNOWLEDGEMENT ROUTES, most specific first.
+ *
+ * WHY A DEDICATED ROUTE EXISTS AT ALL. Until now an executed command was only
+ * remembered in this process's `executedCommandIds` set, so a Mothership that
+ * re-sent its queue made the node log "Skipping already-executed command" on
+ * every single heartbeat, forever — the command was never retired upstream.
+ * The only feedback path was a generic profile submission that carried no
+ * `command_id`, so the cloud had no key to match the queue entry against even
+ * when it was sent. Retiring the entry needs the id, and the id has to go to a
+ * route that acts on it.
+ *
+ * THE FALLBACKS ARE LOAD-BEARING. A node must not be bricked by a Mothership
+ * that has not shipped the dedicated route yet, so each 404/405/501 falls
+ * through to the next. The last resort is {@link FORAGE_FALLBACK_PATH}, which
+ * every deployment already accepts — the command is at least recorded, and the
+ * downgrade is remembered so the missing routes are not re-probed forever.
+ */
+export const COMMAND_ACK_PATH = "/api/node/ack";
+export const COMMAND_ACK_FALLBACK_PATH = "/api/swarm/commands/ack";
+
+/**
+ * The routes tried, in order, by {@link SwarmClient.acknowledgeRemoteCommand}.
+ *
+ * The dedicated `/api/node/ack` is the intended endpoint. The `/api/swarm/*`
+ * route is tried second because the swarm API surface is the one guaranteed to
+ * be deployed alongside this node. Ordered as a const so the fallback chain is
+ * stated in exactly one place.
+ */
+const COMMAND_ACK_ROUTES: readonly string[] = [COMMAND_ACK_PATH, COMMAND_ACK_FALLBACK_PATH];
+
+/**
  * One autonomous discovery, shaped for the Mothership's quarantine intake.
  *
  * Field names are snake_case because this crosses the wire — see the note on
@@ -586,6 +617,107 @@ export class SwarmClient {
     }
 
     console.warn(`[Swarm] Failed to fetch tasks — ${describeError(error)}`);
+  }
+
+  /**
+   * TELLS THE MOTHERSHIP A COMMAND IS DONE, SO IT LEAVES THE QUEUE.
+   *
+   * THE MISSING HALF OF THE LOOP. `executePendingCommands` keeps a local
+   * `executedCommandIds` set, but that memory dies with the process and is
+   * invisible to the cloud. Nothing about it told the Mothership the command
+   * had been dealt with, so the entry stayed queued and was re-sent on every
+   * heartbeat — producing "Skipping already-executed command" on a 30-second
+   * loop, indefinitely, for a command that had already run. This call is what
+   * retires the entry upstream.
+   *
+   * WHY THE ID IS SENT IN EVERY SPELLING. The node does not control the cloud's
+   * schema, and the field this endpoint reads may reasonably be named any of
+   * these. Sending all of them costs a few bytes and makes the ack work against
+   * whichever convention the deployment settled on, instead of silently matching
+   * nothing when it guessed wrong — the exact failure mode this whole call
+   * exists to remove.
+   *
+   * NEVER THROWS. An unreachable Mothership must not stop a node from executing
+   * the next command, and must never turn a successful command into a crash.
+   * Callers treat the return value as advisory.
+   */
+  async acknowledgeRemoteCommand(input: {
+    /** Queue entry id, when the Mothership supplied one. */
+    commandId?: string | undefined;
+    /** Canonical command name, e.g. "RESTART_NODE". */
+    command: string;
+    /** Human-readable outcome, shown on the fleet dashboard. */
+    detail: string;
+    /** Set to "failed" when the command did not complete. */
+    status?: "completed" | "failed" | "in_progress";
+  }): Promise<boolean> {
+    const status = input.status ?? "completed";
+    const commandId = input.commandId?.trim() ?? "";
+    const nodeCode = currentNodeIdentity()?.code ?? env.NODE_NAME;
+
+    const body = {
+      // Every plausible spelling of the id, so the ack binds to the queue entry
+      // regardless of which name this deployment's handler reads.
+      ...(commandId
+        ? { command_id: commandId, commandId, task_id: commandId, taskId: commandId, id: commandId }
+        : {}),
+      command: input.command,
+      commandName: input.command,
+      status,
+      detail: input.detail,
+      nodeName: env.NODE_NAME,
+      nodeCode,
+      role: env.NODE_ROLE,
+      // Lets the cloud distinguish "node is still working on it" from "node has
+      // permanently retired it" without inferring from the status string.
+      completed: status !== "in_progress",
+      acknowledgedAt: new Date().toISOString(),
+    };
+
+    for (const route of COMMAND_ACK_ROUTES) {
+      try {
+        await this.client.post(route, body);
+        console.log(
+          `[Swarm] Acknowledged ${input.command}${commandId ? ` (${commandId})` : ""} ` +
+            `via ${route} — ${input.detail}`,
+        );
+        return true;
+      } catch (error) {
+        const status_ = axios.isAxiosError(error) ? error.response?.status : undefined;
+        // A route that does not exist on this deployment is a downgrade
+        // trigger, not a failure — try the next one rather than giving up.
+        if (status_ === 404 || status_ === 405 || status_ === 501) {
+          continue;
+        }
+        console.warn(
+          `[Swarm] Acknowledgement of ${input.command} failed — ${describeError(error)}`,
+        );
+        return false;
+      }
+    }
+
+    /*
+      EVERY ACK ROUTE IS ABSENT.
+
+      Recorded as a profile submission so the fleet dashboard still shows the
+      command was received and acted on. This does NOT clear the cloud queue —
+      a Mothership with no ack route at all has no way to be told — but it keeps
+      the record honest and stops the request being re-probed on every command.
+    */
+    console.warn(
+      `[Swarm] Mothership exposes no command-ack route — recording ` +
+        `${input.command} as a profile instead. The queue entry may persist.`,
+    );
+    return this.submitProfile({
+      kind: "admin_command_result",
+      command: input.command,
+      command_id: commandId || null,
+      status,
+      nodeName: env.NODE_NAME,
+      role: env.NODE_ROLE,
+      detail: input.detail,
+      reportedAt: new Date().toISOString(),
+    });
   }
 
   /** Submits a completed JSON profile back to the Mothership. */

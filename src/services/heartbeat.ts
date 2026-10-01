@@ -80,6 +80,18 @@ export function adminCommandForTaskType(type: string | undefined): RemoteCommand
 /** One entry from the Mothership's `pending_commands` array. */
 export interface RemoteCommand {
   id?: string;
+  /**
+   * The id to acknowledge against, when it differs from {@link id}.
+   *
+   * The executor dedupes on `id`, and the Orchestrator namespaces its synthetic
+   * ids (`task:<id>`) so an admin task cannot collide with a heartbeat entry of
+   * the same name. That namespaced form is correct as a dedup key but WRONG as
+   * something to send upstream: the Mothership filed the entry as `<id>`, so
+   * acknowledging `task:<id>` would match nothing and the entry would never be
+   * cleared. This carries the real id for that purpose while `id` keeps doing
+   * the local bookkeeping.
+   */
+  ackId?: string;
   command: string;
   /** Optional arguments; `TOGGLE_P2P` accepts `{ enabled: boolean }`. */
   args?: Record<string, unknown>;
@@ -125,7 +137,8 @@ export interface CommandHandlers {
   /** Reports the node's current P2P state, so TOGGLE_P2P can invert it. */
   isP2pEnabled: () => boolean;
   /**
-   * Reports an admin command back to the Mothership.
+   * Reports an admin command back to the Mothership so the queue entry is
+   * retired. This is what stops an executed command being re-sent forever.
    *
    * WHY THIS IS NEEDED. An OTA update ends in `process.exit(0)` from inside the
    * handler, so anything the engine would normally report afterwards — the
@@ -134,8 +147,26 @@ export interface CommandHandlers {
    * dashboard the node simply went silent and then came back, which is
    * indistinguishable from ignoring the command. The host supplies this so the
    * acknowledgement is sent BEFORE the shutdown sequence begins.
+   *
+   * WHY `context` CARRIES THE ID. The acknowledgement's entire purpose is to
+   * clear one specific queue entry, which is impossible without its id. The
+   * executor passes it here so the host can forward it verbatim to the ack
+   * endpoint. It is optional so a two-argument host handler keeps working.
    */
-  acknowledgeCommand?: (command: RemoteCommandName, detail: string) => Promise<void> | void;
+  acknowledgeCommand?: (
+    command: RemoteCommandName,
+    detail: string,
+    context?: {
+      /** The queue entry's id, when the Mothership supplied one. */
+      commandId?: string;
+      /**
+       * Defaults to "completed". The two shutting-down commands report
+       * "in_progress" up front, because at that moment the outcome is not yet
+       * knowable and claiming success would be a lie.
+       */
+      status?: "completed" | "failed" | "in_progress";
+    },
+  ) => Promise<void> | void;
 }
 
 /** Efficiency inputs: successful vs. total task attempts. */
@@ -246,7 +277,13 @@ export function parsePendingCommands(payload: unknown): RemoteCommand[] {
     }
     commands.push({
       command: name,
-      ...(typeof record["id"] === "string" && record["id"] ? { id: record["id"] } : {}),
+      // The id is read from every spelling the Mothership realistically uses.
+      // It looked cosmetic before this change, but the id is the key the
+      // acknowledgement is matched on upstream: an entry filed as
+      // `command_id: "c-9"` and parsed as `undefined` produced an ack the cloud
+      // could not bind to anything, so the queue entry was never cleared and the
+      // command came back on the next heartbeat — the loop this fixes.
+      ...(commandIdFrom(record) ? { id: commandIdFrom(record) } : {}),
       ...(record["args"] && typeof record["args"] === "object"
         ? { args: record["args"] as Record<string, unknown> }
         : {}),
@@ -255,8 +292,39 @@ export function parsePendingCommands(payload: unknown): RemoteCommand[] {
   return commands;
 }
 
+/**
+ * Extracts the queue entry's id, tolerating the field names in use across
+ * Mothership deployments. Returns `undefined` when none is present, which the
+ * executor treats as "this entry cannot be retired upstream".
+ */
+function commandIdFrom(record: Record<string, unknown>): string | undefined {
+  for (const key of ["id", "command_id", "commandId", "task_id", "taskId"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    // Some deployments number their queue; a number is a perfectly good id.
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return undefined;
+}
+
 /** Remembers executed command ids so a re-sent queue cannot re-fire them. */
 const executedCommandIds = new Set<string>();
+
+/**
+ * Timestamp of the last "already executed" acknowledgement, per command key.
+ *
+ * The skip-path acknowledgement exists so a Mothership that keeps re-sending a
+ * finished command is told to stop. But if its ack route is missing or broken,
+ * that same re-send arrives every 30 seconds and would produce one POST per
+ * heartbeat, forever — trading a log loop for a network loop. Rate-limiting to
+ * one retry per {@link SKIP_ACK_THROTTLE_MS} keeps the signal alive while
+ * stopping it becoming its own kind of spam, and it still retries, so a
+ * transient outage heals on its own.
+ */
+const lastSkipAckAt = new Map<string, number>();
+
+/** Minimum gap between "already executed" acks for the same command. */
+const SKIP_ACK_THROTTLE_MS = 60_000;
 
 /** True when remote command execution is switched off by the operator. */
 function remoteCommandsEnabled(): boolean {
@@ -273,10 +341,11 @@ async function acknowledge(
   handlers: CommandHandlers,
   command: RemoteCommandName,
   detail: string,
+  context?: { commandId?: string; status?: "completed" | "failed" | "in_progress" },
 ): Promise<void> {
   if (!handlers.acknowledgeCommand) return;
   try {
-    await handlers.acknowledgeCommand(command, detail);
+    await handlers.acknowledgeCommand(command, detail, context);
   } catch (error) {
     console.warn(
       `[Heartbeat] Could not acknowledge ${command} upstream — ` +
@@ -304,11 +373,57 @@ export async function executePendingCommands(
 
   const executed: RemoteCommandName[] = [];
   for (const entry of commands) {
+    // `RemoteCommand.command` is a plain string because it comes off the wire;
+    // the allowlist gate in `parsePendingCommands` is what guarantees it is one
+    // of the three allowlisted names by the time it reaches here.
+    const command = entry.command as RemoteCommandName;
     const key = entry.id ?? `${entry.command}:${JSON.stringify(entry.args ?? {})}`;
+    // The id sent upstream, which is the REAL queue id where one exists. See
+    // `RemoteCommand.ackId` for why this is not simply `entry.id`.
+    const upstreamId = entry.ackId ?? entry.id;
+    const ackContext = upstreamId ? { commandId: upstreamId } : {};
+
+    /*
+      ALREADY EXECUTED — BUT STILL ACKNOWLEDGE IT.
+
+      This is the fix for the endless "Skipping already-executed command" loop.
+      The dedup set is LOCAL state: it stops the command re-running, but it is
+      invisible to the Mothership, which therefore has no reason to retire the
+      queue entry and re-sends it on the very next heartbeat. Skipping in silence
+      guaranteed the loop could never end, no matter how many heartbeats passed.
+
+      So the skip is reported as a completion, carrying the command id the cloud
+      needs to bind the acknowledgement to the entry. The command is not re-run —
+      the local guard still holds — but the cloud is now told, and stops sending.
+
+      Rate-limited, because if the cloud's ack route is absent this re-send would
+      otherwise become one POST per heartbeat indefinitely.
+    */
     if (executedCommandIds.has(key)) {
-      console.log(`[Heartbeat] Skipping already-executed command ${key}.`);
+      const lastAck = lastSkipAckAt.get(key) ?? 0;
+      if (Date.now() - lastAck >= SKIP_ACK_THROTTLE_MS) {
+        lastSkipAckAt.set(key, Date.now());
+        console.log(
+          `[Heartbeat] Skipping already-executed command ${key} — re-acknowledging ` +
+            `so the Mothership retires it.`,
+        );
+        await acknowledge(handlers, command, "already executed — clearing from queue", {
+          ...ackContext,
+          status: "completed",
+        });
+      } else {
+        console.log(`[Heartbeat] Skipping already-executed command ${key}.`);
+      }
       continue;
     }
+
+    // Resets the throttle so a genuinely new command reusing an id is not
+    // silenced by the previous one's backoff window.
+    lastSkipAckAt.delete(key);
+
+    // Tracked so a command that already acknowledged up front (the two that end
+    // in process.exit) is not acknowledged a second time on the way out.
+    let acknowledgedUpFront = false;
 
     try {
       switch (entry.command) {
@@ -325,8 +440,14 @@ export async function executePendingCommands(
             blocking: true,
           });
           // Restart also exits from inside its handler, so it is acknowledged up
-          // front for the same reason FORCE_UPDATE is.
-          await acknowledge(handlers, "RESTART_NODE", "accepted — restarting the node");
+          // front for the same reason FORCE_UPDATE is. "in_progress" rather than
+          // "completed" because the node is about to go away — the outcome is not
+          // knowable yet, and the id is what retires the queue entry either way.
+          await acknowledge(handlers, "RESTART_NODE", "accepted — restarting the node", {
+            ...ackContext,
+            status: "in_progress",
+          });
+          acknowledgedUpFront = true;
           await handlers.restartNode();
           break;
         case "FORCE_UPDATE":
@@ -354,14 +475,22 @@ export async function executePendingCommands(
             correct the record on the paths that do NOT exit (refused, aborted or
             dev mode) — where "accepted" would otherwise be a lie.
           */
-          await acknowledge(handlers, "FORCE_UPDATE", "accepted — downloading the latest release");
+          await acknowledge(handlers, "FORCE_UPDATE", "accepted — downloading the latest release", {
+            ...ackContext,
+            status: "in_progress",
+          });
+          acknowledgedUpFront = true;
           const committed = await handlers.forceUpdate();
           if (committed === false) {
             await acknowledge(
               handlers,
               "FORCE_UPDATE",
               "not applied — no swap was committed (refused, aborted, or not a packaged exe)",
+              { ...ackContext, status: "failed" },
             );
+            // The record is now correct, so the generic completion ack below
+            // would only contradict it.
+            acknowledgedUpFront = true;
           }
           break;
         case "TOGGLE_P2P": {
@@ -376,14 +505,41 @@ export async function executePendingCommands(
       }
       executed.push(entry.command as RemoteCommandName);
       executedCommandIds.add(key);
+
+      /*
+        EVERY OTHER COMMAND IS ACKNOWLEDGED ON THE WAY OUT.
+
+        TOGGLE_P2P previously reported nothing at all, so its queue entry was
+        never retired and came back every heartbeat even though it had plainly
+        been applied. Retiring the entry here — rather than only on the two
+        exiting paths — is what makes the acknowledgement a general contract
+        instead of a special case for the two commands that happen to restart.
+      */
+      if (!acknowledgedUpFront) {
+        await acknowledge(handlers, command, "executed", {
+          ...ackContext,
+          status: "completed",
+        });
+      }
     } catch (error) {
       // Mark as handled even on failure: retrying a restart command forever
       // would be worse than dropping it and waiting for the operator.
-      console.warn(
-        `[Heartbeat] Command ${entry.command} failed — ` +
-          (error instanceof Error ? error.message : String(error)),
-      );
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`[Heartbeat] Command ${command} failed — ${reason}`);
       executedCommandIds.add(key);
+
+      /*
+        A FAILED COMMAND IS STILL RETIRED UPSTREAM, and reported as failed.
+
+        Leaving a failed entry in the queue would restart the same loop this
+        change is fixing, on a command already known to be unrunnable here. The
+        failure is recorded truthfully, so the operator sees what happened rather
+        than a command that silently vanished.
+      */
+      await acknowledge(handlers, command, `failed — ${reason}`, {
+        ...ackContext,
+        status: "failed",
+      });
     }
   }
   return executed;
@@ -392,4 +548,5 @@ export async function executePendingCommands(
 /** Clears the executed-command memory (used by tests and on role change). */
 export function resetExecutedCommands(): void {
   executedCommandIds.clear();
+  lastSkipAckAt.clear();
 }
