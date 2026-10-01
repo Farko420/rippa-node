@@ -16,7 +16,11 @@ on:
     types: [published]
 
 permissions:
-  contents: write # required to create/update a release and upload assets
+  # Explicit, not implicit: the default GITHUB_TOKEN permissions depend on the
+  # repo/org settings, so a release job can fail with a confusing 403 when
+  # `contents: write` is not requested up front. State both explicitly.
+  contents: write # required to create/update a release, its assets and the tag
+  packages: write # required if the exe is ever mirrored to a GitHub Package
 
 # A newer push to main always wins; never cancel a release upload midway,
 # because that can leave a release pointing at a partial asset.
@@ -103,11 +107,44 @@ jobs:
           commit_message: "chore: bump version to ${{ steps.version.outputs.version }}"
           file_pattern: package.json
 
+      # -------------------------------------------------------------------------
+      # RELEASE TAG RESOLUTION
+      #
+      # A release can only be created against a commitish that actually exists.
+      # On an ordinary push to `master`, `github.ref_name` is the BRANCH name,
+      # not a tag, so using it as a tag target is what makes release creation
+      # fail on every commit that is not itself a tagged release. Resolve an
+      # explicit, always-valid target instead:
+      #   - tag-triggered run  -> the real git tag;
+      #   - branch commit      -> the pushed SHA (never fails), with a stable
+      #                          fallback tag v1.0.<run_number> recorded for
+      #                          provenance and used as the release target name.
+      # -------------------------------------------------------------------------
+      - name: Resolve release tag
+        id: release_tag
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+            $commitish = "${{ github.sha }}"
+          } else {
+            $tag = "v1.0.${{ github.run_number }}"
+            # The SHA is always resolvable, which is the entire point: it removes
+            # the "release creation failed because master is not a tag" failure.
+            $commitish = "${{ github.sha }}"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "commitish=$commitish" >> $env:GITHUB_OUTPUT
+          Write-Host "Release tag: $tag (commitish: $commitish)"
+
       - name: Publish rolling release
         uses: softprops/action-gh-release@v2
         with:
-          # Rolling tag: always points at the newest build.
+          # Rolling tag: always points at the newest build. The fleet's Master
+          # polls /releases/latest, so this tag must stay stable across pushes.
           tag_name: latest
+          # What the release/tag is created from. Never a branch name.
+          target_commitish: ${{ steps.release_tag.outputs.commitish }}
           name: rippa-node ${{ steps.version.outputs.version }}
           prerelease: false
           draft: false
@@ -120,12 +157,31 @@ jobs:
 
             rippa-node-version: `${{ steps.version.outputs.version }}`
             SHA-256: `${{ steps.checksum.outputs.sha256 }}`
+            build-tag: `${{ steps.release_tag.outputs.tag }}`
 
             The Master node polls this release hourly and broadcasts the update to
             every paired satellite automatically.
           files: |
             dist/rippa-node.exe
           fail_on_unmatched_files: true
+        env:
+          # Passed explicitly. The action falls back to `github.token`, but the
+          # implicit value depends on the repository's default token permissions,
+          # so state it to make the 403-on-release impossible to misdiagnose.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The release is a distribution channel; the artifact is the safety net.
+      # `if: always()` is deliberate: a failed or skipped release publish must
+      # never cost us the built exe, which is expensive to rebuild and is the
+      # only copy of that exact build.
+      - name: Upload build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rippa-node-exe
+          path: dist/rippa-node.exe
+          if-no-files-found: error
+          retention-days: 30
 
   # ---------------------------------------------------------------------------
   # ANDROID APK — the mobile satellite.
@@ -222,5 +278,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
+          # Same reason as the .exe job: the SHA always resolves, a branch name
+          # does not. Without this the release can fail to be created on master.
+          target_commitish: ${{ github.sha }}
           files: ${{ steps.apk.outputs.path }}
           fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same safety net as the .exe: the APK survives a failed release publish.
+      - name: Upload the APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rippa-node-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: warn
+          retention-days: 30
