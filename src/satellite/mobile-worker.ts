@@ -127,6 +127,23 @@ export class SatelliteWorker {
     this.pollTimer = setInterval(() => void poll(), 10000);
   }
 
+  /**
+   * Headers for a Master mesh request.
+   *
+   * The mesh key is sent under BOTH `X-Mesh-Key` (the dedicated channel this
+   * protocol has always used) and `Authorization: Bearer` (the credential every
+   * other Rippa surface speaks). Sending only the dedicated header is what left
+   * this poll being 401'd against a Master that authenticates the standard way.
+   */
+  private meshHeaders(): Record<string, string> {
+    const key = this.config?.meshKey || "";
+    return {
+      "Content-Type": "application/json",
+      "X-Mesh-Key": key,
+      ...(key ? { Authorization: `Bearer ${key}` } : {}),
+    };
+  }
+
   private async pollMaster(): Promise<void> {
     if (!this.config?.masterUrl) return;
     // The timer is torn down on suspend, but a poll already in flight when the
@@ -134,19 +151,49 @@ export class SatelliteWorker {
     // the guarantee holds regardless of which happened first.
     if (this.suspended) return;
     const masterUrl = this.config.masterUrl.replace(/\/$/, "");
-    
+
     try {
-      const response = await axios.post(`${masterUrl}/api/mesh/heartbeat`, { status: "idle" }, {
-        timeout: 8000,
-        headers: { "X-Mesh-Key": this.config.meshKey || "" },
-      });
+      const response = await axios.post(
+        `${masterUrl}/api/mesh/heartbeat`,
+        { status: "idle" },
+        { timeout: 8000, headers: this.meshHeaders() },
+      );
 
       const task = response.data?.task as TaskAssignment | undefined;
       if (task && task.id !== this.currentTask?.id) {
         this.currentTask = task;
         await this.executeTask(task);
       }
-    } catch {
+    } catch (error) {
+      /*
+        A 401 IS ACTIONABLE, NOT FATAL.
+
+        The Master refuses a stale key with a `syncReset` payload rather than a
+        bare 401, and that payload is the only automatic route back for a node
+        whose credential went out of date. Swallowing the error (as this did)
+        meant retrying the same dead key every ten seconds forever. When the
+        Master re-issues a key we adopt it immediately and carry on; when it
+        asks us to re-pair instead, that needs an operator and is only logged.
+      */
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status === 401) {
+        const body = axios.isAxiosError(error)
+          ? ((error.response?.data ?? {}) as Record<string, unknown>)
+          : {};
+        const reset = body["syncReset"] as Record<string, unknown> | null | undefined;
+        const issued = typeof reset?.["meshKey"] === "string" ? String(reset["meshKey"]) : "";
+        if (issued) {
+          this.config = { ...this.config, meshKey: issued } as SatelliteConfig;
+          await this.storage?.set("meshKey", issued);
+          console.log("[Satellite] Mesh key refused — adopted the re-issued key.");
+          return;
+        }
+        console.warn(
+          `[Satellite] Master refused the mesh key (${reset?.["reason"] ?? "unknown"}) — ` +
+            "re-pairing is required.",
+        );
+        return;
+      }
       // silent on timeout
     }
   }
@@ -197,7 +244,7 @@ export class SatelliteWorker {
     try {
       await axios.post(`${masterUrl}/api/mesh/result`, result, {
         timeout: 5000,
-        headers: { "X-Mesh-Key": this.config.meshKey || "" },
+        headers: this.meshHeaders(),
       });
     } catch {
       // silent

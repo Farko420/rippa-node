@@ -402,13 +402,32 @@ async function pollForTasks(): Promise<void> {
   }
 }
 
+/**
+ * The mesh credential for Master requests.
+ *
+ * `apiKey` is the same secret the Master issued this node at pairing time (it
+ * is what `startSatellite()` hands the satellite core as `meshKey`), so it is
+ * the one value available for authenticating here.
+ */
+function meshHeaders(): Record<string, string> {
+  const key = config.apiKey || "";
+  return {
+    "Content-Type": "application/json",
+    // Sent under BOTH names. `X-Mesh-Key` is the dedicated mesh channel; the
+    // Bearer form is what every other Rippa surface speaks, and sending only
+    // one of them is what produced a 401 on a node that held a valid key.
+    "X-Mesh-Key": key,
+    ...(key ? { Authorization: `Bearer ${key}` } : {}),
+  };
+}
+
 /** Polls the Master mesh so this node appears in its Swarm Grid. */
 async function pollMaster(): Promise<void> {
   if (!base(config.masterUrl)) return;
   try {
     const response = await fetch(`${base(config.masterUrl)}/api/mesh/heartbeat`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: meshHeaders(),
       body: JSON.stringify({
         nodeCode: config.nodeCode,
         nodeName: config.nodeName,
@@ -418,6 +437,31 @@ async function pollMaster(): Promise<void> {
         metrics: {},
       }),
     });
+    if (response.status === 401) {
+      /*
+        A 401 IS A RECOVERY SIGNAL, NOT A DEAD END.
+
+        The Master answers a refused heartbeat with a `syncReset` payload
+        carrying its own recovery instructions, which is the only thing that lets
+        a node whose key went stale fix itself. A bare 401 was previously
+        swallowed here, so the tablet retried the same dead credential every ten
+        seconds forever and the fleet view showed a permanently red node.
+
+        Adopt the key when the Master hands one over (it only does so for a node
+        it recognises as holding the recently-rotated key); otherwise there is
+        nothing safe to do here and re-pairing needs the operator's Master URL.
+      */
+      const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+      const reset = body["syncReset"] as Record<string, unknown> | null | undefined;
+      const issued = typeof reset?.["meshKey"] === "string" ? String(reset["meshKey"]) : "";
+      if (issued) {
+        saveConfig({ apiKey: issued });
+        log(`Mesh key refused (${reset?.["reason"] ?? "unknown"}) — adopted the re-issued key.`);
+        return;
+      }
+      counters.lastError = `Master refused the mesh key (${reset?.["reason"] ?? "unknown"})`;
+      return;
+    }
     if (!response.ok) return;
     const data = (await response.json()) as Record<string, unknown>;
     const siblings = Array.isArray(data["siblings"])

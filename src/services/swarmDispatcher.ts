@@ -1737,6 +1737,16 @@ async recoverFromSyncReset(
 
     let response;
     try {
+      /*
+        THE MESH KEY IS PRESENTED UNDER BOTH HEADER NAMES.
+
+        `X-Mesh-Key` is the dedicated mesh channel; `Authorization: Bearer` is
+        what every other Rippa surface already speaks. A Master authenticating
+        the standard way refused this poll with a 401 even though the node held
+        a valid key, which is the reported mesh-poll failure. Sending both is
+        backward compatible with any Master that only reads the dedicated one.
+      */
+      const meshKey = getMeshKey();
       response = await axios.post(
         `${pairing.masterUrl.replace(/\/+$/, "")}/api/mesh/heartbeat`,
         {
@@ -1748,7 +1758,13 @@ async recoverFromSyncReset(
           metrics: this.localMetrics,
           p2pEnabled: p2pEnabled(),
         },
-        { timeout: MESH_HTTP_TIMEOUT_MS, headers: { "X-Mesh-Key": getMeshKey() } },
+        {
+          timeout: MESH_HTTP_TIMEOUT_MS,
+          headers: {
+            "X-Mesh-Key": meshKey,
+            ...(meshKey ? { Authorization: `Bearer ${meshKey}` } : {}),
+          },
+        },
       );
     } catch (error) {
       /*
@@ -1772,6 +1788,40 @@ async recoverFromSyncReset(
         await this.recoverFromSyncReset(reset, pairing);
         return;
       }
+
+      /*
+        A BARE 401 STILL TRIGGERS A KEY-SYNC.
+
+        A Master that predates the `syncReset` contract answers with nothing but
+        a status code, and the old code rethrew here — so such a node retried a
+        dead credential every ten seconds indefinitely and never once attempted
+        the recovery its situation called for.
+
+        Synthesising a reset from the status code is the correct move: it is
+        exactly the information a bare 401 conveys ("that key is not valid, go
+        and fix it"), and `recoverFromSyncReset` is already latched and safe —
+        it either adopts a re-issued key or re-runs the pairing handshake. Any
+        OTHER 4xx (or a transport error from an offline Master) is genuinely
+        transient and still propagates for the caller to log.
+      */
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status === 401) {
+        console.warn(
+          "[Swarm] Master refused the mesh key (no syncReset guidance) — " +
+            "re-authenticating automatically.",
+        );
+        await this.recoverFromSyncReset(
+          {
+            reason: "unknown-key",
+            reauthRequired: true,
+            masterCode: pairing?.masterCode ?? "",
+            message: "Master refused the mesh key without recovery guidance.",
+          },
+          pairing,
+        );
+        return;
+      }
+
       throw error;
     }
 

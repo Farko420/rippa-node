@@ -720,9 +720,29 @@ export function createApp(): Express {
   //  - the /api/mesh/* dashboard routes sit behind requireDashboardAuth so the
   //    LAN passkey still protects the Control Center.
 
-  /** Reads the mesh key from the X-Mesh-Key header. */
-  const meshKeyOf = (req: Request): string =>
-    String((req.headers["x-mesh-key"] as string | undefined) ?? "");
+  /*
+    READS THE MESH KEY FROM EITHER HEADER.
+
+    `X-Mesh-Key` is the historical, dedicated channel and stays first so an
+    existing satellite is never affected. `Authorization: Bearer <key>` is
+    accepted as an EQUIVALENT because it is the credential every other Rippa
+    surface already speaks — the Mothership client, the mobile WebView, the
+    desktop dashboard — and a satellite presenting only the standard header was
+    being 401'd despite holding a perfectly valid key. That mismatch is exactly
+    the reported "401 on mesh poll": the caller authenticated correctly by the
+    app's own conventions and this route disagreed.
+
+    An empty string is still a failed authentication; this only widens WHERE a
+    valid key may arrive from, never WHO may present one.
+  */
+  const meshKeyOf = (req: Request): string => {
+    const dedicated = String((req.headers["x-mesh-key"] as string | undefined) ?? "").trim();
+    if (dedicated) return dedicated;
+
+    const auth = String((req.headers["authorization"] as string | undefined) ?? "").trim();
+    const bearer = /^Bearer\s+(.+)$/i.exec(auth);
+    return bearer ? bearer[1].trim() : "";
+  };
 
   // POST /api/mesh/pair — the ONE-TIME Satellite → Master handshake.
   app.post("/api/mesh/pair", (req: Request, res: Response) => {

@@ -64,6 +64,23 @@ const NETWORK_IDLE_CAP_MS = 5_000;
 /** Resolved install promise so repeated checks never start a second download. */
 let chromiumBootstrap: Promise<void> | null = null;
 
+/**
+ * TRUE once we have established Chromium cannot be obtained on this machine.
+ *
+ * WHY THIS IS A MODULE FLAG AND NOT A FIELD ON `ScraperService`. The bootstrap
+ * is shared by every instance (see `chromiumBootstrap`), so the verdict has to
+ * be shared too: a node that failed to download Chromium once must reach the
+ * same conclusion on every scraper instance for the life of the process.
+ *
+ * THIS IS WHAT MAKES A FAILED DOWNLOAD SURVIVABLE. Without it, a failed
+ * bootstrap only logged a line and then every subsequent `scrape()` still took
+ * the Chromium path and threw "Executable doesn't exist at ...", turning a
+ * recoverable first-boot network problem into a node that could never forage
+ * again. With it, `scrape()` degrades to the lightweight fetch scraper and the
+ * rest of the node carries on.
+ */
+let chromiumUnavailable = false;
+
 /** Expected Chromium path, or null when Playwright cannot resolve it. */
 function chromiumExecutablePath(): string | null {
   try {
@@ -84,63 +101,154 @@ function bundledPlaywrightVersion(): string | null {
 }
 
 function reportBootstrapFailure(reason: string): void {
+  // Records the failure so every later scrape takes the lightweight path, then
+  // explains what happened. Deliberately NOT fatal: the node must survive a
+  // missing browser.
+  chromiumUnavailable = true;
   console.log(`[Scraper] Automatic Chromium download did not finish (${reason}).`);
-  console.log('[Scraper] Once you are online, run: npx playwright install chromium');
+  console.log(
+    "[Scraper] Browser scraping is disabled for this run — falling back to the " +
+      "lightweight fetch scraper. All other node capabilities stay online.",
+  );
+  console.log('[Scraper] To restore it once online, run: npx playwright install chromium');
+}
+
+/**
+ * Resolves the writable directory a packaged build must download Chromium into,
+ * or "" when no override is needed.
+ *
+ * WHY A PACKAGED EXE NEEDS THIS. Playwright resolves its browser registry from
+ * `PLAYWRIGHT_BROWSERS_PATH`, and when that is unset it falls back to a location
+ * resolved from the *package installation*. Inside a `pkg` snapshot there is no
+ * node_modules directory on disk, so that fallback points somewhere unusable or
+ * unwritable and the download fails — exactly the reported "Playwright fails to
+ * install Chromium on boot" symptom.
+ *
+ * `%LOCALAPPDATA%\RippaNode\browsers` is chosen deliberately: it is the same
+ * per-user app-data root this app already uses for config.json and the Deep
+ * Brain database (see `utils/paths.ts`), so it is guaranteed writable, survives
+ * OTA swaps of the executable, and needs no admin rights.
+ *
+ * Returns "" on any failure, and for non-packaged runs, so the caller can simply
+ * skip setting the variable rather than reason about which case it is in.
+ */
+function resolveBrowserInstallDir(): string {
+  try {
+    // `typeof` rather than truthiness: `process.pkg` is injected by the pkg
+    // bootstrap and is genuinely absent from a plain `node`/`tsx` process.
+    if (typeof (process as NodeJS.Process & { pkg?: unknown }).pkg === "undefined") {
+      return "";
+    }
+    // Resolved through the app's own path helper rather than re-deriving
+    // LOCALAPPDATA here, so the browser cache can never drift away from the
+    // directory the rest of the app persists to. Lazily required for the same
+    // reason `node:fs` is below — this file is evaluated inside a WebView too.
+    const path = require("node:path") as typeof import("node:path");
+    const { resolveDataDir } = require("../utils/paths") as typeof import("../utils/paths");
+    return path.join(resolveDataDir(), "browsers");
+  } catch (error) {
+    console.warn(
+      `[Scraper] Could not resolve a browser install directory — ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return "";
+  }
 }
 
 /** Startup check: verify Chromium exists, else install it in the background. */
 function ensureChromiumInstalled(): Promise<void> {
   if (chromiumBootstrap) return chromiumBootstrap;
 
-  // `node:fs` and `node:child_process` are required HERE rather than imported at
-  // the top of the file, for the same reason Playwright is: this whole function
-  // is unreachable on mobile, and a static import would still be evaluated.
-  const fs = require("node:fs") as typeof import("node:fs");
-  const { spawn } = require("node:child_process") as typeof import("node:child_process");
+  /*
+    EVERYTHING BELOW IS INSIDE ONE TRY/CATCH, AND THE PROMISE NEVER REJECTS.
 
-  const executable = chromiumExecutablePath();
-  if (executable && fs.existsSync(executable)) {
-    chromiumBootstrap = Promise.resolve();
-    return chromiumBootstrap;
-  }
+    This routine runs from `ScraperService`'s CONSTRUCTOR, i.e. while the
+    Orchestrator is still being built. Anything that threw out of here — a
+    missing `node:child_process`, a read-only filesystem, a bad spawn — took the
+    entire node down at boot, before a single task could run. A missing browser
+    is a degraded capability, never a fatal error, so the promise always
+    resolves and the failure is recorded in `chromiumUnavailable` instead.
+  */
+  chromiumBootstrap = (async () => {
+    try {
+      // `node:fs` and `node:child_process` are required HERE rather than
+      // imported at the top of the file, for the same reason Playwright is:
+      // this whole function is unreachable on mobile, and a static import would
+      // still be evaluated.
+      const fs = require("node:fs") as typeof import("node:fs");
+      const { spawn } = require("node:child_process") as typeof import("node:child_process");
 
-  console.log("[Scraper] Chromium browser not found on this machine.");
-  console.log("[Scraper] Downloading it now in the background (first run only — this can take a minute)…");
-
-  chromiumBootstrap = new Promise<void>((resolve) => {
-    const version = bundledPlaywrightVersion();
-    // Sanitized: only ever `playwright` or `playwright@<x.y.z>` (from package.json).
-    const spec = version && /^[\w.-]+$/.test(version) ? `playwright@${version}` : "playwright";
-    const onWindows = (process as { platform?: string }).platform === "win32";
-    // Windows needs the shell to reach npx.cmd. A single command string (no
-    // args array + shell:true) avoids Node's DEP0190 deprecation warning.
-    const child = onWindows
-      ? spawn(`npx --yes ${spec} install chromium`, {
-          cwd: process.cwd(),
-          stdio: "ignore",
-          detached: true,
-          shell: true,
-        })
-      : spawn("npx", ["--yes", spec, "install", "chromium"], {
-          cwd: process.cwd(),
-          stdio: "ignore",
-          detached: true,
-        });
-
-    child.once("error", (error: Error) => {
-      reportBootstrapFailure(error.message);
-      resolve();
-    });
-    child.once("exit", (code, signal) => {
-      if (code === 0) {
-        console.log("[Scraper] Chromium download finished — scraping is ready.");
-      } else {
-        reportBootstrapFailure(`exit code ${code ?? signal ?? "unknown"}`);
+      /*
+        THE PACKAGED-EXE PATH FIX. Must happen BEFORE the first
+        `chromium.executablePath()` call, because that call resolves and caches
+        the browser registry path. Setting it afterwards is too late: the node
+        would still look in the unwritable location.
+      */
+      const browserDir = resolveBrowserInstallDir();
+      if (browserDir) {
+        process.env.PLAYWRIGHT_BROWSERS_PATH = browserDir;
+        fs.mkdirSync(browserDir, { recursive: true });
+        console.log(`[Scraper] Packaged build — Chromium will be installed in ${browserDir}`);
       }
-      resolve();
-    });
-    child.unref();
-  });
+
+      const executable = chromiumExecutablePath();
+      if (executable && fs.existsSync(executable)) {
+        chromiumUnavailable = false;
+        return;
+      }
+
+      console.log("[Scraper] Chromium browser not found on this machine.");
+      console.log(
+        "[Scraper] Downloading it now in the background (first run only — this can take a minute)…",
+      );
+
+      const version = bundledPlaywrightVersion();
+      // Sanitized: only ever `playwright` or `playwright@<x.y.z>` (from package.json).
+      const spec = version && /^[\w.-]+$/.test(version) ? `playwright@${version}` : "playwright";
+      const onWindows = (process as { platform?: string }).platform === "win32";
+      // Windows needs the shell to reach npx.cmd. A single command string (no
+      // args array + shell:true) avoids Node's DEP0190 deprecation warning.
+      const child = onWindows
+        ? spawn(`npx --yes ${spec} install chromium`, {
+            cwd: process.cwd(),
+            stdio: "ignore",
+            detached: true,
+            shell: true,
+          })
+        : spawn("npx", ["--yes", spec, "install", "chromium"], {
+            cwd: process.cwd(),
+            stdio: "ignore",
+            detached: true,
+          });
+
+      await new Promise<void>((resolve) => {
+        child.once("error", (error: Error) => {
+          reportBootstrapFailure(error.message);
+          resolve();
+        });
+        child.once("exit", (code, signal) => {
+          if (code === 0) {
+            // Verified rather than trusted: an installer that exits 0 having
+            // written nothing must not leave the node believing it has a
+            // browser, because that is the state where every scrape throws.
+            const landed = chromiumExecutablePath();
+            if (landed && fs.existsSync(landed)) {
+              console.log("[Scraper] Chromium download finished — scraping is ready.");
+            } else {
+              reportBootstrapFailure("the installer reported success but no browser was found");
+            }
+          } else {
+            reportBootstrapFailure(`exit code ${code ?? signal ?? "unknown"}`);
+          }
+          resolve();
+        });
+        child.unref();
+      });
+    } catch (error) {
+      reportBootstrapFailure(error instanceof Error ? error.message : String(error));
+    }
+  })();
 
   return chromiumBootstrap;
 }
@@ -200,8 +308,14 @@ export class ScraperService {
    * cannot change during a process's life (a WebView stays a WebView), and
    * re-probing on every pass would run the defensive `globalThis` walks on the
    * hot path of an overnight run.
+   *
+   * NOT `readonly`. This starts as "this runtime supports Chromium" and is
+   * permanently demoted to false once the startup bootstrap proves no browser
+   * can be obtained. See {@link ScraperService.scrape}, which is where that
+   * demotion is acted on — a node whose browser never downloaded has to fall
+   * back to the lightweight scraper rather than throw on every single task.
    */
-  private readonly canUseBrowser: boolean;
+  private canUseBrowser: boolean;
 
   constructor() {
     this.canUseBrowser = supportsBrowserScraping();
@@ -218,7 +332,8 @@ export class ScraperService {
     */
     if (this.canUseBrowser) {
       // Verifies the binary and, when missing, starts a silent background
-      // install so no manual CLI command is ever needed.
+      // install so no manual CLI command is ever needed. Guaranteed never to
+      // reject, so no `.catch()` is needed here to keep boot alive.
       this.chromiumReady = ensureChromiumInstalled();
     } else {
       this.chromiumReady = Promise.resolve();
@@ -274,7 +389,48 @@ export class ScraperService {
       return scrapeMobile(url);
     }
 
-    const browser = await this.getBrowser();
+    /*
+      THE RUNTIME SAID YES BUT THE BROWSER IS NOT THERE.
+
+      `canUseBrowser` is a statement about the RUNTIME (this is Node, not a
+      WebView). It is not a promise that Chromium exists: on a packaged exe the
+      download can still be in flight, fail, or never have been reached. Waiting
+      for that verdict here — once, on the first scrape — and permanently
+      demoting to the fetch scraper is what turns a failed Chromium install into
+      a degraded node instead of a permanently broken one. Without this check the
+      code below would call `chromium.launch()` against a binary that is not
+      there and throw on every single task, forever.
+    */
+    await this.chromiumReady;
+    if (chromiumUnavailable) {
+      this.canUseBrowser = false;
+      console.log(
+        "[Scraper] No Chromium available — this node will use the lightweight fetch scraper.",
+      );
+      return scrapeMobile(url);
+    }
+
+    /*
+      A LAUNCH THAT FAILS IS ALSO A DEGRADATION, NOT A CRASH.
+
+      Everything above can succeed — runtime is Node, the binary was found — and
+      still fail here: the binary is corrupt, blocked by antivirus, or missing a
+      system library. That must cost this node its browser scraping and nothing
+      else, so the instance is demoted (which also stops `isBrowserBacked()`
+      reporting a capability that does not work) and the caller falls back.
+    */
+    let browser: Browser;
+    try {
+      browser = await this.getBrowser();
+    } catch (error) {
+      this.canUseBrowser = false;
+      console.warn(
+        `[Scraper] Chromium failed to launch — ${
+          error instanceof Error ? error.message : String(error)
+        }. Using the lightweight fetch scraper instead.`,
+      );
+      return scrapeMobile(url);
+    }
     const context = await browser.newContext({
       // en-AU + a stock desktop UA keeps the parse honest for AU-targeted pages.
       locale: "en-AU",

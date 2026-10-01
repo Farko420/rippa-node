@@ -142,6 +142,34 @@ export const COMMAND_ACK_PATH = "/api/node/ack";
 export const COMMAND_ACK_FALLBACK_PATH = "/api/swarm/commands/ack";
 
 /**
+ * CAPABILITY REGISTRATION ROUTES, most specific first.
+ *
+ * WHY A CHAIN. `/api/swarm/capabilities` is the swarm-scoped spelling and is
+ * what this node has always posted to, but a Mothership that has not shipped
+ * that route answers 404 — and a 404 here meant this node silently stayed a
+ * plain "standard node" forever, with the cloud routing heavy AI work elsewhere
+ * and this node's GPU sitting idle. The node was not broken; it was just
+ * talking to a door that does not exist in this deployment.
+ *
+ * `/api/node/capabilities` is the node-scoped equivalent the same API uses for
+ * `/api/node/ack` and `/api/node/latest-version`, so it is tried second. The
+ * chain mirrors {@link COMMAND_ACK_ROUTES} deliberately: a node must not be
+ * wedged by a cloud that has not shipped the preferred route yet, and the
+ * working route must be remembered so the missing one is not re-probed on
+ * every capability change.
+ */
+export const CAPABILITY_PATH = "/api/swarm/capabilities";
+export const CAPABILITY_FALLBACK_PATH = "/api/node/capabilities";
+
+/**
+ * The routes tried, in order, by {@link SwarmClient.registerAiCapability}.
+ *
+ * Ordered as a const so the fallback chain is stated in exactly one place,
+ * mirroring {@link COMMAND_ACK_ROUTES}.
+ */
+const CAPABILITY_ROUTES: readonly string[] = [CAPABILITY_PATH, CAPABILITY_FALLBACK_PATH];
+
+/**
  * The routes tried, in order, by {@link SwarmClient.acknowledgeRemoteCommand}.
  *
  * The dedicated `/api/node/ack` is the intended endpoint. The `/api/swarm/*`
@@ -213,6 +241,12 @@ export class SwarmClient {
    * {@link SwarmClient.pushForageDiscovery}.
    */
   private quarantineUnsupported = false;
+  /**
+   * Index into {@link CAPABILITY_ROUTES} of the route that last worked, so a
+   * Mothership lacking the preferred one is probed once rather than on every
+   * capability change. Starts at 0 (the swarm-scoped spelling).
+   */
+  private capabilityRouteIndex = 0;
 
   /**
    * Node codes currently linked peer-to-peer, reported as `connected_satellites`.
@@ -846,19 +880,52 @@ export class SwarmClient {
     models?: string[];
     preferredModel?: string;
   }): Promise<boolean> {
-    try {
-      await this.client.post("/api/swarm/capabilities", payload);
-      console.log(
-        `[Swarm] Registered as ${payload.aiCapable ? "AI_CAPABLE_NODE" : "standard node"}` +
-          (payload.preferredModel ? ` (${payload.preferredModel})` : ""),
-      );
-      return true;
-    } catch (error) {
-      // A Mothership without this endpoint is fine â€” the node just stays a
-      // standard worker.
-      console.warn(`[Swarm] Capability registration failed â€” ${describeError(error)}`);
-      return false;
+    let lastError: unknown = null;
+
+    /*
+      THE FALLBACK CHAIN. Each route is tried from the one remembered as working,
+      and a 404/405/501 (route genuinely absent) advances to the next while any
+      other failure — a 401, a 500, a transport error — is a real failure and is
+      returned immediately rather than being papered over by a second request.
+
+      The index is remembered on success, so a Mothership without
+      `/api/swarm/capabilities` costs exactly one 404 for the life of the
+      process rather than one per capability change.
+    */
+    for (let attempt = 0; attempt < CAPABILITY_ROUTES.length; attempt += 1) {
+      const index = (this.capabilityRouteIndex + attempt) % CAPABILITY_ROUTES.length;
+      const route = CAPABILITY_ROUTES[index];
+      try {
+        await this.client.post(route, payload);
+        this.capabilityRouteIndex = index;
+        console.log(
+          `[Swarm] Registered as ${payload.aiCapable ? "AI_CAPABLE_NODE" : "standard node"}` +
+            (payload.preferredModel ? ` (${payload.preferredModel})` : "") +
+            (index > 0 ? ` via ${route}` : ""),
+        );
+        return true;
+      } catch (error) {
+        lastError = error;
+        const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+        if (status === 404 || status === 405 || status === 501) {
+          // Route absent on this deployment — try the next spelling.
+          console.log(`[Swarm] No capability route at ${route}; trying the fallback.`);
+          continue;
+        }
+        console.warn(`[Swarm] Capability registration failed — ${describeError(error)}`);
+        return false;
+      }
     }
+
+    // A Mothership with neither route is fine — the node just stays a standard
+    // worker. Logged once, with the reason, so it is diagnosable rather than silent.
+    console.warn(
+      `[Swarm] Capability registration failed — this Mothership exposes neither ` +
+        `${CAPABILITY_PATH} nor ${CAPABILITY_FALLBACK_PATH}` +
+        (lastError ? ` (${describeError(lastError)})` : "") +
+        ". Staying a standard node.",
+    );
+    return false;
   }
 }
 
