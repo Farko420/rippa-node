@@ -6,6 +6,10 @@ import { ensureDataDir, resolveInstallDir } from "../utils/paths";
 // TYPE-ONLY import: erased at compile time, so this creates no runtime cycle
 // even though `nodeAuth` imports this module for its fs/validation helpers.
 import type { PeerEndpoint } from "./nodeAuth";
+// VALUE import, and the reason ./nodeCode exists: nodeAuth depends on this
+// module, so pulling the code FORMAT back out of nodeAuth would be a cycle. This
+// leaf module has no dependencies of its own and both sides import it safely.
+import { normalizeCloudLinkCode as normalizeLinkCode } from "./nodeCode";
 
 /**
  * FIRST-RUN SETUP / CONFIGURATION MANAGER.
@@ -178,8 +182,8 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
   const pin =
     pickString(record, "DASHBOARD_PIN", "dashboard_pin", "dashboardPin", "pin", "passkey") ||
     DEFAULT_DASHBOARD_PIN;
-  // Digits only: the relay code is typed into a numeric UI field and used in a
-  // tunnel URL, so anything else is stripped rather than persisted.
+  // Accepts a 6-digit tunnel code OR a RIPPA-XXXX-XXXX node code, canonicalised
+  // on the way in. See normalizeCloudLinkCode in ./nodeCode.
   const cloudLinkCode = normalizeCloudLinkCode(
     pickString(record, "cloud_link_code", "CLOUD_LINK_CODE", "cloudLinkCode"),
   );
@@ -243,14 +247,18 @@ function normalizePeers(value: unknown): PeerEndpoint[] {
 /**
  * Normalises a Cloud Link relay code.
  *
- * Strips non-digits, then requires EXACTLY 6 digits — anything else yields ""
- * (LAN-only linking). It deliberately does NOT truncate an over-long code:
- * silently turning a 7-digit value into a wrong 6-digit code would connect
- * the satellite to the wrong tunnel. Validation surfaces the error instead.
+ * DELEGATES to `normalizeCloudLinkCode` in ./nodeCode, which accepts BOTH a
+ * 6-digit tunnel code (`123456`) and a full node code (`RIPPA-D2N6-6VZV`). The
+ * node code is the modern identifier for a node, so refusing it here is what
+ * made the Remote / Cloud Link box reject a perfectly valid pasted code.
+ *
+ * Like the digit-only rule it replaces, it deliberately does NOT truncate an
+ * over-long value: quietly turning a 7-digit entry into a 6-digit one would
+ * point the satellite at the wrong tunnel. Validation surfaces the error
+ * instead, so a typo is visible rather than silently "fixed".
  */
 export function normalizeCloudLinkCode(value: string): string {
-  const digits = String(value ?? "").replace(/\D+/g, "");
-  return /^\d{6}$/.test(digits) ? digits : "";
+  return normalizeLinkCode(value);
 }
 
 /**
@@ -482,10 +490,15 @@ export function validateConfigInput(
     errors.push({ path: "dashboard_pin", message: "Dashboard passkey must be at least 4 characters" });
   }
   const cloudLink = pickString(record, "cloud_link_code", "CLOUD_LINK_CODE", "cloudLinkCode");
-  // An empty code is fine (LAN-only). A non-empty one must be exactly 6 digits,
-  // so a typo surfaces as a clear message instead of a silently dropped value.
+  // An empty code is fine (LAN-only). A non-empty one must be a 6-digit tunnel
+  // code OR a RIPPA-XXXX-XXXX node code. The message names BOTH accepted forms:
+  // the old "exactly 6 digits" wording is what made an operator who pasted
+  // `RIPPA-D2N6-6VZV` believe their code was corrupt rather than told the truth.
   if (cloudLink && !normalizeCloudLinkCode(cloudLink)) {
-    errors.push({ path: "cloud_link_code", message: "Cloud Link code must be exactly 6 digits" });
+    errors.push({
+      path: "cloud_link_code",
+      message: "Remote / Cloud Link must be a 6-digit code (123456) or a node code (RIPPA-XXXX-XXXX)",
+    });
   }
   if (errors.length > 0) return { ok: false, errors };
   const config = normalizeConfig({ ...record, NODE_ROLE: role, node_role: role });

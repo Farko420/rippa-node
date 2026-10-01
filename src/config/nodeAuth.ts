@@ -1,14 +1,32 @@
 import crypto from "node:crypto";
 import { env } from "../config";
 import { isHttpUrl, readConfigLenient, resolveAppRoot, writeConfig } from "./configManager";
+// The code FORMAT itself lives in ./nodeCode so configManager can validate the
+// operator's Cloud Link input against the same rules without a require cycle.
+import {
+  generateNodeCode,
+  isValidNodeCode,
+  normalizeCloudLinkCode,
+  normalizeNodeCode,
+} from "./nodeCode";
+
+// Re-exported rather than re-declared: these are the names the rest of the app
+// (server.ts, swarmDispatcher.ts) has always imported from here, and keeping
+// them stable means the extraction into ./nodeCode changed no call sites.
+export { NODE_CODE_PREFIX, generateNodeCode, isValidNodeCode, normalizeNodeCode } from "./nodeCode";
 
 /**
  * ZERO-CONFIG NODE CODES & PAIRING IDENTITY.
  *
- * Every Rippa Node has a permanent, unique `rippa_node_code` minted once on
- * first boot (RIPPA-XXXX-XXXX) and persisted in `config.json` next to the
- * executable. The code IS the node's identity on the mesh — it survives
- * restarts, IP changes and reinstalling the folder on another PC.
+ * Every Rippa Node has a unique `rippa_node_code` in the RIPPA-XXXX-XXXX form,
+ * persisted in `config.json` in the OS app-data directory. The code IS the node's
+ * identity on the mesh — it survives restarts, IP changes and OTA updates.
+ *
+ * It is no longer immutable. `regenerateNodeCode()` / `setNodeCode()` below let
+ * the operator mint a new identity from the Setup screen, which is the supported
+ * recovery path when a config is lost or a node is deliberately re-homed. The code
+ * FORMAT is defined once in ./nodeCode; this module owns the PERSISTENCE and the
+ * pairing rules around it.
  *
  * The pairing philosophy is deliberately narrow:
  *
@@ -19,14 +37,11 @@ import { isHttpUrl, readConfigLenient, resolveAppRoot, writeConfig } from "./con
  *   - A Satellite stores those endpoints automatically — the operator never
  *     types a peer IP again.
  *
- * Everything is persisted through `configManager.writeConfig` so a pkg build
- * always writes beside the real .exe, never into the read-only snapshot.
+ * Everything is persisted through `configManager.writeConfig`, so a pkg build
+ * always writes to the real app-data directory, never the read-only snapshot.
  */
 
-/** Human-readable prefix shown on every Node screen and pairing dialog. */
-export const NODE_CODE_PREFIX = "RIPPA";
-
-/** Default relay base used to build a Cloud Link URL from a 6-digit code. */
+/** Default relay base used to build a Cloud Link URL from a link code. */
 export const DEFAULT_CLOUD_LINK_BASE = "https://rippaadventures.com/link";
 
 /** The permanent identity of this node. */
@@ -60,48 +75,18 @@ export interface PairingRecord {
   p2pEnabled: boolean;
 }
 
-/** Cryptographically random uppercase code body (8 chars, no ambiguous glyphs). */
-function randomCodeBody(): string {
-  const alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
-  const bytes = crypto.randomBytes(8);
-  let out = "";
-  for (const byte of bytes) out += alphabet[byte % alphabet.length];
-  return `${out.slice(0, 4)}-${out.slice(4, 8)}`;
-}
-
-/** Mints a brand-new permanent node code. */
-export function generateNodeCode(): string {
-  return `${NODE_CODE_PREFIX}-${randomCodeBody()}`;
-}
-
 /**
- * Normalises user input into canonical code form (`RIPPA-XXXX-XXXX`).
- * Returns "" for anything that cannot be a valid code, so callers can treat
- * an empty string as "not a code" and fall back to URL/IP entry.
- */
-export function normalizeNodeCode(value: unknown): string {
-  const raw = String(value ?? "")
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "");
-  const body = raw.startsWith(NODE_CODE_PREFIX) ? raw.slice(NODE_CODE_PREFIX.length) : raw;
-  const match = /^([2-9A-HJ-NP-Z]{4})([2-9A-HJ-NP-Z]{4})$/.exec(body);
-  return match ? `${NODE_CODE_PREFIX}-${match[1]}-${match[2]}` : "";
-}
-
-/** True when `value` is (or normalises to) a well-formed node code. */
-export function isValidNodeCode(value: unknown): boolean {
-  return normalizeNodeCode(value).length > 0;
-}
-
-/**
- * Builds the internet relay URL for a 6-digit Cloud Link code.
- * Returns "" when no usable code is present (LAN-only sibling).
+ * Builds the internet relay URL for a Cloud Link code.
+ *
+ * ACCEPTS BOTH FORMS, because the Remote / Cloud Link field accepts both: the
+ * classic 6-digit tunnel code and a full `RIPPA-XXXX-XXXX` node code. Returns ""
+ * when no usable code is present (LAN-only sibling).
  */
 export function buildCloudLinkUrl(code: string | undefined | null, base?: string): string {
-  const digits = String(code ?? "").replace(/\D+/g, "");
-  if (!/^\d{6}$/.test(digits)) return "";
+  const link = normalizeCloudLinkCode(code);
+  if (!link) return "";
   const root = (base || DEFAULT_CLOUD_LINK_BASE).replace(/\/+$/, "");
-  return `${root}/${digits}`;
+  return `${root}/${link}`;
 }
 
 /**
@@ -163,6 +148,84 @@ export function currentNodeIdentity(): NodeIdentity | null {
   const stored = read();
   const code = normalizeNodeCode(stored?.NODE_CODE);
   return code ? { code, createdAt: stored?.NODE_CREATED_AT || "" } : null;
+}
+
+/**
+ * Identity fields that are CLEARED whenever the code changes.
+ *
+ * Every one of these is an association created *under the old code*. Leaving
+ * them behind is what made a code change silently broken: a satellite would keep
+ * authenticating with a mesh key the new Master never issued, and a Master would
+ * keep advertising a registry full of nodes that pair against the old identity.
+ * Clearing them forces a genuine re-pairing, which is the entire point of
+ * regenerating an identity.
+ *
+ * The operator's own settings (name, API key, passkey, Mothership URL, port,
+ * Ollama URL) are deliberately NOT in this list — regenerating a code must never
+ * cost the operator their configuration.
+ */
+const IDENTITY_ASSOCIATIONS: Record<string, unknown> = {
+  PAIRED_MASTER_CODE: "",
+  PAIRED_MASTER_URL: "",
+  PAIRED_MASTER_CLOUD_URL: "",
+  PAIRED_MASTER_AT: "",
+  MESH_KEY: "",
+  MESH_KEY_ISSUER: "",
+  PEER_MESH: [],
+  SATELLITE_REGISTRY: [],
+  P2P_ENABLED: true,
+};
+
+/**
+ * Mints a fresh node code and clears every association made under the old one.
+ *
+ * THIS IS THE "UNLOCK THE NODE CODE" PATH. The code was originally documented as
+ * permanent with no recovery, which meant a node whose config.json was lost — or
+ * one deliberately re-homed onto another machine — was stuck: the only way to get
+ * a new identity was to delete files and reinstall. This is the supported way to
+ * do it from the UI, with no restart and no file surgery.
+ *
+ * The in-memory mesh state (the dispatcher's registry, tasks and mesh key) is
+ * NOT touched here; the caller resets that via `SwarmDispatcher.resetIdentity()`
+ * so the two concerns stay in their own layer.
+ */
+export function regenerateNodeCode(): NodeIdentity {
+  const identity: NodeIdentity = {
+    code: generateNodeCode(),
+    createdAt: new Date().toISOString(),
+  };
+  persist({
+    NODE_CODE: identity.code,
+    NODE_CREATED_AT: identity.createdAt,
+    ...IDENTITY_ASSOCIATIONS,
+  });
+  console.log(`[NodeCode] Regenerated node code: ${identity.code} (mesh associations cleared)`);
+  return identity;
+}
+
+/**
+ * Adopts an operator-chosen code, clearing associations exactly as
+ * {@link regenerateNodeCode} does.
+ *
+ * Throws when the value is not a well-formed code rather than silently minting a
+ * different one: the operator typed something specific, and quietly substituting
+ * a random code would leave them reading a code that is not the one they set.
+ */
+export function setNodeCode(value: string): NodeIdentity {
+  const code = normalizeNodeCode(value);
+  if (!code) {
+    throw new Error(
+      `"${String(value ?? "").trim()}" is not a valid node code. Use the RIPPA-XXXX-XXXX form.`,
+    );
+  }
+  const createdAt = new Date().toISOString();
+  persist({
+    NODE_CODE: code,
+    NODE_CREATED_AT: createdAt,
+    ...IDENTITY_ASSOCIATIONS,
+  });
+  console.log(`[NodeCode] Node code set to ${code} (mesh associations cleared)`);
+  return { code, createdAt };
 }
 
 /** The one-time Satellite to Master pairing, or null when never paired. */

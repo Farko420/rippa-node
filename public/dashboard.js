@@ -622,6 +622,55 @@ function renderSatelliteDetail(satellite) {
 }
 // --- POLLING + ACTIONS ------------------------------------------------------
 
+/**
+ * Regenerates this node's code from the Control Center header.
+ *
+ * Deliberately no confirm dialog — see the identical reasoning on the Setup
+ * button in app.js. The action is reversible (press it again), it leaves every
+ * setting untouched, and the one thing it does change (pairing / satellite
+ * list) is called out in the tooltip and in Setup's own hint text.
+ *
+ * The endpoint response carries the new code, but the header is repainted by the
+ * normal snapshot poll a moment later anyway; writing it directly just means the
+ * change is visible immediately rather than up to five seconds later.
+ */
+async function regenerateNodeCode() {
+  const btn = $("ccRegenCode");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "…";
+  }
+  try {
+    const { response, data } = await api("/api/config/regenerate-code", {
+      method: "POST",
+      body: "{}",
+    });
+    if (!response.ok || !data.success) {
+      showAlert(data.message || "Could not change the node code.", "err");
+      return;
+    }
+    const code = $("ccNodeCode");
+    if (code) code.textContent = data.nodeCode || "—";
+    showAlert(
+      "New node code: " + (data.nodeCode || "—") + ". Satellites must pair with the new code.",
+      "ok",
+    );
+    // Repaint the grid immediately: the registry was cleared server-side, so
+    // waiting for the next tick would show a stale fleet for several seconds.
+    void refresh();
+  } catch (err) {
+    showAlert("Could not change the node code: " + (err && err.message ? err.message : err), "err");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "🎲";
+    }
+  }
+}
+
+const regenBtn = $("ccRegenCode");
+if (regenBtn) regenBtn.addEventListener("click", () => { void regenerateNodeCode(); });
+
 /** Fetches the snapshot and repaints every panel. */
 async function refresh() {
   try {

@@ -453,6 +453,57 @@ export class SwarmDispatcher {
     await this.ensurePaired();
   }
 
+  /**
+   * DISCARDS ALL IN-MEMORY MESH STATE so this node can start again under a new
+   * identity.
+   *
+   * Called right after `regenerateNodeCode()` / `setNodeCode()`. Those functions
+   * clear the PERSISTED associations in config.json; this clears the ones held
+   * in this process. Both halves are required, and missing either is a real bug:
+   *
+   *  - Config only  -> a Master would keep serving the OLD registry, so the
+   *    Swarm Grid still listed every satellite paired to the previous code, and
+   *    the old mesh key would still authenticate their heartbeats.
+   *  - Memory only  -> the new code would be written to disk but the live
+   *    process would keep advertising the old one until the next restart, so the
+   *    UI would show a code the node was not actually using.
+   *
+   * Deliberately does NOT touch the operator's settings or restart the poll /
+   * monitor intervals: this is an identity change, not a reconfiguration, and
+   * the node keeps working throughout.
+   */
+  resetIdentity(): void {
+    this.registry.clear();
+    this.tasks.clear();
+    this.activeAssignment = null;
+    this.reportingMode = "p2p";
+    this.lastHeartbeatAt = 0;
+    // A pairing attempt in flight belongs to the old identity; letting it finish
+    // would re-write the pairing record we just cleared.
+    this.pairingInFlight = false;
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    if (this.isMaster) {
+      // The Master owns the mesh key it issues, and the cleared MESH_KEY means a
+      // fresh one is minted here and persisted — otherwise every Satellite would
+      // present a key this node no longer recognises and be 401'd forever.
+      this.meshKey = `mesh-${crypto.randomUUID()}`;
+      saveMeshKey(this.meshKey, this.nodeCode);
+      this.masterEndpoint = selfEndpoint(localIPv4());
+      saveRegistry([]);
+      console.log("[Swarm] Identity reset — new mesh key issued, registry cleared.");
+    } else {
+      this.meshKey = "";
+      this.masterEndpoint = null;
+      // Re-pair immediately rather than waiting for the next poll tick, so the
+      // node is a good swarm citizen again within seconds of the change.
+      void this.ensurePaired();
+      console.log("[Swarm] Identity reset — re-pairing with the Master.");
+    }
+  }
+
   /** Stops the background loop. Safe to call repeatedly. */
   stop(): void {
     this.running = false;

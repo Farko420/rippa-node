@@ -149,8 +149,32 @@
 </section>
 <section class="field hidden" id="cloudLinkWrap">
     <label for="cloudLink">Remote / Cloud Link</label>
-    <input id="cloudLink" type="text" inputmode="numeric" maxlength="6" placeholder="Enter Cloud Link Code" autocomplete="off" />
+    <!--
+      THE CLOUD LINK FIELD IS TEXT, NOT A NUMBER.
+
+      This is the second field that used to reject a valid node code. It carried
+      `inputmode="numeric"` and `maxlength="6"`, and app.js additionally ran a
+      `.replace(/\D+/g, "")` keystroke filter over it — belt, braces and a
+      truncation to six characters, all of which assumed the value could only
+      ever be digits. Pasting `RIPPA-D2N6-6VZV` produced `D266VZV`, which then
+      failed server-side validation and was dropped: the operator saw a field
+      that swallowed their code with no error anywhere.
+
+      A node code is letters, digits and hyphens, and it is the modern way to
+      identify a node, so this field now accepts BOTH shapes:
+
+          123456            — the classic 6-digit tunnel relay code
+          RIPPA-D2N6-6VZV    — a node code
+
+      `maxlength` is raised to 24 (the longest accepted value is 15 characters,
+      the round number just gives room to paste), `inputmode` is dropped so
+      mobile keyboards offer letters, and the sanitizer in app.js does the
+      uppercase-and-filter work in ONE place shared with the Master Node field.
+    -->
+    <input id="cloudLink" type="text" maxlength="24" placeholder="RIPPA-D2N6-6VZV or 123456"
+      autocomplete="off" autocapitalize="characters" spellcheck="false" />
     <p class="hint">Use this code to connect over the internet if a VPN or network isolates this device.</p>
+    <p class="hint">Accepts a node code (e.g. <code>RIPPA-D2N6-6VZV</code>) or a 6-digit relay code.</p>
 </section>
 <section class="field">
   <label for="nodeName">Node Name</label>
@@ -183,6 +207,45 @@
       <label for="ollama">Ollama URL</label>
       <input id="ollama" type="url" value="http://127.0.0.1:11434" />
     </div>
+  </div>
+  <!--
+    NODE IDENTITY — READABLE, REGENERABLE, EDITABLE.
+
+    The node code is this node's address on the mesh: a Satellite pairs with it
+    once and the Master takes over its networking. It used to be described as
+    "permanent" with no way to change it, which meant the only recovery from a
+    lost or wrong config was to delete files and reinstall the app — a genuinely
+    destructive answer to a trivial problem.
+
+    So the code is now a first-class, editable setting:
+
+      - The value is always shown, so the operator can read it without hunting.
+      - "Regenerate Code" mints a fresh random one server-side.
+      - The field itself accepts a hand-typed code for the rare case where an
+        operator needs a specific value (a pre-provisioned code, a rebuild).
+
+    The two controls WRITE DIFFERENT THINGS and that distinction matters:
+    "Regenerate" tells the server to mint one, while editing the text and
+    pressing "Set Code" sends the typed value for validation. The server is the
+    only place a code is ever accepted, so an invalid entry is rejected with a
+    message instead of being quietly normalised into something the operator
+    did not type.
+
+    Changing the code clears the node's mesh pairing and satellite registry (see
+    IDENTITY_ASSOCIATIONS in src/config/nodeAuth.ts) but leaves every other
+    setting — name, API key, passkey, role, Mothership URL, port — untouched, so
+    regenerating can never cost the operator their configuration.
+  -->
+  <div class="field" id="nodeCodeWrap">
+    <label for="nodeCode">Node Code (this node's mesh identity)</label>
+    <div class="keyrow">
+      <input id="nodeCode" type="text" placeholder="RIPPA-XXXX-XXXX" maxlength="24"
+        autocomplete="off" autocapitalize="characters" spellcheck="false" />
+      <button id="setNodeCode" type="button" title="Use the code typed above">Set</button>
+      <button id="regenNodeCode" type="button" class="ghost" title="Generate a brand-new node code">&#127922; Regenerate</button>
+    </div>
+    <p class="hint" id="nodeCodeState">Node code unknown.</p>
+    <p class="hint">Satellites pair with this code. Changing it clears this node's pairing and satellite list &mdash; everything else is kept.</p>
   </div>
 </details>
 <div id="alert" class="alert hidden"></div>
@@ -223,6 +286,13 @@
     <div class="cc-code" title="This node's permanent code - pair a Satellite with it once.">
       <span class="cc-code-label">NODE CODE</span>
       <code id="ccNodeCode">-</code>
+      <!--
+        Regenerating from the header saves a trip to Setup for the most common
+        reason to want a new code (a node that was re-imaged, or a fleet being
+        re-keyed). The code itself is repainted by the next snapshot poll, so
+        there is nothing to reconcile here.
+      -->
+      <button id="ccRegenCode" type="button" class="ghost" title="Generate a new node code">&#127922;</button>
     </div>
     <button id="ccSetupBtn" type="button" class="ghost" title="Node settings">&#9881; Setup</button>
     <button id="ccLock" type="button" class="ghost">&#128274; Lock</button>

@@ -16,6 +16,11 @@ const bridgeLink = $("bridgeLink"), copyMasterBtn = $("copyMaster"), lockBtn = $
 // LAN auto-discovery + cloud link (satellite setup).
 const scanBtn = $("scanBtn"), masterPicker = $("masterPicker"), scanState = $("scanState");
 const cloudLinkWrap = $("cloudLinkWrap"), cloudLink = $("cloudLink");
+// Node identity: the code field, its status line, and the two controls that
+// change it. See the NODE IDENTITY block in index.html for why the code is no
+// longer treated as immutable.
+const nodeCode = $("nodeCode"), nodeCodeState = $("nodeCodeState");
+const regenNodeCodeBtn = $("regenNodeCode"), setNodeCodeBtn = $("setNodeCode");
 
 const TOKEN_KEY = "rippa_dashboard_auth";
 let masterBridgeUrl = "";
@@ -299,11 +304,66 @@ async function scanForMasters() {
 }
 
 if (scanBtn) scanBtn.addEventListener("click", () => { void scanForMasters(); });
-// The relay code is 6 digits; strip anything else as it is typed.
-if (cloudLink) cloudLink.addEventListener("input", () => {
-  const digits = cloudLink.value.replace(/\D+/g, "").slice(0, 6);
-  if (cloudLink.value !== digits) cloudLink.value = digits;
-});
+
+/*
+  REMOTE / CLOUD LINK SANITIZER — LETTERS ARE PART OF A NODE CODE.
+
+  The old listener on this field was:
+
+      cloudLink.value.replace(/\D+/g, "").slice(0, 6)
+
+  which is the exact reason a valid node code could not be entered here. It kept
+  only digits and then truncated to six, so `RIPPA-D2N6-6VZV` became `D266VZV`:
+  every letter was silently deleted as it was typed, and the result was then
+  rejected by the server as a malformed code. The operator got a field that ate
+  their input and an error that made no sense.
+
+  `sanitizeLinkInput` is the replacement, and it is deliberately a FILTER rather
+  than a validator:
+
+    - It keeps A-Z, 0-9 and hyphens — precisely the alphabet a node code uses.
+    - It upper-cases, so a code typed in any case still matches on the mesh.
+    - It drops everything else (spaces, punctuation, stray characters) rather
+      than refusing the input, because a code pasted from a chat window often
+      carries a trailing space or an em-dash around it.
+    - It does NOT decide whether the result is a VALID code. That judgement
+      belongs to the server, which is the only place that can say "this is not a
+      code" with any confidence. Filtering here only guarantees the field cannot
+      produce something the keyboard could never have typed.
+
+  The cap is a backstop against a runaway paste (a whole paragraph), not a
+  length rule: the longest legitimate value is 15 characters.
+*/
+function sanitizeLinkInput(value) {
+  return String(value == null ? "" : value)
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]/g, "")
+    .slice(0, 24);
+}
+
+/** Applies sanitizeLinkInput to a field, and to pasted content. */
+function bindLinkSanitizer(field) {
+  if (!field) return;
+  field.addEventListener("input", () => {
+    const clean = sanitizeLinkInput(field.value);
+    if (field.value !== clean) field.value = clean;
+  });
+  // A paste fires `input` too, so this is belt-and-braces: some mobile
+  // WebViews apply a paste without emitting a usable input event, and a code that
+  // silently failed to arrive is the bug this whole change exists to remove.
+  field.addEventListener("paste", () => {
+    setTimeout(() => {
+      const clean = sanitizeLinkInput(field.value);
+      if (field.value !== clean) field.value = clean;
+    }, 0);
+  });
+}
+
+bindLinkSanitizer(cloudLink);
+// The node code field uses the same alphabet, so it gets the same sanitizer.
+// A hand-typed code is filtered the same way a pasted one is — otherwise the
+// manual path would accept input the mesh could never match.
+bindLinkSanitizer(nodeCode);
 if (masterPicker) masterPicker.addEventListener("change", () => {
   const url = masterPicker.value;
   if (!url) return;
@@ -532,6 +592,98 @@ function renderSetupGaps(missing) {
   }
 }
 
+/**
+ * Paints the node code into the setup form and its status line.
+ *
+ * The field is only overwritten when it is not being actively edited. An operator
+ * part-way through typing a specific code must not have it replaced underneath
+ * them by a background refresh — the same reason the Master picker is only
+ * synced when the value differs.
+ */
+function renderNodeCode(code, createdAt) {
+  const value = String(code || "").trim();
+  if (nodeCode && document.activeElement !== nodeCode) nodeCode.value = value;
+  if (!nodeCodeState) return;
+  if (!value) {
+    nodeCodeState.textContent = "No node code yet — it is minted on first boot, or press Regenerate.";
+    return;
+  }
+  const minted = createdAt ? " · minted " + String(createdAt).slice(0, 10) : "";
+  nodeCodeState.textContent = "Satellites pair with this code." + minted;
+}
+
+/**
+ * POSTs to the regenerate endpoint and repaints from the response.
+ *
+ * NO CONFIRM DIALOG, and that is deliberate. A modal here would be a poor trade:
+ * the action is reversible (press it again for another code), it changes nothing
+ * about the node's settings, and every extra step between an operator and a fix
+ * is a step someone gives up on. What the action DOES change — the pairing and
+ * the satellite list — is stated plainly in the field's own hint text, so it is
+ * disclosed before the click rather than hidden behind a popup.
+ *
+ * @param {string} code Optional explicit code to adopt; "" mints a new one.
+ */
+async function postNodeCode(code) {
+  const body = code ? { nodeCode: code } : {};
+  const res = await fetch("/api/config/regenerate-code", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401) { showLocked(); return null; }
+  if (!res.ok || !data.success) {
+    showAlert(data.message || "Could not change the node code.", "err");
+    return null;
+  }
+  renderNodeCode(data.nodeCode, data.nodeCodeCreatedAt);
+  showAlert(data.message || "Node code updated.", "ok");
+  return data;
+}
+
+if (regenNodeCodeBtn) {
+  regenNodeCodeBtn.addEventListener("click", async () => {
+    hideAlert();
+    regenNodeCodeBtn.disabled = true;
+    regenNodeCodeBtn.textContent = "Working…";
+    try {
+      await postNodeCode("");
+    } catch (e) {
+      showAlert("Could not reach the node: " + (e && e.message ? e.message : e), "err");
+    } finally {
+      regenNodeCodeBtn.disabled = false;
+      regenNodeCodeBtn.textContent = "🎲 Regenerate";
+    }
+  });
+}
+
+if (setNodeCodeBtn) {
+  setNodeCodeBtn.addEventListener("click", async () => {
+    hideAlert();
+    const typed = nodeCode ? sanitizeLinkInput(nodeCode.value) : "";
+    // Validate the SHAPE here so an obvious typo gets an instant, local message.
+    // The server still validates authoritatively — this is convenience, not
+    // security, and the endpoint remains the single gate on what is accepted.
+    if (!/^RIPPA-[0-9A-HJ-NP-Z]{4}-[0-9A-HJ-NP-Z]{4}$/.test(typed)) {
+      showAlert(
+        'That is not a valid node code. Use the RIPPA-XXXX-XXXX form, e.g. RIPPA-D2N6-6VZV.',
+        "err",
+      );
+      return;
+    }
+    setNodeCodeBtn.disabled = true;
+    try {
+      await postNodeCode(typed);
+    } catch (e) {
+      showAlert("Could not reach the node: " + (e && e.message ? e.message : e), "err");
+    } finally {
+      setNodeCodeBtn.disabled = false;
+    }
+  });
+}
+
 async function load() {
   try {
     // GET /api/config - the canonical "what is saved right now" read. The server
@@ -559,6 +711,7 @@ async function load() {
     applyBridgeHref(c.master_node_url || c.MASTER_LOCAL_URL || "");
     if (cloudLink) cloudLink.value = c.cloud_link_code || c.CLOUD_LINK_CODE || "";
     if (nodeName) nodeName.value = c.node_name || c.NODE_NAME || "";
+    renderNodeCode(data.nodeCode, data.nodeCodeCreatedAt);
     if (port) port.value = c.port || c.PORT || 4000;
     if (ollama) ollama.value = c.ollama_url || c.OLLAMA_URL || "http://127.0.0.1:11434";
     if (apiKey) apiKey.value = "";

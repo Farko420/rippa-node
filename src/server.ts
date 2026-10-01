@@ -14,6 +14,8 @@ import {
   getPairing,
   isValidNodeCode,
   normalizeNodeCode,
+  regenerateNodeCode,
+  setNodeCode,
   type PeerEndpoint,
 } from "./config/nodeAuth";
 import { SwarmDispatcher, type LoadClass, type TaskOutcome } from "./services/swarmDispatcher";
@@ -265,6 +267,17 @@ function buildConfigPayload(authenticated: boolean): Record<string, unknown> {
     configPresent: configFileExists(),
     configPath: configFilePath(),
     missing: complete ? [] : describeConfigGaps(readConfig()),
+    /*
+      THE NODE CODE, AT THE TOP LEVEL OF THE PAYLOAD.
+
+      The Setup screen shows this next to the "Regenerate Code" button, and the
+      response to a regeneration has to carry the new value so the UI can repaint
+      from the response it already has rather than racing a second fetch. The
+      dashboard reads the same code from /api/mesh/snapshot; exposing it here too
+      means the settings page never shows a stale or missing code.
+    */
+    nodeCode: stored.NODE_CODE || "",
+    nodeCodeCreatedAt: stored.NODE_CREATED_AT || "",
     config: {
       node_role: stored.NODE_ROLE,
       NODE_ROLE: stored.NODE_ROLE,
@@ -635,6 +648,69 @@ export function createApp(): Express {
       });
     }
   });
+
+  /*
+    POST /api/config/regenerate-code — MINT A NEW NODE IDENTITY.
+
+    WHY THIS EXISTS. The node code was documented as permanent with no recovery
+    path, so a node that lost its config.json — or one deliberately re-homed onto
+    another machine — had exactly one remedy: delete files and reinstall. That is
+    a terrible answer to "my code is wrong", and it is the reason this endpoint
+    is PIN-gated rather than open: regenerating an identity is a real,
+    mesh-visible action, and it belongs to whoever holds the dashboard passkey,
+    not to anything that merely reaches the node on the LAN.
+
+    Registered under BOTH prefixes to match the file's existing convention —
+    `/api/config` is the short alias `/api/system/config` is served under, and a
+    UI that hard-codes the wrong one would fail with a confusing 404.
+
+    BEHAVIOUR:
+      - Mints a fresh cryptographically random RIPPA-XXXX-XXXX code.
+      - Writes it straight to config.json in the persistent data directory
+        (%LOCALAPPDATA%\RippaNode), so it survives restarts and OTA updates.
+      - Clears every mesh/satellite association made under the old code and
+        resets the live dispatcher, so the node genuinely re-pairs.
+      - Returns the new code in the response body so the UI updates immediately
+        with no restart.
+    NOTHING ELSE IS TOUCHED. Name, API key, passkey, role, Mothership URL, port
+    and Ollama URL are all left exactly as they were; a code change must never
+    cost the operator their configuration.
+
+    An explicit `nodeCode` in the body adopts that value instead of minting one
+    (the manual-entry path), validated by the same normaliser the mesh uses.
+  */
+  const regenerateCodeHandler = (req: Request, res: Response): void => {
+    const body =
+      req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>) : {};
+    const requested = typeof body["nodeCode"] === "string" ? body["nodeCode"].trim() : "";
+    try {
+      const identity = requested ? setNodeCode(requested) : regenerateNodeCode();
+      // The persisted half is done; now drop the in-memory half so the running
+      // process stops advertising the retired identity immediately.
+      dispatcher.resetIdentity();
+      console.log(`[API] Node code changed to ${identity.code}.`);
+      res.json({
+        success: true,
+        nodeCode: identity.code,
+        nodeCodeCreatedAt: identity.createdAt,
+        message: requested
+          ? `Node code set to ${identity.code}. Satellites must pair with the new code.`
+          : `New node code: ${identity.code}. Satellites must pair with the new code.`,
+        // Spreads the freshly-read config payload, so the GUI repaints the code
+        // and every other setting from this one response.
+        ...buildConfigPayload(true),
+      });
+    } catch (error) {
+      // Only `setNodeCode` throws, and only for a malformed manual code. Report
+      // it as a 400 with the reason rather than a 500: nothing was written.
+      res.status(400).json({
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+  app.post("/api/config/regenerate-code", requireDashboardAuth, regenerateCodeHandler);
+  app.post("/api/system/config/regenerate-code", requireDashboardAuth, regenerateCodeHandler);
 
   // ---- Zero-config mesh API (Master ⇄ Satellite) -----------------------------
   //
