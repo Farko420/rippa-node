@@ -47,13 +47,9 @@ jobs:
       # npm ci is preferred over npm install for reproducibility, but it fails
       # without a lockfile in sync; fall back so the build is never blocked.
       - name: Install dependencies
-        shell: pwsh
         run: |
-          npm ci
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "npm ci failed - falling back to npm install"
-            npm install
-          }
+          npm install better-sqlite3@11.3.0 --no-save
+          npm install --no-package-lock
 
       # Bump the patch version so the fleet's isVersionNewer() comparison sees a
       # genuinely newer release on every push. The bumped version is committed
@@ -281,3 +277,4 @@ jobs:
   #   3. Verify the worker bundle with a grep for `require('fs')` /
   #      `better-sqlite3` before spending a Gradle cycle on it.
   # ===========================================================================
+
