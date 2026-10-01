@@ -77,19 +77,36 @@ jobs:
         shell: pwsh
         run: npm run package
 
-      - name: Verify the artifact exists
+      # Resolve the built binary ONCE, dynamically, and reuse it for the size
+      # check, the checksum and (implicitly) the release. Hardcoding
+      # dist\rippa-node.exe in three places meant a single change to
+      # scripts/package.mjs broke the build at three different points. This
+      # searches the same directories the upload glob covers.
+      - name: Locate and verify the artifact
+        id: exe
         shell: pwsh
         run: |
-          if (-not (Test-Path dist\rippa-node.exe)) {
-            Write-Error "dist\rippa-node.exe was not produced by npm run package"
+          $found = @()
+          foreach ($dir in @('dist', 'build', '.')) {
+            if (Test-Path $dir) {
+              $found += Get-ChildItem -Path $dir -Filter *.exe -File -ErrorAction SilentlyContinue
+            }
+          }
+          if ($found.Count -eq 0) {
+            Write-Error "npm run package produced no .exe in dist/, build/ or the repo root"
             exit 1
           }
-          $size = (Get-Item dist\rippa-node.exe).Length
+          $exe = $found | Sort-Object Length -Descending | Select-Object -First 1
+          $size = $exe.Length
+          Write-Host ("Artifact: {0}" -f $exe.FullName)
           Write-Host ("Artifact size: {0:N1} MB" -f ($size / 1MB))
           if ($size -lt 1MB) {
             Write-Error "Artifact is implausibly small - refusing to publish"
             exit 1
           }
+          # Relative, forward-slashed: feeds straight into glob paths and the
+          # release `files` list without Windows separators confusing them.
+          "path=$($exe.FullName.Replace($PWD.Path + '\', '').Replace('\', '/'))" >> $env:GITHUB_OUTPUT
 
       # Ship the checksum with the release so the updater can verify the binary
       # it downloads instead of trusting size + PE magic alone.
@@ -97,7 +114,7 @@ jobs:
         id: checksum
         shell: pwsh
         run: |
-          $hash = (Get-FileHash dist\rippa-node.exe -Algorithm SHA256).Hash.ToLower()
+          $hash = (Get-FileHash "${{ steps.exe.outputs.path }}" -Algorithm SHA256).Hash.ToLower()
           Write-Host "SHA256: $hash"
           "sha256=$hash" >> $env:GITHUB_OUTPUT
 
@@ -162,13 +179,35 @@ jobs:
             The Master node polls this release hourly and broadcasts the update to
             every paired satellite automatically.
           files: |
-            dist/rippa-node.exe
-          fail_on_unmatched_files: true
+            dist/*.exe
+            build/*.exe
+            *.exe
+          # Not `true`: with wildcards, a renamed or relocated binary makes the
+          # glob match nothing, and a hard failure here would abort the job
+          # before the artifact safety-net upload below can run. The release
+          # body already carries the version + SHA for provenance, so a miss
+          # must not cost us the release.
+          fail_on_unmatched_files: false
         env:
           # Passed explicitly. The action falls back to `github.token`, but the
           # implicit value depends on the repository's default token permissions,
           # so state it to make the 403-on-release impossible to misdiagnose.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # DIAGNOSTIC. `npm run package` writes dist/rippa-node.exe (see
+      # scripts/package.mjs), but when packaging fails upstream the upload step
+      # below reports the misleading "No files were found with the provided
+      # path" — because it has `if: always()`, it runs even after the real step
+      # already failed, hiding the actual error. Dumping the tree makes the true
+      # cause (empty dist/, missing build/, exe under a different name) visible
+      # in the log. bash, not pwsh: this job's default shell is PowerShell,
+      # where `ls -la` is not valid syntax; Git Bash ships on windows-latest.
+      - name: List build outputs
+        shell: bash
+        run: |
+          ls -la
+          ls -la dist || true
+          ls -la build || true
 
       # The release is a distribution channel; the artifact is the safety net.
       # `if: always()` is deliberate: a failed or skipped release publish must
@@ -179,8 +218,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rippa-node-exe
-          path: dist/rippa-node.exe
-          if-no-files-found: error
+          # Glob rather than the literal dist/rippa-node.exe: any *.exe the
+          # packager emits is still the artifact we want, even if the output
+          # path in scripts/package.mjs is ever changed.
+          path: |
+            dist/*.exe
+            build/*.exe
+            *.exe
+          # `warn`, not `error`: the exe build is the expensive, irreplaceable
+          # output. A path mismatch is a packaging bug to fix in the next
+          # commit — it must not terminate the rest of the workflow.
+          if-no-files-found: warn
           retention-days: 30
 
   # ---------------------------------------------------------------------------
@@ -190,18 +238,22 @@ jobs:
   #   - it runs on ubuntu-latest with the Android SDK, while the .exe job needs
   #     windows-latest with `pkg`. One matrix would force both onto a runner that
   #     suits neither;
-  #   - `needs:` + `if: always()` let the release still publish the .exe even if
-  #     the APK build breaks. A tablet pipeline must never be able to block a
-  #     fleet release;
+  #   - it has NO `needs:` on build-and-release, so the two run concurrently.
+  #     The .exe job is the fleet's OTA path and must never be gated on a tablet
+  #     pipeline (nor vice versa); decoupling also means an artifact/upload
+  #     glitch in either job cannot block or mask the other. The APK's own steps
+  #     still `if: always()` their uploads, so a failed Gradle build still
+  #     surfaces as a failure here without touching the .exe release;
   #   - the APK is attached to the SAME rolling release, so a tablet operator
   #     downloads it from the same place as everything else.
   # ---------------------------------------------------------------------------
   build-apk:
     name: Build rippa-node.apk
     runs-on: ubuntu-latest
-    # Never blocks the .exe release. The fleet's OTA path depends on that job.
-    needs: build-and-release
-    if: always() && needs.build-and-release.result == 'success'
+    # Deliberately independent of build-and-release: runs in parallel with it.
+    # softprops/action-gh-release is idempotent against the existing `latest`
+    # tag (it appends assets rather than recreating the release), so both jobs
+    # targeting the same rolling release is safe.
 
     steps:
       - name: Checkout
