@@ -10,8 +10,10 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck",
     "test:brain-parity": "tsx scripts/brain-parity-check.ts .parity/bundle.json",
-    "test:verify": "node scripts/verify-units.mjs && node scripts/verify-fixes.mjs",
-    "package": "node scripts/package.mjs"
+    "test:verify": "npm run build && node scripts/verify-units.mjs && node scripts/verify-fixes.mjs",
+    "test:mobile": "npm run build && node scripts/verify-mobile.mjs",
+    "package": "node scripts/package.mjs",
+    "package:apk": "node scripts/package-apk.mjs"
   },
   "keywords": [],
   "type": "commonjs",
@@ -30,6 +32,7 @@
     "@types/node": "^26.6.3",
     "@types/node-cron": "^3.0.11",
     "@yao-pkg/pkg": "^6.23.0",
+    "esbuild": "^0.28.2",
     "ts-node": "^10.9.2",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"

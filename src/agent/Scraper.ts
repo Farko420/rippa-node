@@ -1,7 +1,35 @@
 import "../pkgNativeShim"; // must load before playwright (exe loader shims)
-import { chromium, type Browser, type Page } from "playwright";
-import { spawn } from "node:child_process";
-import fs from "node:fs";
+import type { Browser, Page } from "playwright";
+import { describeRuntime, supportsBrowserScraping } from "../platform";
+import { scrapeMobile } from "./MobileScraper";
+
+/**
+ * EVERY NODE-ONLY DEPENDENCY IN THIS FILE IS LOADED LAZILY, AND THAT IS LOAD-
+ * BEARING FOR THE APK — not an optimisation.
+ *
+ * `playwright-core/lib/bootstrap.js` reads `process.versions` at MODULE EVALUATION
+ * time. A static `import { chromium } from "playwright"` therefore throws
+ * "Cannot read properties of undefined (reading 'versions')" the instant this
+ * file is parsed inside the Capacitor WebView, where there is no `process`. That
+ * kills the import chain and the node never boots on a tablet.
+ *
+ * So Playwright, `node:child_process` and `node:fs` are all reached through
+ * `require()` INSIDE the functions that need them, which defers evaluation until
+ * (and unless) `supportsBrowserScraping()` has already confirmed a desktop
+ * runtime. Type-only imports above are erased at compile time and cost nothing.
+ *
+ * The practical effect: this module is now safe to import anywhere, and the
+ * mobile path below never touches a single Node-only module.
+ */
+type ChromiumApi = typeof import("playwright");
+
+let chromiumApi: ChromiumApi | null = null;
+
+/** Loads (once) the Playwright API. Only ever called on a desktop runtime. */
+function loadChromium(): ChromiumApi {
+  if (!chromiumApi) chromiumApi = require("playwright") as ChromiumApi;
+  return chromiumApi;
+}
 
 /**
  * THE EYES — headless scraping service.
@@ -39,7 +67,7 @@ let chromiumBootstrap: Promise<void> | null = null;
 /** Expected Chromium path, or null when Playwright cannot resolve it. */
 function chromiumExecutablePath(): string | null {
   try {
-    return chromium.executablePath();
+    return loadChromium().chromium.executablePath();
   } catch {
     return null;
   }
@@ -64,6 +92,12 @@ function reportBootstrapFailure(reason: string): void {
 function ensureChromiumInstalled(): Promise<void> {
   if (chromiumBootstrap) return chromiumBootstrap;
 
+  // `node:fs` and `node:child_process` are required HERE rather than imported at
+  // the top of the file, for the same reason Playwright is: this whole function
+  // is unreachable on mobile, and a static import would still be evaluated.
+  const fs = require("node:fs") as typeof import("node:fs");
+  const { spawn } = require("node:child_process") as typeof import("node:child_process");
+
   const executable = chromiumExecutablePath();
   if (executable && fs.existsSync(executable)) {
     chromiumBootstrap = Promise.resolve();
@@ -77,7 +111,7 @@ function ensureChromiumInstalled(): Promise<void> {
     const version = bundledPlaywrightVersion();
     // Sanitized: only ever `playwright` or `playwright@<x.y.z>` (from package.json).
     const spec = version && /^[\w.-]+$/.test(version) ? `playwright@${version}` : "playwright";
-    const onWindows = process.platform === "win32";
+    const onWindows = (process as { platform?: string }).platform === "win32";
     // Windows needs the shell to reach npx.cmd. A single command string (no
     // args array + shell:true) avoids Node's DEP0190 deprecation warning.
     const child = onWindows
@@ -159,11 +193,44 @@ export class ScraperService {
   private browser: Browser | null = null;
   /** Resolved once the startup Chromium check (and any download) has settled. */
   private readonly chromiumReady: Promise<void>;
+  /**
+   * True when this runtime can actually drive Chromium.
+   *
+   * Captured ONCE in the constructor rather than probed per scrape: the answer
+   * cannot change during a process's life (a WebView stays a WebView), and
+   * re-probing on every pass would run the defensive `globalThis` walks on the
+   * hot path of an overnight run.
+   */
+  private readonly canUseBrowser: boolean;
 
   constructor() {
-    // Startup check — verifies the Chromium binary and, when missing, starts
-    // a silent background install so no manual CLI command is ever needed.
-    this.chromiumReady = ensureChromiumInstalled();
+    this.canUseBrowser = supportsBrowserScraping();
+
+    /*
+      THE CHROMIUM BOOTSTRAP IS SKIPPED ON MOBILE — THE CRITICAL LINE FOR THE APK.
+
+      `ensureChromiumInstalled()` shells out to `npx playwright install chromium`.
+      Inside the Capacitor WebView there is no `child_process`, so that spawn
+      throws — and it throws from a CONSTRUCTOR, i.e. while the Orchestrator is
+      still being built. The failure took the node down at boot on a tablet,
+      before a single task ran. Guarding it here is what lets the APK start at
+      all; the mobile path in `scrape()` then takes over with no Chromium.
+    */
+    if (this.canUseBrowser) {
+      // Verifies the binary and, when missing, starts a silent background
+      // install so no manual CLI command is ever needed.
+      this.chromiumReady = ensureChromiumInstalled();
+    } else {
+      this.chromiumReady = Promise.resolve();
+      console.log(
+        `[Scraper] ${describeRuntime()} — Chromium unavailable here, using the lightweight fetch scraper.`,
+      );
+    }
+  }
+
+  /** True when Playwright is in use; false when the mobile fallback is active. */
+  isBrowserBacked(): boolean {
+    return this.canUseBrowser;
   }
 
   /**
@@ -178,7 +245,7 @@ export class ScraperService {
     // First launch waits for the background bootstrap download (if one ran).
     await this.chromiumReady;
 
-    this.browser = await chromium.launch({
+    this.browser = await loadChromium().chromium.launch({
       headless: true,
       args: ["--disable-blink-features=AutomationControlled"],
     });
@@ -194,6 +261,19 @@ export class ScraperService {
 
   /** Scrapes a URL and returns sanitized body text. Throws on navigation failure / empty page. */
   async scrape(url: string): Promise<ScrapeResult> {
+    /*
+      THE MOBILE FALLBACK, taken BEFORE any Playwright call.
+
+      Placed at the top rather than deep inside `getBrowser()` on purpose: the
+      decision is per-runtime, not per-browser-instance, and failing to take it
+      early would mean constructing a Chromium context on a device that cannot
+      run one. The returned shape is identical either way, so the caller (the
+      idle forager) has no idea which engine produced the text.
+    */
+    if (!this.canUseBrowser) {
+      return scrapeMobile(url);
+    }
+
     const browser = await this.getBrowser();
     const context = await browser.newContext({
       // en-AU + a stock desktop UA keeps the parse honest for AU-targeted pages.

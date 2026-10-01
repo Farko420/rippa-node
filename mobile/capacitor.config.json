@@ -1,0 +1,13 @@
+{
+  "appId": "com.rippaadventures.node",
+  "appName": "Rippa Node",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "android": {
+    "allowMixedContent": true,
+    "backgroundColor": "#0d1117"
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}

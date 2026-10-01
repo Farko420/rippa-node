@@ -1,0 +1,17 @@
+{
+  "name": "rippa-node-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Capacitor wrapper that runs a Rippa Node as a 24/7 Android satellite.",
+  "scripts": {
+    "sync": "node ../scripts/package-apk.mjs",
+    "build:apk": "node ../scripts/package-apk.mjs"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.2.0",
+    "@capacitor/core": "^6.2.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.2.0"
+  }
+}

@@ -1,6 +1,7 @@
 import { ensureConfiguration, isConfigComplete, openDashboard } from "./config/configManager";
 import { APP_VERSION } from "./version";
 import { startVitalsSampler } from "./services/telemetry";
+import { describeRuntime, supportsBrowserScraping } from "./platform";
 
 // Deeper fatal-error stacks (the default of 10 frames hides the caller module).
 (Error as { stackTraceLimit?: number }).stackTraceLimit = 60;
@@ -46,6 +47,14 @@ async function main(): Promise<void> {
   console.log("══════════════════════════════════════════════");
   console.log(` Rippa Node v${APP_VERSION} — "${env.NODE_NAME}"`);
   console.log(` Role: ${env.NODE_ROLE} | API port: ${env.PORT}`);
+  // Stated up front because it changes what the node can do: a build without
+  // Chromium scrapes with `fetch` instead, which is visible here rather than
+  // being discovered as silently degraded output days later.
+  console.log(
+    ` Runtime: ${describeRuntime()} | scraping: ${
+      supportsBrowserScraping() ? "headless Chromium (Playwright)" : "lightweight fetch (mobile)"
+    }`,
+  );
   console.log(` Mothership: ${env.MOTHERSHIP_URL}`);
   console.log(` Ollama: ${env.OLLAMA_URL}`);
   console.log("══════════════════════════════════════════════");

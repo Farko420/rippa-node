@@ -20,10 +20,23 @@ import Module from "node:module";
  * and `node dist/index.js` behave exactly as before.
  */
 
-type PackagedProcess = NodeJS.Process & { pkg?: unknown };
-
+/**
+ * True when running inside the `pkg`-frozen executable.
+ *
+ * DEFENSIVE ON PURPOSE. This module is imported at the top of `Scraper.ts`, so it
+ * is evaluated inside the Capacitor WebView too — where `process` does not exist
+ * at all. Reading `process.pkg` unguarded threw
+ * "Cannot read properties of undefined (reading 'pkg')" at module load, which
+ * took down the Scraper import chain and with it the whole node on Android.
+ * A missing `process` is simply "not packaged", which is the correct answer.
+ */
 function isPackaged(): boolean {
-  return Boolean((process as PackagedProcess).pkg);
+  try {
+    const proc = (globalThis as { process?: { pkg?: unknown } }).process;
+    return Boolean(proc?.pkg);
+  } catch {
+    return false;
+  }
 }
 
 function isInspectorRequest(request: unknown): boolean {

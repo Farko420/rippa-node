@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ANDROID MANIFEST OVERLAY.
+
+  Copied over the file Capacitor generates (`npx cap add android`) by
+  scripts/package-apk.mjs, which runs AFTER generation and before Gradle. It is an
+  overlay rather than a hand-maintained project because the whole android/
+  tree is generated: committing it would mean merging upstream template changes
+  by hand on every Capacitor upgrade.
+
+  WHY EACH PERMISSION IS NEEDED FOR A 24/7 OVERNIGHT RUN:
+
+    INTERNET              the whole point — Mothership and Master traffic.
+    ACCESS_NETWORK_STATE  required before Android grants INTERNET on API 28+.
+    WAKE_LOCK             keeps the CPU on with the screen off. Without it the
+                           device sleeps between fetches and the node silently
+                           stops mid-run around 11pm.
+    FOREGROUND_SERVICE    lets the process outlive the UI.
+    FOREGROUND_SERVICE_DATA_SYNC
+                           Android 14 (API 34) REQUIRES a typed foreground
+                           service and rejects a startForeground() call with no
+                           matching type. Without this the service throws
+                           ForegroundServiceStartNotAllowedException on any
+                           modern tablet and the app dies at launch.
+    POST_NOTIFICATIONS    Android 13+ requires an explicit grant, or the
+                           persistent notification is silently never shown and
+                           the service looks dead to the user.
+    RECEIVE_BOOT_COMPLETED
+                           restarts the service after a reboot, so "overnight"
+                           survives someone plugging the tablet in.
+    FOREGROUND_SERVICE_SPECIAL_USE
+                           lets the service declare WHY it needs to run (see
+                           the property in the service declaration below).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+  <application
+      android:name="com.rippaadventures.node.RippaNodeApplication"
+      android:allowBackup="true"
+      android:icon="@mipmap/ic_launcher"
+      android:label="@string/app_name"
+      android:roundIcon="@mipmap/ic_launcher_round"
+      android:supportsRtl="true"
+      android:theme="@style/AppTheme"
+      android:usesCleartextTraffic="true">
+
+    <!--
+      THE NODE'S OWN FOREGROUND SERVICE.
+
+      exported=false: nothing outside this app may start it, because starting it
+      pins a wake lock and shows a permanent notification.
+
+      stopWithTask=false: swiping the app away must NOT take the node with it.
+      That is the entire difference between an overnight satellite and an app
+      that dies the first time someone tidies up their tablet.
+
+      foregroundServiceType="dataSync" matches the FOREGROUND_SERVICE_DATA_SYNC
+      permission declared above — the two must agree on API 34+ or the platform
+      throws at startForeground().
+    -->
+    <service
+        android:name=".RippaNodeService"
+        android:enabled="true"
+        android:exported="false"
+        android:stopWithTask="false"
+        android:foregroundServiceType="dataSync">
+      <!--
+        Required on API 34+: the platform audits every long-running foreground
+        service against a declared reason. Without this Play Store review (and
+        some OEM builds) rejects the start outright.
+      -->
+      <property
+          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+          android:value="Autonomous swarm node: polls the Rippa Mothership on a
+                           timer and must survive the screen turning off to keep
+                          foraging for the fleet." />
+    </service>
+
+    <!--
+      BOOT RECEIVER: brings the service back after a reboot or an app update.
+
+      The node is expected to survive "someone left the tablet on the desk", and
+      a tablet that reboots for an update at 3am would otherwise silently drop
+      out of the swarm until noticed the next morning.
+    -->
+    <receiver
+        android:name=".RippaNodeBootReceiver"
+        android:enabled="true"
+        android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.BOOT_COMPLETED" />
+        <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+      </intent-filter>
+    </receiver>
+  </application>
+</manifest>

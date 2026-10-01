@@ -7,6 +7,7 @@ import type { Server } from "node:http";
 import { z } from "zod";
 import { env, reloadEnv } from "./config";
 import { APP_VERSION } from "./version";
+import { runtimeCapabilities } from "./platform";
 import { scanForMasters } from "./network/discovery";
 import {
   ensureNodeIdentity,
@@ -363,6 +364,10 @@ export function createApp(): Express {
       role: env.NODE_ROLE,
       status: "online",
       version: APP_VERSION,
+      // What THIS build can actually do. Essential on a tablet: it is the only
+      // way to confirm from the LAN that the APK really took the lightweight
+      // scraping path, rather than inferring it from a log nobody can reach.
+      runtime: runtimeCapabilities(),
     });
   });
 

@@ -1,6 +1,13 @@
 /**
  * BUGS 4, 5, 6 — P2P PAIRING, TASK CLAIMING, ADMIN COMMANDS, SYNC PROGRESS.
  * Drives a real node over real HTTP. See verify-harness.mjs for the fixtures.
+ *
+ * RUNS AGAINST `npm run build` OUTPUT, which must therefore exist first (the npm
+ * script does it for you). This matters more than it sounds: step 4 of
+ * `scripts/package.mjs` deliberately PRUNES every `.js` out of `dist/` once the
+ * `.exe` has been frozen into it, so after `npm run package` there is no compiled
+ * JavaScript left here to import. Building first keeps these checks
+ * order-independent.
  */
 import fs from "node:fs";
 import path from "node:path";
