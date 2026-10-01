@@ -279,8 +279,14 @@ if (!fs.existsSync(apk)) {
   console.error(`[APK] Gradle finished but ${apk} was not produced.`);
   process.exit(1);
 }
+
+// Copy APK to workspace root for easy sideloading
+const rootApk = path.join(root, "rippa-satellite.apk");
+fs.copyFileSync(apk, rootApk);
+console.log(`[APK] Copied to workspace root: rippa-satellite.apk`);
+
 const sizeMb = fs.statSync(apk).size / (1024 * 1024);
 console.log("");
-console.log(`[APK] rippa-node.apk (${sizeMb.toFixed(1)} MB)`);
-console.log("[APK] Install with: adb install -r " + path.relative(root, apk));
+console.log(`[APK] ✔ rippa-satellite.apk (${sizeMb.toFixed(1)} MB)`);
+console.log("[APK] Sideload with: adb install -r rippa-satellite.apk");
 console.log("");

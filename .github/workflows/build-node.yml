@@ -40,53 +40,15 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          # PINNED, not floating, and 22 is the floor, not a preference:
-          # better-sqlite3@13 declares `engines.node >= 22`, so a Node 20 runner
-          # is an unsupported combination and npm only warns (EBADENGINE) about
-          # it. This is also the exact runtime scripts/package.mjs freezes into
-          # the .exe (`pkg --targets node22-win-x64`), so the build host and the
-          # shipped binary now agree instead of silently drifting apart.
-          node-version: 22
+           # PINNED STRICTLY TO 20 LTS: Node 20 has guaranteed precompiled .node
+           # binaries for better-sqlite3 on Windows, completely bypassing node-gyp
+           # C++ compilation. Node 22 lacks prebuilds and triggers compilation, which
+           # fails on Windows runners due to missing MSVC toolchain.
+           # shipped binary now agree instead of silently drifting apart.
+           node-version: '20'
           cache: npm
 
       # -------------------------------------------------------------------------
-      # WINDOWS C++ TOOLCHAIN — required by better-sqlite3's node-gyp rebuild.
-      #
-      # better-sqlite3 is a NATIVE addon. Normally npm downloads a matching
-      # prebuilt .node binary, but when no prebuild matches (new Node ABI, new
-      # SQLite release, or a blocked/failed download) npm falls back to
-      # compiling from source, and node-gyp then requires:
-      #   * Python on PATH, and
-      #   * the MSVC C++ toolchain.
-      # Without Python the build dies with a misleading "unable to find
-      # python"/spawn error even though the source is perfectly buildable —
-      # that is the .exe failure this step exists to remove.
-      #
-      # Python is installed EXPLICITLY and BEFORE `npm install` so it is already
-      # on PATH for the install step itself, not only for a later manual retry.
-      # MSVC is deliberately NOT installed here: windows-latest images already
-      # ship the Visual Studio Build Tools with the Desktop C++ workload, and
-      # pulling another multi-GB copy adds minutes for no benefit.
-      # -------------------------------------------------------------------------
-      - name: Setup Python & Build Tools
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      # A cached tarball from an earlier (possibly partial or corrupt) install
-      # makes npm ci/npm install fail REPRODUCIBLY from the same poisoned entry.
-      # Clearing forces a fresh download and a genuine node-gyp attempt instead
-      # of replaying the bad cache. `--force` is mandatory: without it npm
-      # refuses to clean programmatically and waits on a confirmation prompt
-      # that never arrives in CI.
-      #
-      # This runs AFTER setup-node has restored `cache: npm`, so it discards that
-      # restore as well — intentional, because the point is to rule the cache out
-      # as the cause. The save side of the cache still helps later runs.
-      - name: Clean Cache
-        shell: pwsh
-        run: npm cache clean --force
-
       # npm ci is preferred over npm install for reproducibility, but it fails
       # without a lockfile in sync; fall back so the build is never blocked.
       - name: Install dependencies

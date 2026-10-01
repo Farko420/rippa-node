@@ -14,7 +14,8 @@
     "test:paths": "tsx scripts/verify-paths.mts",
     "test:mobile": "npm run build && node scripts/verify-mobile.mjs",
     "package": "node scripts/package.mjs",
-    "package:apk": "node scripts/package-apk.mjs"
+    "package:apk": "node scripts/package-apk.mjs",
+    "build:apk": "npm run build && node scripts/package-apk.mjs"
   },
   "keywords": [],
   "type": "commonjs",
