@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck",
     "test:brain-parity": "tsx scripts/brain-parity-check.ts .parity/bundle.json",
+    "test:verify": "node scripts/verify-units.mjs && node scripts/verify-fixes.mjs",
     "package": "node scripts/package.mjs"
   },
   "keywords": [],

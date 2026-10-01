@@ -1,5 +1,6 @@
 import dgram from "node:dgram";
 import os from "node:os";
+import { normalizeNodeCode } from "../config/nodeAuth";
 
 /**
  * LAN AUTO-DISCOVERY — zero-configuration Satellite → Master linking.
@@ -40,6 +41,15 @@ const BEACON_KIND = "rippa-node-beacon/v1";
 /** A Master node found on the local network. */
 export interface DiscoveredMaster {
   nodeName: string;
+  /**
+   * The Master's permanent node code (`RIPPA-XXXX-XXXX`).
+   *
+   * Present so a Satellite can be pointed at its Master by CODE rather than by IP.
+   * The beacon is the only channel a Master has on the LAN, and without its code
+   * in the payload a code typed into the setup form was unresolvable — the field
+   * looked like it accepted one and then always failed with "not a valid URL".
+   */
+  nodeCode: string;
   ipAddress: string;
   /** The Master's API port. */
   port: number;
@@ -50,6 +60,7 @@ export interface DiscoveredMaster {
 interface BeaconPayload {
   kind: string;
   nodeName: string;
+  nodeCode: string;
   ipAddress: string;
   port: number;
 }
@@ -82,9 +93,14 @@ export function isPrivateIPv4(address: string): boolean {
   );
 }
 
-/** Builds the beacon payload this node advertises as a Master. */
-function buildBeacon(nodeName: string, port: number): BeaconPayload {
-  return { kind: BEACON_KIND, nodeName, ipAddress: localIPv4(), port };
+/**
+ * Builds the beacon payload this node advertises as a Master.
+ *
+ * `nodeCode` is read from this node's own permanent identity rather than passed
+ * in, so it can never drift from the code this node authenticates with.
+ */
+function buildBeacon(nodeName: string, port: number, nodeCode: string): BeaconPayload {
+  return { kind: BEACON_KIND, nodeName, nodeCode, ipAddress: localIPv4(), port };
 }
 
 /**
@@ -128,7 +144,7 @@ export class MasterBeacon {
    * Starts broadcasting. Resolves `false` — never throws — when the socket is
    * unavailable, because a blocked UDP port must not stop the node booting.
    */
-  start(nodeName: string, port: number): Promise<boolean> {
+  start(nodeName: string, port: number, nodeCode: string): Promise<boolean> {
     if (this.timer) return Promise.resolve(true);
 
     return new Promise<boolean>((resolve) => {
@@ -168,7 +184,7 @@ export class MasterBeacon {
         }
 
         const announce = (): void => {
-          const payload = Buffer.from(JSON.stringify(buildBeacon(nodeName, port)), "utf8");
+          const payload = Buffer.from(JSON.stringify(buildBeacon(nodeName, port, nodeCode)), "utf8");
           // Send to the subnet broadcast address for this node, falling back to
           // the global broadcast address. The subnet address is what a Windows
           // firewall profile typically permits.
@@ -314,8 +330,12 @@ function parseBeacon(message: Buffer): DiscoveredMaster | null {
 
   const nodeName =
     (typeof payload.nodeName === "string" && payload.nodeName.trim()) || ipAddress;
+  // Normalised through the same rules the setup form uses, so a code read off
+  // the wire compares equal to one typed by hand. A beacon with no usable code
+  // is still returned (it can be picked by address), just with an empty code.
+  const nodeCode = normalizeNodeCode(payload.nodeCode);
 
-  return { nodeName, ipAddress, port, url: `http://${ipAddress}:${port}` };
+  return { nodeName, nodeCode, ipAddress, port, url: `http://${ipAddress}:${port}` };
 }
 
 function describe(error: unknown): string {

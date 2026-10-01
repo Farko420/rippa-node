@@ -124,15 +124,28 @@
   <input id="mothership" type="url" placeholder="https://rippaadventures.com" />
 </section>
 <section class="field hidden" id="masterUrlWrap">
-    <label for="masterUrl">Master Node</label>
+    <label for="masterUrl">Master Node Code or Address</label>
+    <!--
+      THE NODE-CODE FIELD IS TEXT, NOT A NUMBER.
+
+      A node code is `RIPPA-D2N6-6VZV` — letters, digits and dashes. This field
+      used to carry `inputmode="numeric"` / a digits-only filter (inherited from
+      the 6-digit Cloud Link relay code beside it), which silently dropped every
+      letter and made the documented "paste your Master's node code" flow
+      impossible: RIPPA-D2N6-6VZV became D266VZV and was rejected as a malformed
+      URL. `type="text"` with `autocapitalize` accepts the code verbatim, and the
+      hint below says exactly what is accepted so the failure is not silent.
+    -->
+    <input id="masterUrl" type="text" placeholder="RIPPA-D2N6-6VZV or http://192.168.1.50:4000"
+      autocomplete="off" autocapitalize="characters" spellcheck="false" />
     <div class="discover">
       <button id="scanBtn" type="button" class="ghost">&#128225; Scan Local Network</button>
       <select id="masterPicker" aria-label="Discovered Master nodes">
         <option value="">- No Master selected -</option>
       </select>
     </div>
-    <input id="masterUrl" type="text" placeholder="http://192.168.1.50:4000" />
-    <p class="hint" id="scanState">Scan to find Masters automatically, or type an address below.</p>
+    <p class="hint" id="scanState">Scan to find Masters automatically, or paste the Master's node code.</p>
+    <p class="hint">Accepts the Master's node code (e.g. <code>RIPPA-D2N6-6VZV</code>) or its LAN address.</p>
 </section>
 <section class="field hidden" id="cloudLinkWrap">
     <label for="cloudLink">Remote / Cloud Link</label>
@@ -232,16 +245,23 @@
     <button id="otaPush" type="button" class="ghost cc-restore" hidden>Push to Swarm Now</button>
   </section>
 
-  <!-- CONTROL BAR: dispatch a shared task (the Master auto-provisions P2P). -->
-  <section class="cc-control">
-    <input id="taskLabel" type="text" placeholder="Shared task - e.g. verify Lamington NP facts" />
-    <select id="taskLoad" aria-label="Task load">
-      <option value="lite">Lite</option>
-      <option value="normal" selected>Normal</option>
-      <option value="heavy">Heavy</option>
-    </select>
-    <button id="taskRun" type="button" class="save cc-run">&#9654; Assign to Swarm</button>
-  </section>
+  <!--
+    THE MANUAL "ASSIGN TO SWARM" CONTROL BAR IS GONE, AND THIS IS THE REASON.
+
+    The swarm is 100% AI-controlled: work enters through the Mothership queue and
+    the TaskEngine's priority tier, which claims and executes it without any
+    operator input. The label/dropdown/button that used to sit here did not
+    assign work to the Mothership queue at all — it POSTed /api/mesh/task,
+    which is a LOCAL Master-only helper that marks the given satellites as busy
+    in the Control Center's own registry. It therefore could not pull a single
+    piece of real work off the cloud queue, while looking exactly like it could.
+
+    That is worse than a missing feature: an operator would watch a real task sit
+    in the Mothership queue, press "Assign to Swarm", see nodes light up, and
+    conclude the fleet was working. The button and its dashboard.js handler have
+    been removed together; `POST /api/mesh/task` remains for programmatic use but
+    is no longer surfaced in the UI.
+  -->
   <div id="ccAlert" class="alert hidden"></div>
 <main class="cc-main">
     <!-- SWARM GRID - one card per satellite: code, IP, status, task, vitals. -->
@@ -259,6 +279,31 @@
     <section class="cc-panel">
       <h2>Master Brain Parity</h2>
       <p class="hint">Load <code>rippa-brain-master.json</code> to give this node the Mothership's knowledge.</p>
+      <!--
+        SYNC STATUS - A REAL, BACKEND-DRIVEN PROGRESS BAR.
+
+        Two independent phases, which is why there are two indicators:
+
+          1. #brainProgress  the transfer. The browser's own FileReader reports
+             genuine byte progress while the bundle is read and parsed.
+          2. #brainSync      the database work. The node's ingestion engine
+             publishes a progress event every few hundred rows over
+             GET /api/system/events, so the bar reflects rows actually inserted
+             into SQLite rather than bytes still sitting in memory.
+
+        Without the second one the operator watched a bar sit at 100% ("Uploading
+        to the node…") for the whole 30-second ingest and had no way to tell a
+        working node from a hung one. #brainSyncLabel carries the human phase
+        ("Syncing chunks…", "Parity Achieved", "Idle").
+      -->
+      <div id="brainSync" class="brain-sync" aria-live="polite">
+        <div class="brain-sync-head">
+          <span class="brain-sync-label">Sync Status</span>
+          <span id="brainSyncLabel" class="hint">Idle</span>
+        </div>
+        <div class="bar"><div id="brainSyncBar" class="bar-fill brain-sync-fill" style="width:0%"></div></div>
+        <span id="brainSyncDetail" class="hint"></span>
+      </div>
       <div id="brainDrop" class="brain-drop" role="button" tabindex="0"
            aria-label="Upload a master brain bundle">
         <div class="brain-drop-inner">
@@ -296,6 +341,31 @@
 </div>
 </div>
 
+
+<!--
+  ADMIN COMMAND OVERLAY - the "Applying OTA Update..." / "Restarting Node..." screen.
+
+  THE OVERLAY IS UNCLOSABLE BY DESIGN, and that is a deliberate decision rather
+  than an oversight. Both commands it covers are irreversible by the time the
+  browser hears about them: the OTA swap has already spawned its detached batch
+  script, and the restart has already begun tearing services down. A dismiss
+  button would therefore be a lie - it would offer the operator a control that
+  does not exist. It stays up until the page itself goes away, which is exactly
+  when the node is restarting anyway.
+
+  It is hidden in markup and revealed ONLY by a `blocking` admin_command event
+  from GET /api/system/events, so it can never cover the dashboard on a normal
+  boot - see showAdminOverlay() in dashboard.js.
+-->
+<div id="adminOverlay" class="admin-overlay" hidden role="alertdialog" aria-live="assertive"
+     aria-labelledby="adminOverlayTitle">
+  <div class="admin-overlay-card">
+    <div class="admin-spinner" aria-hidden="true"></div>
+    <h2 id="adminOverlayTitle">Working…</h2>
+    <p id="adminOverlayDetail">The node is applying a command from the Mothership.</p>
+    <p class="admin-overlay-foot">Do not close this window. The node will restart by itself.</p>
+  </div>
+</div>
 
 <!-- SATELLITE DETAIL MODAL -->
 <div id="ccModal" class="lock" hidden>

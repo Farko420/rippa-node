@@ -84,6 +84,53 @@ function num(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+/**
+ * ONE PROGRESS TICK FROM THE INGESTION ENGINE.
+ *
+ * The operator is watching a bar for a load that can take tens of seconds, and a
+ * bar that only ever shows "100%" at the end is indistinguishable from a frozen
+ * page. These are the four numbers the UI needs and nothing else.
+ */
+export interface BrainIngestProgress {
+  /** Coarse phase name, e.g. "places", "knowledge_chunks". */
+  phase: string;
+  /** Human sentence for the status label, e.g. "Syncing chunks…". */
+  detail: string;
+  /** 0-100 across the whole load. */
+  percent: number;
+  /** Rows written so far across every collection. */
+  written: number;
+  /** Rows the bundle is expected to carry, for the `written/total` readout. */
+  total: number;
+}
+
+/** Called as the load advances. May be sync or async; awaited either way. */
+export type BrainIngestProgressListener = (
+  progress: BrainIngestProgress,
+) => void | Promise<void>;
+
+/**
+ * Rows written between progress reports.
+ *
+ * Deliberately not 1. Reporting every row would mean 50,000 SSE frames for a
+ * bundle that finishes in a few seconds — the flood would cost more than the
+ * work it describes. This keeps updates frequent enough to look continuous while
+ * the insert loop is the only thing running.
+ */
+const PROGRESS_CHUNK_ROWS = 250;
+
+/**
+ * Yields to the event loop so queued SSE frames actually reach the browser.
+ *
+ * better-sqlite3 is synchronous, so without this the whole ingestion runs inside
+ * one uninterrupted tick: every progress event is published, but none of them is
+ * ever *written* until the last row lands, and the operator sees a bar that
+ * jumps 0 -> 100. One `setImmediate` per chunk is enough to drain the socket.
+ */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 /** Keeps only strings, capped, so an array cannot smuggle objects into a JSON column. */
 function strArray(value: unknown, maxItems: number): string[] {
   if (!Array.isArray(value)) return [];
@@ -196,10 +243,42 @@ export function getBrainCounts(): BrainIngestResult["counts"] {
  * hand-edited file claiming 5,000 places while carrying 400 must not produce a
  * "1:1 parity locked" message over 400 rows.
  */
-export function ingestBrainBundle(
+export async function ingestBrainBundle(
   raw: unknown,
-  options: { force?: boolean } = {},
-): BrainIngestResult {
+  options: { force?: boolean; onProgress?: BrainIngestProgressListener } = {},
+): Promise<BrainIngestResult> {
+  const onProgress = options.onProgress;
+  /** Total rows the bundle claims to carry, for the progress denominator. */
+  const rowTotal = (key: string): number =>
+    Array.isArray((raw as Record<string, unknown> | null)?.[key])
+      ? ((raw as Record<string, unknown>)[key] as unknown[]).length
+      : 0;
+  const totalRows =
+    rowTotal("places") +
+    rowTotal("categories") +
+    rowTotal("tags") +
+    rowTotal("knowledge_chunks") +
+    rowTotal("road_features");
+
+  /**
+   * Publishes one tick and yields so the frame is actually flushed.
+   *
+   * The yield is what makes this honest: without it the whole load runs in one
+   * tick, the frames queue up on the socket, and the bar jumps 0 -> 100 the
+   * instant the last row lands. See `yieldToEventLoop`.
+   */
+  const report = async (phase: string, detail: string, written: number): Promise<void> => {
+    if (!onProgress) return;
+    await onProgress({
+      phase,
+      detail,
+      percent: totalRows > 0 ? Math.min(100, Math.round((written / totalRows) * 100)) : 0,
+      written,
+      total: totalRows,
+    });
+    await yieldToEventLoop();
+  };
+
   const empty: BrainIngestResult["counts"] = {
     places: 0,
     categories: 0,
@@ -294,8 +373,11 @@ export function ingestBrainBundle(
   let tags = 0;
   let chunks = 0;
   let roads = 0;
+  let written = 0;
   const seenPlaceIds = new Set<string>();
   const started = Date.now();
+
+  await report("starting", "Opening transaction…", 0);
 
   db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
   db.exec("BEGIN IMMEDIATE TRANSACTION");
@@ -334,6 +416,11 @@ export function ingestBrainBundle(
         stamp,
       );
       places += 1;
+      written += 1;
+      // Reported every chunk rather than every row — see PROGRESS_CHUNK_ROWS.
+      if (written % PROGRESS_CHUNK_ROWS === 0) {
+        await report("places", `Syncing places… ${places} of ${placeRows.length}`, written);
+      }
     }
 
     for (const row of (Array.isArray(bundle["categories"]) ? bundle["categories"] : []) as Record<
@@ -344,7 +431,9 @@ export function ingestBrainBundle(
       if (!id) continue;
       upsertCategory.run(id, str(row?.["label"], 160), stamp);
       categories += 1;
+      written += 1;
     }
+    await report("categories", `Linking categories… ${categories} written`, written);
 
     for (const row of (Array.isArray(bundle["tags"]) ? bundle["tags"] : []) as Record<
       string,
@@ -362,7 +451,9 @@ export function ingestBrainBundle(
       const members = strArray(row?.["place_ids"], 50000).filter((pid) => seenPlaceIds.has(pid));
       upsertTag.run(id, label, JSON.stringify(members), stamp);
       tags += 1;
+      written += 1;
     }
+    await report("tags", `Linking tags… ${tags} written`, written);
 
     for (const row of (Array.isArray(bundle["knowledge_chunks"])
       ? bundle["knowledge_chunks"]
@@ -380,7 +471,16 @@ export function ingestBrainBundle(
         stamp,
       );
       chunks += 1;
+      written += 1;
+      if (written % PROGRESS_CHUNK_ROWS === 0) {
+        await report("knowledge_chunks", `Syncing chunks… ${chunks} written`, written);
+      }
     }
+    await report(
+      "knowledge_chunks",
+      `Syncing chunks… ${chunks} written`,
+      written,
+    );
 
     for (const row of (Array.isArray(bundle["road_features"]) ? bundle["road_features"] : []) as Record<
       string,
@@ -397,7 +497,9 @@ export function ingestBrainBundle(
         stamp,
       );
       roads += 1;
+      written += 1;
     }
+    await report("road_features", `Writing road features… ${roads} written`, written);
 
     /*
       THE CURSOR MOVES LAST AND INSIDE THE TRANSACTION, so it can only ever
@@ -416,6 +518,11 @@ export function ingestBrainBundle(
       // transaction; there is nothing left to undo and the original error — the
       // one that actually explains what happened — is the one worth reporting.
     }
+    await report(
+      "failed",
+      `Load failed: ${error instanceof Error ? error.message : String(error)}`,
+      written,
+    ).catch(() => undefined);
     return fail(
       `The bundle could not be loaded and nothing was changed: ${
         error instanceof Error ? error.message : String(error)
@@ -431,6 +538,12 @@ export function ingestBrainBundle(
   console.log(
     `[Brain] Loaded bundle ${exportedAt}: ${places} place(s), ${categories} categor(ies), ` +
       `${tags} tag(s), ${chunks} chunk(s), ${roads} road feature(s) in ${elapsed}ms.`,
+  );
+
+  // Terminal tick. Published AFTER the COMMIT, so "Parity Achieved" can never be
+  // displayed over rows that a rollback subsequently undid.
+  await report("done", "Parity Achieved", totalRows > 0 ? totalRows : written).catch(
+    () => undefined,
   );
 
   return {

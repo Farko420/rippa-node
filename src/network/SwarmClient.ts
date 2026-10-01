@@ -1,6 +1,7 @@
 ﻿import axios, { type AxiosInstance } from "axios";
 import { schedule, type ScheduledTask } from "node-cron";
 import { env } from "../config";
+import { currentNodeIdentity } from "../config/nodeAuth";
 import {
   buildHeartbeatTelemetry,
   executePendingCommands,
@@ -14,9 +15,18 @@ import {
  * Every request carries `NODE_API_KEY` as a Bearer token.
  */
 
-export type NodeStatus = "idle" | "busy";
+export type NodeStatus = "idle" | "busy" | "working";
 
-/** Snake_case field names are part of the Mothership's wire contract. */
+/**
+ * Snake_case field names are part of the Mothership's wire contract.
+ *
+ * `status` is deliberately three-valued. "busy" is a coarse "something is
+ * happening"; "working" means a specific claimed task is in flight, and it is
+ * what tells the Mothership's queue that this node has ACCEPTED a task rather
+ * than merely being reachable. Without a distinct claimed state the cloud cannot
+ * tell "still deciding" from "never saw it", which is precisely why pending tasks
+ * used to sit unclaimed.
+ */
 export interface HeartbeatPayload {
   nodeName: string;
   role: "master" | "satellite";
@@ -48,6 +58,18 @@ export interface SwarmTask {
   id: string;
   type: string;
   payload?: Record<string, unknown>;
+  /**
+   * Queue state from the Mothership, when it sends one. Only "pending"-shaped
+   * tasks are claimable; a task the cloud has already retired is not work.
+   */
+  status?: string;
+}
+
+/** A claimed task, plus whether the Mothership acknowledged the claim. */
+export interface ClaimedTask {
+  task: SwarmTask;
+  /** True when the cloud confirmed the claim, or sent no claim route at all. */
+  acknowledged: boolean;
 }
 
 /** What `/api/node/latest-version` reports back to the swarm. */
@@ -354,6 +376,73 @@ export class SwarmClient {
     }
   }
 
+  /**
+   * CLAIMS a task with the Mothership and flips this node to "working".
+   *
+   * WHY AN EXPLICIT CLAIM. Fetching a task and executing it is not enough: while
+   * the node was deciding what to do, the cloud still considered the task
+   * unassigned and could hand the same work to every other node in the fleet.
+   * The claim is what makes the queue single-owner, and it is what flips the
+   * heartbeat `status` to "working" so the cloud can see the node took it.
+   *
+   * FAILS OPEN, ON PURPOSE. A Mothership with no claim route answers 404, and a
+   * node that treated that as a hard error would refuse to run any task at all —
+   * exactly the "nodes are ignoring the queue" symptom this replaces. So an
+   * absent claim endpoint is reported as `acknowledged: false` and the task still
+   * executes; only a genuine transport failure on a route that DOES exist is
+   * surfaced. The work is never withheld over bookkeeping.
+   */
+  async claimTask(task: SwarmTask): Promise<ClaimedTask> {
+    this.setStatus("working");
+    if (!task?.id) return { task, acknowledged: false };
+
+    try {
+      await this.client.post("/api/swarm/tasks/claim", {
+        taskId: task.id,
+        nodeCode: currentNodeIdentity()?.code ?? env.NODE_NAME,
+        nodeName: env.NODE_NAME,
+        claimedAt: new Date().toISOString(),
+      });
+      console.log(`[Swarm] Claimed task ${task.id} (${task.type}).`);
+      return { task, acknowledged: true };
+    } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status === 404 || status === 405 || status === 501) {
+        // No claim route on this deployment — older cloud, not a failure.
+        console.log(
+          `[Swarm] Mothership has no task-claim route; executing ${task.id} unclaimed.`,
+        );
+        return { task, acknowledged: false };
+      }
+      console.warn(
+        `[Swarm] Claim for task ${task.id} failed — ${describeError(error)} ` +
+          "(executing anyway; the task will be reported on completion)",
+      );
+      return { task, acknowledged: false };
+    }
+  }
+
+  /**
+   * Releases a claim without reporting a result.
+   *
+   * Used when a claimed task turns out to be unrunnable on this node, so the
+   * cloud can re-queue it immediately instead of waiting for a result that will
+   * never arrive.
+   */
+  async releaseTask(task: SwarmTask, reason: string): Promise<void> {
+    try {
+      await this.client.post(`/api/swarm/tasks/${encodeURIComponent(task.id)}/release`, {
+        nodeName: env.NODE_NAME,
+        reason,
+      });
+      console.log(`[Swarm] Released task ${task.id} — ${reason}`);
+    } catch (error) {
+      // Best-effort: a cloud without a release route simply re-queues on its own
+      // timeout, so this must never block the node's next task.
+      console.warn(`[Swarm] Release of task ${task.id} failed — ${describeError(error)}`);
+    }
+  }
+
   /** Fetches pending tasks from the Mothership. Returns `[]` when unreachable. */
   async fetchTasks(): Promise<SwarmTask[]> {
     // BACKOFF GATE â€” see TASK_FETCH_BACKOFF_BASE_MS. A 5xx arms a cooldown and
@@ -373,7 +462,11 @@ export class SwarmClient {
       if (Array.isArray(data)) {
         return data as SwarmTask[];
       }
-      return Array.isArray(data?.tasks) ? (data.tasks as SwarmTask[]) : [];
+      // Same envelope-tolerance as the heartbeat path. This used to read only
+      // `data.tasks`, so a Mothership answering `{ pending_tasks: [...] }` or
+      // `{ data: { tasks: [...] } }` produced an empty list and the node looked
+      // idle while the queue was full — the reported "nodes ignore tasks" bug.
+      return parseTaskPayload(data);
     } catch (error) {
       this.reportTaskFetchFailure(error);
       return [];
@@ -640,6 +733,12 @@ function firstString(source: Record<string, unknown>, keys: string[]): string | 
  * are dropped — a task the node cannot report a result against is a task it
  * cannot acknowledge, and acknowledging it would corrupt the fleet's view of
  * what is still outstanding.
+ *
+ * STATUS IS CARRIED, AND TERMINAL STATES ARE FILTERED. The cloud may hand back
+ * the whole queue including work that is already done, in flight elsewhere, or
+ * failed. Executing one of those re-does work for free at best and corrupts the
+ * fleet's counts at worst, so only tasks that are pending (or that carry no
+ * status at all, which is what an older deployment sends) reach the engine.
  */
 function parseTaskPayload(payload: unknown): SwarmTask[] {
   if (!payload || typeof payload !== "object") return [];
@@ -653,6 +752,12 @@ function parseTaskPayload(payload: unknown): SwarmTask[] {
     const record = entry as Record<string, unknown>;
     const id = firstString(record, ["id", "taskId", "task_id"]);
     if (!id) continue;
+
+    // Terminal states are not work. An absent status is treated as pending
+    // because that is what a deployment with no queue states sends.
+    const status = firstString(record, ["status", "state"])?.toLowerCase() ?? "pending";
+    if (!CLAIMABLE_TASK_STATES.has(status)) continue;
+
     const payloadField = record["payload"] ?? record["input"] ?? record["data"];
     tasks.push({
       id,
@@ -660,10 +765,21 @@ function parseTaskPayload(payload: unknown): SwarmTask[] {
       ...(payloadField && typeof payloadField === "object"
         ? { payload: payloadField as Record<string, unknown> }
         : {}),
+      status,
     });
   }
   return tasks;
 }
+
+/** Task states this node will accept work from. See `parseTaskPayload`. */
+const CLAIMABLE_TASK_STATES: ReadonlySet<string> = new Set([
+  "pending",
+  "queued",
+  "ready",
+  "assigned",
+  "unclaimed",
+  "new",
+]);
 
 /**
  * Normalises a Mothership update payload into {@link LatestVersionInfo}.

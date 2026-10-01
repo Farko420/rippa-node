@@ -66,6 +66,13 @@ export interface RippaNodeConfig {
   P2P_ENABLED?: boolean;
   /** Sibling endpoints auto-filled by the Master (never typed by a user). */
   PEER_MESH?: PeerEndpoint[];
+  /**
+   * Master-side satellite registry, persisted so the Swarm Grid and the
+   * `connected_satellites` heartbeat survive a restart. Written by the
+   * dispatcher alone — never by the setup form, which must not be able to forge
+   * fleet membership.
+   */
+  SATELLITE_REGISTRY?: unknown;
 }
 
 export type NodeRole = "master" | "satellite";
@@ -231,6 +238,17 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
     MESH_KEY_ISSUER: pickString(record, "MESH_KEY_ISSUER") || undefined,
     P2P_ENABLED: record["P2P_ENABLED"] === false ? false : true,
     PEER_MESH: normalizePeers(record["PEER_MESH"]),
+    /*
+      SATELLITE_REGISTRY MUST be carried through here, exactly like PEER_MESH.
+
+      `writeConfig` runs `normalizeConfig` and writes whatever that returns — it
+      is not a merge. Any field this function does not name is silently DELETED
+      on the next save, and a Master that lost its registry would show "0
+      satellites" again after an operator touched Setup.
+    */
+    SATELLITE_REGISTRY: Array.isArray(record["SATELLITE_REGISTRY"])
+      ? record["SATELLITE_REGISTRY"]
+      : [],
   };
 }
 

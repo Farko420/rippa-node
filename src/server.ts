@@ -17,6 +17,7 @@ import {
 } from "./config/nodeAuth";
 import { SwarmDispatcher, type LoadClass, type TaskOutcome } from "./services/swarmDispatcher";
 import { getBrainCounts, getSyncCursor, ingestBrainBundle } from "./services/brainIngest";
+import { latestNodeEvent, publishNodeEvent, subscribeNodeEvents } from "./services/nodeEvents";
 import { getDeepBrain } from "./db/database";
 import {
   SwarmUpdater,
@@ -460,6 +461,68 @@ export function createApp(): Express {
     res.json({ success: true, authenticated: false });
   });
 
+  /*
+    GET /api/system/events — the node's Server-Sent Events stream.
+
+    WHAT THIS CARRIES. Two kinds of thing the dashboard cannot learn by asking:
+
+      - `admin_command`: a Force OTA Update or Restart Node Service arrived on the
+        heartbeat. The operator needs to see it the moment it happens.
+      - `brain_sync`: progress through a bundle load, so the Master Brain Parity
+        panel shows a moving bar instead of appearing frozen for 30 seconds.
+
+    WHY SSE AND NOT A POLL. The progress signal is high-frequency and the admin
+    signal is rare but latency-sensitive. A poll would either hammer the CPU while
+    a bundle loads or make a restart take seconds to appear; a stream costs one
+    open connection and delivers both immediately.
+
+    THE HEARTBEAT FRAME IS NOT OPTIONAL. Proxies and browsers close an idle
+    connection, and a dashboard sitting untouched during a 126 MB download would
+    otherwise be disconnected exactly when it needs to keep listening.
+
+    REPLAYED STATE ON CONNECT. A dashboard opened AFTER an admin command arrived
+    must still see it — that is the normal case, since the operator usually opens
+    the dashboard after sending the command. The retained "blocking" event is
+    replayed first, which is what puts the overlay up.
+  */
+  app.get("/api/system/events", requireDashboardAuth, (req: Request, res: Response) => {
+    res.status(200).set({
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      // Disables response buffering in nginx-style reverse proxies, which would
+      // otherwise hold every frame until the connection closed.
+      "X-Accel-Buffering": "no",
+    });
+    res.flushHeaders?.();
+
+    // Replay the retained admin command (if any) so a late-joining dashboard
+    // still gets the overlay, then the last brain-sync state for the same reason.
+    const replay = latestNodeEvent("admin_command");
+    if (replay?.blocking) res.write(`data: ${JSON.stringify(replay)}\n\n`);
+    const brain = latestNodeEvent("brain_sync");
+    if (brain) res.write(`data: ${JSON.stringify(brain)}\n\n`);
+
+    const unsubscribe = subscribeNodeEvents((event) => {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    });
+
+    const heartbeat = setInterval(() => {
+      // A comment frame keeps intermediaries from reaping an idle stream.
+      res.write(": keep-alive\n\n");
+    }, 20_000);
+
+    // `close` fires for both a clean client disconnect and an aborted request, so
+    // this single handler is enough to release the listener and the timer.
+    const cleanup = (): void => {
+      clearInterval(heartbeat);
+      unsubscribe();
+    };
+    req.on("close", cleanup);
+    req.on("error", cleanup);
+    res.on("error", cleanup);
+  });
+
   // GET /api/system/config — current config.json state (API key + PIN masked).
   app.get("/api/system/config", requireDashboardAuth, (req: Request, res: Response) => {
     res.json(buildConfigPayload(hasDashboardSession(req)));
@@ -792,7 +855,10 @@ export function createApp(): Express {
     non-master node, and the Deep Brain is master-only by design. A satellite
     receiving this POST should be told so plainly, not handed a stack trace.
   */
-  app.post("/api/brain/upload-backup", requireDashboardAuth, (req: Request, res: Response) => {
+  app.post(
+    "/api/brain/upload-backup",
+    requireDashboardAuth,
+    async (req: Request, res: Response) => {
     let deepBrain: unknown;
     try {
       deepBrain = getDeepBrain();
@@ -818,7 +884,28 @@ export function createApp(): Express {
     const force = String(req.query["force"] ?? "") === "true";
 
     try {
-      const result = ingestBrainBundle(body, { force });
+      const result = await ingestBrainBundle(body, {
+        force,
+        /*
+          PROGRESS IS PUBLISHED, NOT POLLED FOR. The dashboard opens
+          /api/system/events once and listens; this callback is the producer. The
+          load can take tens of seconds for a real bundle, so a UI that only
+          learned the outcome at the end would look frozen for the entire time.
+        */
+        onProgress: (progress) => {
+          publishNodeEvent({
+            kind: "brain_sync",
+            phase: progress.phase,
+            percent: progress.percent,
+            title: progress.detail,
+            detail:
+              progress.total > 0
+                ? `${progress.written.toLocaleString()} of ${progress.total.toLocaleString()} rows`
+                : undefined,
+            blocking: progress.phase !== "done" && progress.phase !== "failed",
+          });
+        },
+      });
       // A REFUSAL IS 400, NOT 500. Nothing is broken — the file was understood and
       // deliberately not applied — and the dashboard renders `message` either way,
       // so the operator reads the same sentence in both cases.
@@ -835,7 +922,8 @@ export function createApp(): Express {
         message: `Upload failed: ${error instanceof Error ? error.message : String(error)}`,
       });
     }
-  });
+    },
+  );
 
   // GET /api/mesh/satellite/:code — detail payload for the modal.
   app.get("/api/mesh/satellite/:code", requireDashboardAuth, (req: Request, res: Response) => {

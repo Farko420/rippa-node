@@ -127,6 +127,51 @@
 .brain-progress { margin-top:14px; }
 .brain-progress .hint { display:block; margin-top:6px; }
 
+/* ---- SYNC STATUS (backend-driven) -------------------------------------------
+   Sits ABOVE the drop zone rather than inside it, because it is a persistent
+   indicator rather than a transient one: after a load finishes it settles on
+   "Parity Achieved" and stays readable, whereas the in-zone progress bar is
+   hidden again once the transfer ends. Two bars at once would read as
+   duplicated state. */
+.brain-sync { margin-bottom:12px; padding:10px 12px; border:1px solid var(--line);
+  border-radius:12px; background:rgba(13,17,23,.5); }
+.brain-sync-head { display:flex; align-items:baseline; justify-content:space-between; gap:10px; }
+.brain-sync-label { font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--mut); }
+.brain-sync .bar { margin-top:8px; }
+/* Green once parity is reached, blue while rows are still landing, so the
+   colour alone tells the operator whether the load actually completed. */
+.brain-sync-fill { background:var(--acc); transition:width .18s ease; }
+.brain-sync.done .brain-sync-fill { background:var(--ok); }
+.brain-sync.failed .brain-sync-fill { background:#f85149; }
+.brain-sync.failed #brainSyncLabel { color:#f85149; }
+.brain-sync.done #brainSyncLabel { color:var(--ok); }
+#brainSyncDetail { display:block; margin-top:6px; }
+
+/* ---- ADMIN COMMAND OVERLAY --------------------------------------------------
+   Full-screen, above everything, and deliberately has NO close affordance. Both
+   commands it covers are already irreversible when the event arrives, so a
+   dismiss button would promise a control that does not exist. `z-index` clears
+   the lock screen (z-index 10) and the modal, which sit at 10 and below. */
+.admin-overlay { position:fixed; inset:0; z-index:100; display:flex;
+  align-items:center; justify-content:center; padding:24px;
+  background:rgba(13,17,23,.96); backdrop-filter:blur(8px); }
+.admin-overlay-card { width:min(520px,100%); text-align:center;
+  background:var(--card); border:1px solid var(--acc); border-radius:18px;
+  padding:38px 32px; box-shadow:0 24px 80px #000a; }
+.admin-overlay-card h2 { margin:0 0 10px; font-size:22px; }
+.admin-overlay-card p { margin:0 0 8px; font-size:14px; color:var(--mut); }
+.admin-overlay-foot { margin-top:16px !important; font-size:12px; color:var(--mut); }
+/* A spinner, not a bar: there is no measurable progress on a restart or a binary
+   swap, and a fake percentage would be a lie. It spins to say "working". */
+.admin-spinner { width:44px; height:44px; margin:0 auto 20px; border-radius:50%;
+  border:3px solid var(--line); border-top-color:var(--acc); animation:admin-spin 1s linear infinite; }
+@keyframes admin-spin { to { transform:rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  /* Respect the OS setting: a permanently spinning element is a vestibular
+     trigger, and the overlay still communicates everything through its text. */
+  .admin-spinner { animation:none; border-top-color:var(--acc); }
+}
+
 /* ---- SWARM GRID NODE METRICS ----------------------------------------------
    Per-card CPU / RAM / uptime bars. The `.nm-row` grid mirrors the modal's
    `.load-row` so a card and its detail modal read identically. */

@@ -608,6 +608,84 @@ async function load() {
   try { refreshRole(); } catch (err) { /* noop */ }
 }
 
+/*
+ * MASTER NODE FIELD: A NODE CODE IS A VALID VALUE, NOT A MALFORMED URL.
+ *
+ * The field accepts `RIPPA-D2N6-6VZV` as readily as `http://192.168.1.50:4000`,
+ * and this is where a code is turned into a URL the node can dial. The old code
+ * path assumed every value was an address, so a pasted node code was rejected
+ * server-side as "must be a valid http(s) URL" and the documented
+ * "paste your Master's code" flow simply did not work.
+ *
+ * Resolving a code needs a LAN scan (the Master advertises itself with a beacon),
+ * so it happens on demand rather than on every keystroke. A code that matches no
+ * beacon is left in the field untouched and explained, never silently rewritten —
+ * a satellite on an isolated network can still be pointed at a URL by hand.
+ */
+
+/** True when `value` looks like a `RIPPA-XXXX-XXXX` node code. */
+function looksLikeNodeCode(value) {
+  return /^RIPPA-[0-9A-HJ-NP-Z]{4}-[0-9A-HJ-NP-Z]{4}$/i.test(String(value || "").trim());
+}
+
+/**
+ * Resolves a node code to the Master's LAN URL via a discovery scan.
+ * Returns "" when nothing matches.
+ */
+async function resolveNodeCodeToUrl(code) {
+  try {
+    const res = await fetch("/api/system/network/scan", {
+      credentials: "same-origin",
+      headers: authHeaders(),
+    });
+    if (res.status === 401) {
+      showLocked();
+      return "";
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.success) return "";
+    const wanted = String(code).trim().toUpperCase();
+    const match = (data.masters || []).find(
+      (master) => String(master.nodeCode || "").trim().toUpperCase() === wanted,
+    );
+    return match ? match.url : "";
+  } catch (err) {
+    return ""; // a failed scan is not a setup error; the URL path still works
+  }
+}
+
+/**
+ * Prepares the Master Node field for saving: returns the URL to persist.
+ *
+ * A code is scanned for and swapped for the Master's real address. Anything else
+ * is passed through untouched, so manual entry keeps working exactly as before.
+ */
+async function resolveMasterFieldForSave() {
+  const raw = (masterUrl && masterUrl.value ? masterUrl.value : "").trim();
+  if (!raw || !looksLikeNodeCode(raw)) return raw;
+
+  setScanState("Looking up Master node code " + raw + " on this network…");
+  const url = await resolveNodeCodeToUrl(raw);
+  if (url) {
+    if (masterUrl) masterUrl.value = url;
+    masterBridgeUrl = url;
+    masterUrlEdited = false;
+    if (masterPicker && [...masterPicker.options].some((o) => o.value === url)) {
+      masterPicker.value = url;
+    }
+    refreshBridge();
+    setScanState("Master node code " + raw + " resolved to " + url + ".");
+  } else {
+    // Left as typed on purpose: see the docblock. An unreachable Master now looks
+    // like "not a valid URL", so the message names the code explicitly.
+    setScanState(
+      "No Master answering to " + raw + " on this network. Start the Master, scan again, " +
+        "or type its address (http://…:4000) by hand.",
+    );
+  }
+  return url;
+}
+
 if (saveBtn) saveBtn.addEventListener("click", async () => {
   hideAlert();
   saveBtn.disabled = true;
@@ -615,7 +693,9 @@ if (saveBtn) saveBtn.addEventListener("click", async () => {
   const body = {
     node_role: role ? role.value : "master",
     mothership_url: mothership ? mothership.value.trim() : "",
-    master_node_url: masterUrl ? masterUrl.value.trim() : "",
+    // Resolved through resolveMasterFieldForSave() so a pasted NODE CODE becomes
+    // the Master's real URL before validation sees it. See that function.
+    master_node_url: await resolveMasterFieldForSave(),
     cloud_link_code: cloudLink ? cloudLink.value.trim() : "",
     node_name: nodeName ? nodeName.value.trim() : "",
     node_api_key: apiKey ? apiKey.value : "",

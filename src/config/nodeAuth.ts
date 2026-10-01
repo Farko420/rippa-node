@@ -252,6 +252,42 @@ export function listPeers(): PeerEndpoint[] {
 }
 
 /**
+ * MASTER-SIDE REGISTRY PERSISTENCE.
+ *
+ * The satellite registry (codes, names, endpoints, metrics) lived only in the
+ * dispatcher's memory, so every Master restart erased the Swarm Grid and
+ * emptied the `connected_satellites` list reported to the Mothership — the cloud
+ * then saw a healthy Master with no fleet, which is indistinguishable from one
+ * that never had any. It is written alongside the mesh key in config.json so the
+ * fleet survives a restart and a crash alike.
+ */
+
+/** One persisted satellite. Deliberately minimal — see the caller's docblock. */
+export interface PersistedSatelliteRecord {
+  nodeCode: string;
+  nodeName: string;
+  endpoint: PeerEndpoint;
+  p2pEnabled: boolean;
+  completedTaskIds: string[];
+  metrics: Record<string, unknown>;
+}
+
+/** Writes the registry, preserving every other config field (see `persist`). */
+export function saveRegistry(records: PersistedSatelliteRecord[]): void {
+  persist({ SATELLITE_REGISTRY: records });
+}
+
+/** Reads the persisted registry, dropping any entry with an invalid code. */
+export function loadRegistry(): PersistedSatelliteRecord[] {
+  const raw = read()?.SATELLITE_REGISTRY;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(
+    (entry): entry is PersistedSatelliteRecord =>
+      Boolean(entry) && typeof entry === "object" && isValidNodeCode((entry as PersistedSatelliteRecord).nodeCode),
+  );
+}
+
+/**
  * Sets the local P2P mode flag. When the Master's adaptive monitor revokes P2P
  * this flips the node into master-relay-only mode without a restart.
  */

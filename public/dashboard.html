@@ -51,16 +51,12 @@
     <button id="otaPush" type="button" class="ghost cc-restore" hidden>Push to Swarm Now</button>
   </section>
 
-  <!-- CONTROL BAR: dispatch a shared task (the Master auto-provisions P2P). -->
-  <section class="cc-control">
-    <input id="taskLabel" type="text" placeholder="Shared task — e.g. verify Lamington NP facts" />
-    <select id="taskLoad" aria-label="Task load">
-      <option value="lite">Lite</option>
-      <option value="normal" selected>Normal</option>
-      <option value="heavy">Heavy</option>
-    </select>
-    <button id="taskRun" type="button" class="save cc-run">▶ Assign to Swarm</button>
-  </section>
+  <!--
+    NO MANUAL "ASSIGN TO SWARM" CONTROL BAR — see the identical note in
+    index.html. The swarm is 100% AI-controlled; that button only marked
+    satellites busy in this node's local registry and never pulled real work off
+    the Mothership queue, so it removed here as well as there.
+  -->
   <div id="ccAlert" class="alert hidden"></div>
 
   <main class="cc-main">
@@ -80,6 +76,15 @@
     <section class="cc-panel" id="brainPanel">
       <h2>Master Brain Parity</h2>
       <p class="hint">Drop a <code>rippa-brain-master-*.json</code> bundle from Admin &rarr; Rippa Labs to load it here.</p>
+      <!-- Backend-driven sync progress — see the identical block in index.html. -->
+      <div id="brainSync" class="brain-sync" aria-live="polite">
+        <div class="brain-sync-head">
+          <span class="brain-sync-label">Sync Status</span>
+          <span id="brainSyncLabel" class="hint">Idle</span>
+        </div>
+        <div class="bar"><div id="brainSyncBar" class="bar-fill brain-sync-fill" style="width:0%"></div></div>
+        <span id="brainSyncDetail" class="hint"></span>
+      </div>
       <div id="brainDrop" class="brain-drop" tabindex="0" role="button"
            aria-label="Upload a master brain bundle">
         <div class="brain-drop-inner">
@@ -112,6 +117,17 @@
     <div class="logo big">◈</div>
     <h1>Master Control Center</h1>
     <p class="sub" id="ccBootSub">Connecting to the swarm…</p>
+  </div>
+</div>
+
+<!-- ADMIN COMMAND OVERLAY — unclosable by design. See the note in index.html. -->
+<div id="adminOverlay" class="admin-overlay" hidden role="alertdialog" aria-live="assertive"
+     aria-labelledby="adminOverlayTitle">
+  <div class="admin-overlay-card">
+    <div class="admin-spinner" aria-hidden="true"></div>
+    <h2 id="adminOverlayTitle">Working…</h2>
+    <p id="adminOverlayDetail">The node is applying a command from the Mothership.</p>
+    <p class="admin-overlay-foot">Do not close this window. The node will restart by itself.</p>
   </div>
 </div>
 

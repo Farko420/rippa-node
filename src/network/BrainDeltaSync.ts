@@ -130,7 +130,7 @@ export class BrainDeltaSync {
       // Force: the delta is newer than the cursor by construction, but the
       // ingest's staleness guard compares exported_at, and a cloud clock that
       // disagrees with ours would otherwise silently discard real changes.
-      const result = ingestBrainBundle(payload, { force: true });
+      const result = await ingestBrainBundle(payload, { force: true });
       if (!result.ok) {
         console.warn(`[Delta] Not applied — ${result.message} Cursor unchanged.`);
         return false;

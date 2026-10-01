@@ -1,4 +1,5 @@
 import { getSystemVitals, type SystemVitals } from "./telemetry";
+import { publishNodeEvent } from "./nodeEvents";
 
 /**
  * HEARTBEAT TELEMETRY & REMOTE COMMAND EXECUTION.
@@ -35,6 +36,46 @@ const COMMAND_ALLOWLIST: readonly RemoteCommandName[] = [
   "FORCE_UPDATE",
   "TOGGLE_P2P",
 ];
+
+/**
+ * FLEET MANAGEMENT TASK TYPES, and why they are listed here at all.
+ *
+ * The Mothership expresses "Force OTA Update" and "Restart Node Service" two
+ * different ways, and this file used to understand only one of them. It parsed
+ * `pending_commands` (a `{command: "FORCE_UPDATE"}` array) and ignored a queue
+ * entry whose `type` was `FORCE_OTA_UPDATE` or `RESTART_NODE_SERVICE` — which is
+ * exactly the shape an operator's "Force Update" button produces. Those tasks
+ * then fell through the orchestrator's `switch`, hit `default:`, and were
+ * reported back as "no handler for type ..." — received, logged, and ignored.
+ *
+ * So the same names are now recognised as task types, and both spellings map onto
+ * one canonical command. Keeping the allowlist as the single gate means this
+ * adds no new capability: an admin command is only ever executed after matching
+ * an entry that was already permitted.
+ */
+const ADMIN_TASK_TYPES: Readonly<Record<string, RemoteCommandName>> = {
+  FORCE_UPDATE: "FORCE_UPDATE",
+  FORCE_OTA_UPDATE: "FORCE_UPDATE",
+  OTA_UPDATE: "FORCE_UPDATE",
+  UPDATE: "FORCE_UPDATE",
+  RESTART_NODE: "RESTART_NODE",
+  RESTART_NODE_SERVICE: "RESTART_NODE",
+  RESTART: "RESTART_NODE",
+  RESTART_SERVICE: "RESTART_NODE",
+  TOGGLE_P2P: "TOGGLE_P2P",
+};
+
+/**
+ * Maps a task type onto an admin command, or null when it is ordinary work.
+ *
+ * Exported so the orchestrator can intercept an admin task BEFORE its own
+ * `switch` — the interception has to happen upstream of task execution, or the
+ * task is already reported as skipped by the time anyone notices what it was.
+ */
+export function adminCommandForTaskType(type: string | undefined): RemoteCommandName | null {
+  if (!type) return null;
+  return ADMIN_TASK_TYPES[String(type).trim().toUpperCase()] ?? null;
+}
 
 /** One entry from the Mothership's `pending_commands` array. */
 export interface RemoteCommand {
@@ -147,20 +188,36 @@ export function buildHeartbeatTelemetry(
  * `{ pending_commands: [...] }`. Non-object entries and unknown commands are
  * dropped here rather than at execution time, so the executor only ever sees
  * allowlisted work.
+ *
+ * ALIASES MATTER HERE. The command name arrives as whatever the operator's button
+ * was labelled — `FORCE_OTA_UPDATE`, `RESTART_NODE_SERVICE`, `restart` — not
+ * necessarily the canonical token. The old exact-match test silently discarded
+ * every one of those, which is how "Force OTA Update" reached the node and was
+ * then dropped without a word. Normalising through {@link adminCommandForTaskType}
+ * means the allowlist is judged on the MEANING of the command, and the allowlist
+ * is still the only thing that can authorise execution.
  */
 export function parsePendingCommands(payload: unknown): RemoteCommand[] {
   if (!payload || typeof payload !== "object") return [];
   const root = payload as Record<string, unknown>;
-  const raw = Array.isArray(root) ? root : root["pending_commands"];
+  const raw = Array.isArray(root) ? root : (root["pending_commands"] ?? root["commands"]);
   if (!Array.isArray(raw)) return [];
 
   const commands: RemoteCommand[] = [];
   for (const entry of raw) {
     if (!entry || typeof entry !== "object") continue;
     const record = entry as Record<string, unknown>;
-    const name = String(record["command"] ?? "").trim().toUpperCase();
-    if (!COMMAND_ALLOWLIST.includes(name as RemoteCommandName)) {
-      console.warn(`[Heartbeat] Ignoring unknown remote command "${name}".`);
+    // `command` is canonical; `type`/`action`/`name` are what several
+    // Mothership builds actually send. All are resolved through the same alias
+    // table so no spelling of an admin command can slip past unrecognised.
+    const rawName = String(
+      record["command"] ?? record["type"] ?? record["action"] ?? record["name"] ?? "",
+    )
+      .trim()
+      .toUpperCase();
+    const name = adminCommandForTaskType(rawName);
+    if (!name || !COMMAND_ALLOWLIST.includes(name)) {
+      console.warn(`[Heartbeat] Ignoring unknown remote command "${rawName}".`);
       continue;
     }
     commands.push({
@@ -211,10 +268,30 @@ export async function executePendingCommands(
       switch (entry.command) {
         case "RESTART_NODE":
           console.log("[Heartbeat] RESTART_NODE — shutting down gracefully.");
+          // Announced BEFORE the handler runs, not after: a restart handler ends
+          // in process.exit(), so anything published afterwards never reaches a
+          // browser. The dashboard needs the notice while the node is still up.
+          publishNodeEvent({
+            kind: "admin_command",
+            command: "RESTART_NODE",
+            title: "Restarting Node…",
+            detail: "The Mothership asked this node to restart. The service will come back automatically.",
+            blocking: true,
+          });
           await handlers.restartNode();
           break;
         case "FORCE_UPDATE":
           console.log("[Heartbeat] FORCE_UPDATE — starting the OTA pipeline.");
+          // Same reasoning: the overlay must appear while the download runs, not
+          // after it has already finished.
+          publishNodeEvent({
+            kind: "admin_command",
+            command: "FORCE_UPDATE",
+            title: "Applying OTA Update…",
+            detail:
+              "Downloading the latest release, verifying it, then swapping the executable and restarting.",
+            blocking: true,
+          });
           await handlers.forceUpdate();
           break;
         case "TOGGLE_P2P": {

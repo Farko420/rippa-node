@@ -424,12 +424,26 @@ export class TaskEngine {
   /**
    * Runs one assigned task and reports the result.
    *
+   * THE ORDER HERE IS THE FIX FOR "THE NODES IGNORE THE QUEUE". The claim comes
+   * FIRST and the execution second: the node announces that it has taken
+   * ownership (and the heartbeat starts reporting `status: "working"`) before it
+   * starts work, so the Mothership can see the transition from available to
+   * claimed instead of only learning about the task once it is already finished.
+   *
    * A handler that throws is caught here rather than allowed to escape, because
    * a single bad task must not abandon the rest of the queue — and because the
-   * `finally` below is what guarantees the node is released even when it does.
+   * `finally` in {@link drain} is what guarantees the node is released even when
+   * it does.
    */
   private async runPriorityTask(task: SwarmTask): Promise<void> {
-    this.deps.swarm.setStatus("busy");
+    /*
+      CLAIM BEFORE EXECUTING. `claimTask` also flips the node to "working", so
+      the status is honest from the moment the task is owned. It fails open by
+      design (see SwarmClient.claimTask) — an unreachable claim route must never
+      stop real work from being done.
+    */
+    await this.deps.swarm.claimTask(task);
+    this.deps.swarm.setStatus("working");
     setCurrentProcess(task.type || task.id || "task");
     const startedAt = Date.now();
 

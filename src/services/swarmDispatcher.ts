@@ -11,15 +11,18 @@ import {
   getPairing,
   isValidNodeCode,
   listPeers,
+  loadRegistry,
   normalizeNodeCode,
   p2pEnabled,
   peerCandidateUrls,
   saveMeshKey,
   savePairing,
+  saveRegistry,
   selfEndpoint,
   setP2pEnabled,
   verifyMeshKey,
   type PeerEndpoint,
+  type PersistedSatelliteRecord,
 } from "../config/nodeAuth";
 
 /**
@@ -152,6 +155,26 @@ export interface SatelliteRecord {
   p2pHealth: P2pHealth;
   metrics: NodeMetrics;
 }
+
+/**
+ * The subset of a SatelliteRecord that survives a Master restart.
+ *
+ * WHY THE REGISTRY IS PERSISTED AT ALL. The registry is the only thing standing
+ * between "the Satellite paired" and "the Swarm Grid shows it", and it lived
+ * purely in memory. Every Master restart therefore wiped the fleet view back to
+ * "0 satellites" and the `connected_satellites` array the Mothership heartbeat
+ * reports went empty with it — indistinguishable, from the cloud's side, from
+ * having no satellites at all.
+ *
+ * Deliberately NOT persisted: `currentTask` and `p2pHealth`. A task that was
+ * running when the Master died is not running now, and resurrecting stale health
+ * counters would let a revoked node look legitimately provisioned. Endpoints
+ * and metrics are the facts that stay true on their own.
+ *
+ * The shape itself is `PersistedSatelliteRecord`, imported from `config/nodeAuth`
+ * so the on-disk contract has exactly one definition next to the code that
+ * reads and writes it.
+ */
 
 /** Result of the Satellite's one-time pairing handshake. */
 export interface PairingResult {
@@ -309,6 +332,10 @@ export class SwarmDispatcher {
   private localMetrics: NodeMetrics = emptyMetrics();
   /** Any role: last instant a heartbeat landed. */
   private lastHeartbeatAt = 0;
+  /** Satellite: guards the one-time pairing handshake against a retry storm. */
+  private pairingInFlight = false;
+  /** Master-only: debounce timer for registry writes to config.json. */
+  private persistTimer: NodeJS.Timeout | null = null;
 
   private monitorTimer: NodeJS.Timeout | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
@@ -349,6 +376,20 @@ export class SwarmDispatcher {
       // The mesh key is minted once and handed to every Satellite at pairing
       // time; it authenticates all sibling traffic afterwards.
       if (!this.meshKey) this.meshKey = `mesh-${crypto.randomUUID()}`;
+      /*
+        PERSISTED, NOT REGENERATED PER BOOT — this was the "Master shows 0
+        satellites" bug. The key used to be a fresh random string on every
+        start, so each Satellite was still holding the PREVIOUS boot's key,
+        every /api/mesh/heartbeat was rejected 401, `registerSatellite` was
+        never reached, and the Master's registry stayed permanently empty.
+        It is long-lived shared state, exactly like the node code beside it,
+        so it is read from config.json first and only minted when absent.
+      */
+      if (getMeshKey() !== this.meshKey) {
+        // Written so the NEXT boot reuses this key rather than minting another.
+        saveMeshKey(this.meshKey, this.nodeCode);
+      }
+      this.restoreRegistry();
       this.masterEndpoint = selfEndpoint(localIPv4());
       this.monitorTimer = setInterval(() => void this.runMonitorCycle(), MONITOR_INTERVAL_MS);
       this.monitorTimer.unref?.();
@@ -361,7 +402,55 @@ export class SwarmDispatcher {
       console.log(
         `[Swarm] Rippa Node AI active (SATELLITE) — polling Master every ${POLL_INTERVAL_MS / 1000}s.`,
       );
+      /*
+        PAIR ON ARRIVAL, NOT ONLY WHEN ASKED.
+
+        A Satellite with a Master URL that has never completed the handshake
+        would otherwise idle forever: the poll cycle returns early when there
+        is no pairing record, and nothing else ever called `pairWithMaster`, so
+        the Master never learned the node existed. Retrying here is what turns
+        "configured to point at a Master" into "actually in the Swarm Grid".
+      */
+      void this.ensurePaired();
     }
+  }
+
+  /**
+   * Satellite: performs the one-time handshake if it has never paired.
+   *
+   * A no-op once paired, and guarded against overlapping attempts so an
+   * unreachable Master cannot stack up a request per poll interval.
+   */
+  private async ensurePaired(): Promise<void> {
+    if (this.isMaster || this.pairingInFlight) return;
+    if (getPairing()) return;
+    // Mid-setup with no Master URL saved yet — the config-change handler calls
+    // this again as soon as one exists.
+    const masterUrl = (env.MASTER_LOCAL_URL || "").trim();
+    if (!/^https?:\/\//i.test(masterUrl)) return;
+
+    this.pairingInFlight = true;
+    try {
+      await this.pairWithMaster(masterUrl);
+    } catch (error) {
+      // Expected while the Master is still booting or the LAN is not up yet;
+      // the next poll cycle tries again.
+      console.warn(
+        `[Swarm] Pairing with ${masterUrl} failed — ${
+          error instanceof Error ? error.message : String(error)
+        } (will retry)`,
+      );
+    } finally {
+      this.pairingInFlight = false;
+    }
+  }
+
+  /**
+   * Public entry point for `ensurePaired`, so a config save that introduces a
+   * Master URL triggers the handshake at once instead of a poll interval later.
+   */
+  async ensurePairedWithMaster(): Promise<void> {
+    await this.ensurePaired();
   }
 
   /** Stops the background loop. Safe to call repeatedly. */
@@ -422,7 +511,12 @@ export class SwarmDispatcher {
       throw new Error("A valid rippa_node_code is required to pair (format RIPPA-XXXX-XXXX).");
     }
     if (!this.isMaster) throw new Error("Only a Master node can register satellites.");
-    if (!this.meshKey) this.meshKey = `mesh-${crypto.randomUUID()}`;
+    if (!this.meshKey) {
+      // Same boot-order safety net as `start()`: the key must be stable across
+      // restarts, so fall back to the persisted one before minting.
+      this.meshKey = getMeshKey() || `mesh-${crypto.randomUUID()}`;
+      saveMeshKey(this.meshKey, this.nodeCode);
+    }
 
     const ip = (input.ipAddress || "").trim();
     const port = Number(input.port) || env.PORT;
@@ -457,7 +551,85 @@ export class SwarmDispatcher {
     };
     this.registry.set(nodeCode, record);
     console.log(`[Swarm] SATELLITE PAIRED: ${endpoint.nodeName} (${nodeCode}) at ${endpoint.lanUrl}`);
+    this.schedulePersist();
     return { record, meshKey: this.meshKey, masterEndpoint: this.selfEndpoint() };
+  }
+
+  /**
+   * MASTER: writes the registry to config.json, debounced.
+   *
+   * Debounced because the registry changes on every satellite heartbeat (10s
+   * each) and `writeConfig` is a synchronous full-file rewrite — doing that per
+   * heartbeat would put disk I/O on the hot path of the poll loop for no benefit.
+   * One second of coalescing turns a burst of N heartbeats into one write while
+   * still persisting promptly enough that a hard kill loses at most a heartbeat.
+   */
+  private schedulePersist(): void {
+    if (!this.isMaster || this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      this.persistRegistry();
+    }, 1_000);
+    this.persistTimer.unref?.();
+  }
+
+  /** Writes the survivable part of the registry to config.json. Best effort. */
+  private persistRegistry(): void {
+    if (!this.isMaster) return;
+    const payload: PersistedSatelliteRecord[] = [...this.registry.values()].map((record) => ({
+      nodeCode: record.nodeCode,
+      nodeName: record.nodeName,
+      endpoint: record.endpoint,
+      p2pEnabled: record.p2pEnabled,
+      completedTaskIds: record.completedTaskIds.slice(-20),
+      // Widened to a plain record because the persisted shape is untyped JSON on
+      // the way back in — see the cast in `restoreRegistry`.
+      metrics: { ...record.metrics } as Record<string, unknown>,
+    }));
+    try {
+      saveRegistry(payload);
+    } catch (error) {
+      // Losing the fleet view across a restart is recoverable; killing the
+      // heartbeat loop over a write failure is not.
+      console.warn(
+        `[Swarm] Could not persist the satellite registry — ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * MASTER: restores the registry saved by a previous run.
+   *
+   * Called at boot, before any satellite can heartbeat in. Restored nodes start
+   * as OFFLINE (their `lastSeenAt` is in the past) and flip to online on their
+   * next poll, so a node that never comes back is visibly greyed out rather
+   * than silently reported as healthy.
+   */
+  private restoreRegistry(): void {
+    if (!this.isMaster) return;
+    const saved = loadRegistry();
+    if (saved.length === 0) return;
+    for (const entry of saved) {
+      if (this.registry.has(entry.nodeCode)) continue;
+      const metrics = (entry.metrics ?? {}) as Partial<NodeMetrics>;
+      this.registry.set(entry.nodeCode, {
+        nodeCode: entry.nodeCode,
+        nodeName: entry.nodeName,
+        endpoint: entry.endpoint,
+        p2pEnabled: entry.p2pEnabled !== false,
+        // Never resurrected: a task from a previous boot is not running now.
+        currentTask: null,
+        completedTaskIds: Array.isArray(entry.completedTaskIds) ? entry.completedTaskIds : [],
+        p2pHealth: { attempts: 0, failures: 0, timeouts: 0, revoked: false },
+        // The persisted `lastSeenAt` is deliberately KEPT rather than reset to
+        // now: it is what makes a restored node render as offline until its
+        // first poll, instead of appearing healthy before it has been heard from.
+        metrics: { ...emptyMetrics(), ...metrics, lastSeenAt: metrics.lastSeenAt ?? "" },
+      });
+    }
+    console.log(`[Swarm] Restored ${this.registry.size} satellite(s) from the previous run.`);
   }
 
   /**
@@ -851,6 +1023,20 @@ export class SwarmDispatcher {
         avgEfficiency,
       },
     };
+  }
+
+  /**
+   * Every satellite this node is MESHED WITH, online or not.
+   *
+   * Feeds the `connected_satellites` field on the Mothership heartbeat.
+   * Deliberately NOT `listOnlineSatellites()`: that filters to currently-reachable
+   * nodes, so one missed poll would drop a paired satellite from the cloud's view
+   * of the fleet. Peering is a fact about the mesh, not about the last 45 seconds
+   * — an offline node is still paired, and the Control Center already renders its
+   * `online` flag separately.
+   */
+  listConnectedSatelliteCodes(): string[] {
+    return [...this.registry.values()].map((record) => record.nodeCode);
   }
 
   /** A single satellite's detail record, or null when the code is unknown. */

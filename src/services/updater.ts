@@ -335,8 +335,13 @@ export class SwarmUpdater {
    * One full cycle: poll GitHub, and on a newer release update this node and
    * broadcast to every online satellite. Never throws — a failed check must
    * leave the node running its normal tasks.
+   *
+   * @param force when true, a release that is NOT newer is applied anyway. This
+   *   is what an operator's "Force OTA Update" means: repair a node stuck on a
+   *   bad build. The unattended path leaves `force` off, so a routine hourly
+   *   check can never reinstall the version already running.
    */
-  async checkNow(): Promise<void> {
+  async checkNow(force = false): Promise<void> {
     if (this.updating) return; // an update is already in flight
     if (process.env.OTA_ENABLED === "false") {
       console.log("[Updater] Idle — disabled via OTA_ENABLED=false.");
@@ -356,11 +361,11 @@ export class SwarmUpdater {
     if (!release) return;
     this.latest = release;
 
-    if (!isVersionNewer(release.version)) {
+    if (!force && !isVersionNewer(release.version)) {
       console.log(`[Updater] Fleet is up to date (v${APP_VERSION}).`);
       return;
     }
-    if (release.version === this.lastAttempted) {
+    if (!force && release.version === this.lastAttempted) {
       console.warn(
         `[Updater] v${release.version} already attempted and did not complete — ` +
           "waiting for a newer build.",
@@ -381,6 +386,22 @@ export class SwarmUpdater {
     } finally {
       this.updating = false;
     }
+  }
+
+  /**
+   * FORCES the update pipeline: fetch the latest release, swap this node's
+   * executable, and restart.
+   *
+   * The distinction from {@link checkNow} matters. `checkNow` is the unattended
+   * hourly poll and deliberately refuses to reinstall the running build; an
+   * operator's "Force OTA Update" is a repair action and must run even when
+   * GitHub is already at this node's version — that is precisely the case where
+   * a node is stuck on a corrupt or half-swapped build and the only fix is to
+   * put the same good bytes back down.
+   */
+  async forceUpdate(): Promise<void> {
+    console.log("[Updater] FORCE UPDATE requested by the fleet controller.");
+    await this.checkNow(true);
   }
 
   /**

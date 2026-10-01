@@ -728,42 +728,9 @@ async function pushUpdate() {
 
 // --- POLLING + ACTIONS ------------------------------------------------------
 
-/** Assigns a shared task; the Master auto-provisions the sibling payloads. */
-async function assignTask() {
-  const button = $("taskRun");
-  const label = $("taskLabel");
-  const load = $("taskLoad");
-  if (!button) return;
-  button.disabled = true;
-  button.textContent = "Assigning…";
-  try {
-    const { response, data } = await api("/api/mesh/task", {
-      method: "POST",
-      body: JSON.stringify({
-        label: (label && label.value.trim()) || "Shared swarm task",
-        load: (load && load.value) || "normal",
-      }),
-    });
-    if (!response.ok || !data.success) {
-      showAlert(data.message || "Could not assign the task.", "err");
-    } else {
-      const task = data.task || {};
-      showAlert(
-        "Task assigned to " + ((task.assignees || []).length) + " node(s) — sibling endpoints auto-provisioned.",
-        "ok",
-      );
-      if (label) label.value = "";
-      await refresh();
-    }
-  } catch (err) {
-    showAlert("Assignment failed: " + err.message, "err");
-  } finally {
-    button.disabled = false;
-    button.textContent = "▶ Assign to Swarm";
-  }
-}
-
-/** Clears an adaptive P2P revocation for the node shown in the modal. */
+/**
+ * Clears an adaptive P2P revocation for the node shown in the modal.
+ */
 async function restoreP2p() {
   if (!openNodeCode) return;
   try {
@@ -778,10 +745,149 @@ async function restoreP2p() {
   }
 }
 
+// --- NODE EVENT STREAM (SSE) -------------------------------------------------
+//
+// ONE connection carries both live features this dashboard needs:
+//
+//   brain_sync    progress through a bundle load -> the Sync Status bar.
+//   admin_command a Force OTA Update / Restart -> the full-screen overlay.
+//
+// Both are things the NODE decides on a timer, not things the browser asks for,
+// so a request/response cycle cannot express either. EventSource is used rather
+// than WebSocket because the traffic is one-directional and SSE reconnects on its
+// own — which matters for the brain-sync case, where the stream has to survive a
+// 30-second silent ingest.
+
+/** The live EventSource, or null before start / after an auth failure. */
+let eventSource = null;
+/** Highest event id seen, so a reconnect replays nothing twice. */
+let lastEventId = 0;
+
+/**
+ * Opens the node event stream. Idempotent.
+ *
+ * A 401 means the dashboard session lapsed mid-life. EventSource cannot read a
+ * response status, so the failure is detected from the error event instead, and
+ * the page is sent back to the lock screen exactly as the snapshot poll does.
+ */
+function startEventStream() {
+  if (eventSource) return;
+  if (typeof EventSource === "undefined") return; // ancient browser: skip quietly
+
+  try {
+    eventSource = new EventSource("/api/system/events", { withCredentials: true });
+  } catch (err) {
+    return; // stream unsupported — the rest of the dashboard still works
+  }
+
+  eventSource.onmessage = (message) => {
+    let event;
+    try {
+      event = JSON.parse(message.data);
+    } catch (err) {
+      return; // a malformed frame must not kill the stream
+    }
+    if (typeof event.id === "number" && event.id <= lastEventId) return;
+    lastEventId = typeof event.id === "number" ? event.id : lastEventId;
+
+    if (event.kind === "brain_sync") {
+      renderBrainSync(event);
+    } else if (event.kind === "admin_command" && event.blocking) {
+      showAdminOverlay(event);
+    }
+  };
+
+  eventSource.onerror = () => {
+    // EventSource retries on its own for transient drops. The one case worth
+    // handling is an expired session, where it would otherwise retry forever
+    // against a 401 and never recover.
+    if (eventSource && eventSource.readyState === 2 /* CLOSED */) {
+      eventSource.close();
+      eventSource = null;
+    }
+  };
+}
+
+/**
+ * Paints one backend progress tick into the Sync Status panel.
+ *
+ * The percentage comes from the ingestion engine's own row counter, not from the
+ * browser's upload progress, so it tracks rows actually committed rather than
+ * bytes handed to the server. The class carries the state so the colour changes
+ * too: blue while working, green on "Parity Achieved", red on failure.
+ */
+function renderBrainSync(event) {
+  const panel = $("brainSync");
+  const bar = $("brainSyncBar");
+  const label = $("brainSyncLabel");
+  const detail = $("brainSyncDetail");
+  if (!panel || !bar) return;
+
+  const percent = Math.max(0, Math.min(100, Number(event.percent) || 0));
+  bar.style.width = percent + "%";
+
+  panel.classList.remove("done", "failed");
+  if (event.phase === "done") panel.classList.add("done");
+  else if (event.phase === "failed") panel.classList.add("failed");
+
+  if (label) {
+    label.textContent =
+      event.phase === "done"
+        ? "Parity Achieved"
+        : event.phase === "failed"
+          ? "Load Failed"
+          : event.title || "Syncing…";
+  }
+  if (detail) detail.textContent = event.detail || "";
+}
+
+/**
+ * Shows the full-screen, unclosable admin overlay.
+ *
+ * There is intentionally no dismiss path here. By the time this event is
+ * published the node has already committed: the OTA batch script is spawned (or
+ * the shutdown has begun), so a "Cancel" button would offer a control that does
+ * not exist. The overlay lifts only when the page does, which coincides with the
+ * restart it is announcing.
+ */
+function showAdminOverlay(event) {
+  const overlay = $("adminOverlay");
+  if (!overlay) return;
+  const title = $("adminOverlayTitle");
+  const detail = $("adminOverlayDetail");
+  // Prefer the node's own wording; the fallbacks exist so a command with no
+  // title still produces a specific screen rather than a blank "Working…".
+  const fallbackTitle =
+    event.command === "RESTART_NODE" ? "Restarting Node…" : "Applying OTA Update…";
+  if (title) title.textContent = event.title || fallbackTitle;
+  if (detail) {
+    detail.textContent =
+      event.detail ||
+      (event.command === "RESTART_NODE"
+        ? "The Mothership asked this node to restart."
+        : "The Mothership asked this node to update to the latest build.");
+  }
+  overlay.hidden = false;
+}
+
+/** Wires the brain panel and opens the node event stream. */
+function startNodeEvents() {
+  startEventStream();
+}
+
 // --- WIRING -----------------------------------------------------------------
 
-const runBtn = $("taskRun");
-if (runBtn) runBtn.addEventListener("click", () => void assignTask());
+/*
+  NO MANUAL TASK-ASSIGNMENT WIRING.
+
+  The "Assign to Swarm" button and its #taskLabel / #taskLoad fields have been
+  removed from both HTML pages, so this file no longer has a way — or a reason —
+  to POST /api/mesh/task. That endpoint only marks satellites busy in this node's
+  local registry; it cannot pull work off the Mothership queue. Real work arrives
+  through the priority tier of the TaskEngine, which claims and runs it with no
+  operator input. Leaving the handler wired would only be dead code pointing at
+  elements that no longer exist.
+*/
 
 const closeBtn = $("ccModalClose");
 if (closeBtn) closeBtn.addEventListener("click", closeSatellite);
@@ -833,13 +939,16 @@ if (setupBtn) {
   });
 }
 
-// Enter submits the task from the label field.
-const labelInput = $("taskLabel");
-if (labelInput) {
-  labelInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") void assignTask();
-  });
-}
+/*
+  THE "ENTER SUBMITS THE TASK" HANDLER IS GONE WITH THE FIELD IT BELONGS TO.
+
+  It bound to #taskLabel and called assignTask(). With the manual assignment UI
+  removed, #taskLabel no longer exists in either page, so `labelInput` was always
+  null and the guard silently skipped it. It is removed rather than left in place
+  because it is a live reference to a deleted function: had the element ever
+  reappeared — a cached page, a stale bundle — pressing Enter would have thrown
+  a ReferenceError inside the listener instead of assigning anything.
+*/
 
 /*
  * CONTROL CENTER STARTUP — idempotent, and called by app.js.
@@ -875,6 +984,19 @@ function startControlCenter() {
   // would be both wasteful and a way to end up with two drop handlers firing per
   // drop.
   wireBrainPanel();
+
+  /*
+    THE EVENT STREAM IS OPENED HERE, NOT AT SCRIPT LOAD.
+
+    It sits behind `requireDashboardAuth`, so opening it before the dashboard
+    exists would either 401 or — on a first-run node whose config is incomplete —
+    hold a connection open that has no session to authenticate with. Starting it
+    from the same place as the rest of the Control Center means it only ever runs
+    on a page that is already authenticated, and `startEventStream` is idempotent
+    so the repeated calls from app.js's screen transitions cannot open a second
+    connection.
+  */
+  startNodeEvents();
 
   // Polls for the life of the page; no teardown hook is needed because the
   // document is discarded wholesale when the operator navigates away.

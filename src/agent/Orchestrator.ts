@@ -9,6 +9,11 @@ import { healTask } from "../services/taskManager";
 import { startLocalAiDiscovery, type LocalAiStatus } from "../services/localAi";
 import { AutonomousForager } from "../services/autonomousForager";
 import { TaskEngine, type TaskOutcome } from "../services/taskEngine";
+import {
+  adminCommandForTaskType,
+  executePendingCommands,
+  type RemoteCommandName,
+} from "../services/heartbeat";
 
 /**
  * AUTONOMOUS AGENT ORCHESTRATOR — the composition root for the dual-tier engine.
@@ -30,6 +35,22 @@ const OTA_FIRST_CHECK_DELAY_MS = 30_000; // let boot settle before the first che
 /** The new dynamic-skill task type, and the failure signals that trigger healing. */
 const DYNAMIC_SKILL = "DYNAMIC_SKILL";
 
+/**
+ * Hooks the fleet controller supplies so an ADMIN task can actually be carried
+ * out. Kept as a constructor option rather than reaching for module state, so the
+ * orchestrator stays testable and the boot sequence in index.ts owns the wiring.
+ */
+export interface AdminCommandDeps {
+  /** Gracefully stop every service and exit so the batch script relaunches. */
+  restartNode: () => Promise<void> | void;
+  /** Fetch, verify and swap to the latest published release. */
+  forceUpdate: () => Promise<void> | void;
+  /** Reports whether mesh routing is currently enabled on this node. */
+  isP2pEnabled: () => boolean;
+  /** Enables or disables mesh routing. */
+  setP2pEnabled: (enabled: boolean) => Promise<void> | void;
+}
+
 export class Orchestrator {
   private running = false;
   private readonly scraper = new ScraperService();
@@ -46,7 +67,10 @@ export class Orchestrator {
   /** Cancels the periodic local-AI probe. */
   private stopLocalAi: (() => void) | null = null;
 
-  constructor(private readonly swarm: SwarmClient) {
+  constructor(
+    private readonly swarm: SwarmClient,
+    private readonly admin: AdminCommandDeps,
+  ) {
     this.ota = new OtaUpdater(swarm);
 
     this.forager = new AutonomousForager({
@@ -171,6 +195,24 @@ export class Orchestrator {
    * each other during exactly the handoff this engine exists to make clean.
    */
   private async handleTask(task: SwarmTask): Promise<TaskOutcome> {
+    /*
+      ADMIN COMMANDS ARE INTERCEPTED FIRST, BEFORE THE `switch` BELOW.
+
+      This is the fix for "Force OTA Update and Restart Node Service are received
+      but ignored". The Mothership sends those as ORDINARY QUEUE TASKS whose
+      `type` is `FORCE_OTA_UPDATE` / `RESTART_NODE_SERVICE`. Falling through to
+      the `default:` branch produced a logged "no handler for type" and a
+      `skipped` result — the command was seen and then thrown away, every time.
+
+      Routing them through the same executor the heartbeat's `pending_commands`
+      use means one allowlist governs every admin action, one code path runs it,
+      and the dashboard overlay is published from the same place in both cases.
+    */
+    const adminCommand = adminCommandForTaskType(task.type);
+    if (adminCommand) {
+      return this.handleAdminTask(task, adminCommand);
+    }
+
     switch (task.type) {
       // AI-generated JavaScript from the Mothership, run in the skill sandbox.
       case DYNAMIC_SKILL:
@@ -186,6 +228,61 @@ export class Orchestrator {
         // that is ignoring its assignments.
         return { status: "skipped", detail: `no handler for type "${task.type}"` };
     }
+  }
+
+  /**
+   * Carries out one admin task (force update / restart / toggle P2P).
+   *
+   * Delegates to the SAME executor the heartbeat's `pending_commands` path uses,
+   * which is what guarantees the behaviours that matter are identical either way:
+   * the allowlist gate, the once-per-id de-duplication, the operator kill-switch
+   * (`RIPPA_REMOTE_COMMANDS=false`), and the dashboard overlay published before
+   * the handler runs.
+   *
+   * The outcome is marked `reported: true` because `executePendingCommands`
+   * reports its own progress; a second generic `task_result` would contradict it.
+   * A `restart` that succeeds ends in `process.exit()`, so nothing after this
+   * returns in practice — the return exists for the case where a shutdown is
+   * suppressed and the node legitimately carries on.
+   */
+  private async handleAdminTask(
+    task: SwarmTask,
+    command: RemoteCommandName,
+  ): Promise<TaskOutcome> {
+    const args = (task.payload ?? {}) as Record<string, unknown>;
+    const requested = args["enabled"];
+    const executed = await executePendingCommands(
+      [
+        {
+          id: `task:${task.id}`,
+          command,
+          ...(typeof requested === "boolean" ? { args: { enabled: requested } } : {}),
+        },
+      ],
+      {
+        restartNode: () => this.admin.restartNode(),
+        forceUpdate: () => this.admin.forceUpdate(),
+        setP2pEnabled: (enabled) => this.admin.setP2pEnabled(enabled),
+        isP2pEnabled: () => this.admin.isP2pEnabled(),
+      },
+    );
+
+    console.log(
+      `[Orchestrator] Admin task ${task.id} (${task.type}) -> ${executed.join(", ") || "not executed"}.`,
+    );
+
+    // "not executed" means the allowlist refused it, remote commands are off via
+    // the operator kill-switch, or this exact id already ran. Reported as a
+    // failure so the Mothership's queue reflects that nothing happened rather
+    // than leaving the command pending forever.
+    return {
+      status: executed.length > 0 ? "success" : "failure",
+      detail:
+        executed.length > 0
+          ? `admin command ${command} executed`
+          : `admin command ${command} was not executed (disabled or already run)`,
+      reported: true,
+    };
   }
 
   /**

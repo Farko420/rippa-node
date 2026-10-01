@@ -104,12 +104,19 @@ async function main(): Promise<void> {
     // node's own task counters; the handlers below close the loop on commands.
     swarm.setTelemetrySources({
       connectedSatellites: () => {
-        // A Master reports the satellites it manages; a satellite reports the
-        // siblings it is currently meshed with.
-        const siblings = dispatcher.listOnlineSatellites();
-        return siblings.length > 0
-          ? siblings.map((satellite) => satellite.nodeCode)
-          : require("./config/nodeAuth").listPeers().map((peer: { nodeCode: string }) => peer.nodeCode);
+        /*
+          PEERING, NOT REACHABILITY — this is what makes the Mothership aware of
+          the fleet. `listConnectedSatelliteCodes()` reports every satellite the
+          Master has registered, whereas the previous `listOnlineSatellites()`
+          filtered to nodes seen in the last 45s: one missed poll and the cloud
+          was told the Master had no satellites at all, which reads identically
+          to never having paired any.
+        */
+        const meshed = dispatcher.listConnectedSatelliteCodes();
+        if (meshed.length > 0) return meshed;
+        // A satellite has no registry of its own, so it reports its provisioned
+        // siblings instead (see listPeers).
+        return require("./config/nodeAuth").listPeers().map((peer: { nodeCode: string }) => peer.nodeCode);
       },
       efficiency: () => {
         const metrics = dispatcher.getLocalMetrics();
@@ -119,7 +126,12 @@ async function main(): Promise<void> {
       },
       commandHandlers: {
         restartNode: () => shutdown("REMOTE_COMMAND"),
-        forceUpdate: () => swarmUpdater.checkNow(),
+        // `forceUpdate`, NOT `checkNow`. checkNow() is the unattended poll and
+        // deliberately refuses to reinstall the running build, so a "Force OTA
+        // Update" that arrived on a node already at the latest version logged
+        // "up to date" and did nothing — received and ignored, which is exactly
+        // the reported symptom. forceUpdate() bypasses that check.
+        forceUpdate: () => swarmUpdater.forceUpdate(),
         setP2pEnabled: async (enabled: boolean) => {
           // Persisted through nodeAuth so the choice survives a restart.
           require("./config/nodeAuth").setP2pEnabled(enabled);
@@ -135,13 +147,35 @@ async function main(): Promise<void> {
     // knowledge current. Master-only; a no-op until a bundle has been loaded.
     brainDeltaSync = new BrainDeltaSync(swarm);
     brainDeltaSync.start();
-    orchestrator = new Orchestrator(swarm);
+    /*
+      THE ADMIN HOOKS ARE THE *SAME OBJECTS* the heartbeat's command handlers
+      use, not a second copy. Admin work arrives on two channels — a
+      `pending_commands` entry on the heartbeat, and an ordinary queue task
+      whose type is FORCE_OTA_UPDATE / RESTART_NODE_SERVICE — and both must do
+      the same thing. Sharing one object means a fix applied to one path (say,
+      forceUpdate bypassing the "already latest" check) applies to both.
+    */
+    orchestrator = new Orchestrator(swarm, {
+      restartNode: () => shutdown("REMOTE_COMMAND"),
+      forceUpdate: () => swarmUpdater.forceUpdate(),
+      setP2pEnabled: (enabled: boolean) => {
+        require("./config/nodeAuth").setP2pEnabled(enabled);
+      },
+      isP2pEnabled: () => require("./config/nodeAuth").p2pEnabled(),
+    });
     orchestrator.start();
 
     // A Master advertises itself on the LAN so satellite nodes can find it
     // without a hand-typed IP. Satellites never broadcast.
     if (shouldAdvertise(env.NODE_ROLE)) {
-      void beacon.start(env.NODE_NAME, env.PORT);
+      /*
+        THE NODE CODE IS ADVERTISED TOO, not just the name and address. It is
+        what makes "enter this Master's code on the Satellite" a working
+        instruction: the code is the only stable identity a Master has across a
+        DHCP lease change or a renamed PC, and a beacon without it could only be
+        resolved by IP.
+      */
+      void beacon.start(env.NODE_NAME, env.PORT, dispatcher.nodeCode);
     } else {
       beacon.stop();
     }
@@ -186,6 +220,16 @@ async function main(): Promise<void> {
     // The dispatcher reads NODE_ROLE, so a role change must restart it with the
     // new mode (Master monitor loop vs. Satellite poll loop).
     dispatcher.start();
+    /*
+      PAIR IMMEDIATELY IF A MASTER URL WAS JUST SAVED.
+
+      Without this, pairing only happened on the satellite's own boot, so an
+      operator who configured the Master URL and clicked Save saw a node that
+      looked configured but did not appear in the Master's Swarm Grid for up to
+      a full poll cycle — and if the node had already booted, not at all until
+      the next restart. `ensurePaired` is a no-op when already paired.
+    */
+    void dispatcher.ensurePairedWithMaster();
     swarmUpdater.start();
     console.log("[Boot] Re-initialization complete.");
   });

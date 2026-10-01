@@ -6,6 +6,11 @@
  * values, and the sync cursor. Then it exercises the safety guards.
  *
  * Not part of the shipped app.
+ *
+ * The body is wrapped in an async IIFE because `ingestBrainBundle` returns a
+ * promise: it yields to the event loop between chunks so it can publish live
+ * progress to the dashboard (see `yieldToEventLoop` in brainIngest). Top-level
+ * await is unavailable here — this file runs as CommonJS under tsx.
  */
 import fs from "node:fs";
 import { initializeDeepBrain, closeDeepBrain, getDeepBrain } from "../src/db/database";
@@ -25,6 +30,7 @@ if (!BUNDLE_PATH) {
 
 const raw = JSON.parse(fs.readFileSync(BUNDLE_PATH, "utf8"));
 
+async function main(): Promise<void> {
 // --- 1. The cloud's bundle must satisfy the node's stricter validator -------
 const checked = validateBundle(raw);
 check("cloud bundle passes the node's validator", checked.ok, checked.ok ? "" : checked.error);
@@ -34,7 +40,7 @@ if (!checked.ok) process.exit(1);
 initializeDeepBrain();
 const db = getDeepBrain();
 
-const result = ingestBrainBundle(raw);
+const result = await ingestBrainBundle(raw);
 check("ingest succeeded", result.ok, result.message);
 check("places ingested", result.counts.places === 3, `${result.counts.places}`);
 check("categories ingested", result.counts.categories === 2, `${result.counts.categories}`);
@@ -89,33 +95,33 @@ check("sync cursor equals the bundle's exported_at",
   cursor === raw.exported_at, `cursor=${cursor} bundle=${raw.exported_at}`);
 
 // --- 5. Idempotency: re-uploading the same bundle must not duplicate --------
-const again = ingestBrainBundle(raw);
+const again = await ingestBrainBundle(raw);
 check("re-upload is idempotent (INSERT OR REPLACE)",
   again.ok && again.counts.places === 3, `places=${again.counts.places}`);
 check("row count unchanged after re-upload",
   (db.prepare("SELECT COUNT(*) AS n FROM brain_places").get() as { n: number }).n === 3);
 // --- 6. Guards -------------------------------------------------------------
-const empty = ingestBrainBundle({ ...raw, places: [] });
+const empty = await ingestBrainBundle({ ...raw, places: [] });
 check("refuses a bundle with no places (would wipe the brain)", !empty.ok, empty.message.slice(0, 60));
 
 const stale = { ...raw, exported_at: new Date(Date.parse(raw.exported_at) - 86_400_000).toISOString() };
-const staleResult = ingestBrainBundle(stale);
+const staleResult = await ingestBrainBundle(stale);
 check("refuses an older bundle without force", !staleResult.ok, staleResult.message.slice(0, 60));
-const forced = ingestBrainBundle(stale, { force: true });
+const forced = await ingestBrainBundle(stale, { force: true });
 check("loads an older bundle WITH force", forced.ok, forced.message.slice(0, 40));
-ingestBrainBundle(raw, { force: true }); // restore the newest cursor
+await ingestBrainBundle(raw, { force: true }); // restore the newest cursor
 
-const wrongFormat = ingestBrainBundle({ ...raw, format: "RIPPA_BRAIN_BUNDLE_V2" });
+const wrongFormat = await ingestBrainBundle({ ...raw, format: "RIPPA_BRAIN_BUNDLE_V2" });
 check("refuses an unknown format tag (V2 half-understood)", !wrongFormat.ok, wrongFormat.message.slice(0, 60));
 
-const notJson = ingestBrainBundle("just a string");
+const notJson = await ingestBrainBundle("just a string");
 check("refuses a non-object payload", !notJson.ok, notJson.message.slice(0, 40));
 
-const notArray = ingestBrainBundle({ ...raw, places: { nope: true } });
+const notArray = await ingestBrainBundle({ ...raw, places: { nope: true } });
 check("refuses a non-array collection", !notArray.ok, notArray.message.slice(0, 50));
 
 // A malformed row mid-bundle must be skipped, not fatal, and must be reported.
-const withBadRow = ingestBrainBundle({
+const withBadRow = await ingestBrainBundle({
   ...raw,
   places: [...raw.places, { id: "", name: "No id" }, { id: "place-9", name: "   " }],
 });
@@ -126,7 +132,7 @@ check("reports the skipped rows as warnings", withBadRow.warnings.length >= 2,
 
 // --- 7. Atomicity: a refused upload must leave the brain untouched ----------
 const before = getBrainCounts().places;
-ingestBrainBundle({ ...raw, places: "not an array" });
+await ingestBrainBundle({ ...raw, places: "not an array" });
 check("a rejected upload changed nothing", getBrainCounts().places === before,
   `${before} -> ${getBrainCounts().places}`);
 
@@ -135,3 +141,7 @@ closeDeepBrain();
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed.`);
 process.exit(failed.length ? 1 : 0);
+}
+
+// See the header: top-level await is unavailable in this CommonJS script.
+void main();
