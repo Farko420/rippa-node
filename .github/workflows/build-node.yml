@@ -40,11 +40,13 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          # PINNED, not floating. better-sqlite3 is a native addon: install either
-          # resolves a prebuilt binary for the running ABI or falls back to
-          # node-gyp, which needs a full MSVC toolchain and failed the job on
-          # Node 22. Pinning the major keeps the ABI the prebuilds ship for.
-          node-version: 20
+          # PINNED, not floating, and 22 is the floor, not a preference:
+          # better-sqlite3@13 declares `engines.node >= 22`, so a Node 20 runner
+          # is an unsupported combination and npm only warns (EBADENGINE) about
+          # it. This is also the exact runtime scripts/package.mjs freezes into
+          # the .exe (`pkg --targets node22-win-x64`), so the build host and the
+          # shipped binary now agree instead of silently drifting apart.
+          node-version: 22
           cache: npm
 
       # npm ci is preferred over npm install for reproducibility, but it fails
@@ -280,12 +282,17 @@ jobs:
         with:
           # Same pin as the .exe job — the APK build runs `npm ci` for the root
           # workspace too, so the root better-sqlite3 native addon is resolved
-          # under the same ABI in both jobs.
-          node-version: 20
+          # under the same, supported Node in both jobs.
+          node-version: 22
           cache: npm
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # NO setup-android step on purpose. The ubuntu-latest image already ships
+      # the Android SDK and exports ANDROID_HOME/ANDROID_SDK_ROOT, and Capacitor's
+      # Gradle build resolves the SDK from those variables on its own. Pulling in
+      # android-actions/setup-android only added a crash point (and a slow SDK
+      # re-download) for no benefit, so it was removed. If Gradle ever needs a
+      # component the image lacks, install it explicitly with sdkmanager rather
+      # than reintroducing the whole action.
 
       # Gradle's own cache. Without it every build downloads the full Android
       # toolchain and dependencies from scratch, taking most of the job's time.
