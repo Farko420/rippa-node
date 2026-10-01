@@ -2,6 +2,7 @@ import { exec } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { config as loadDotenv } from "dotenv";
+import { ensureDataDir, resolveInstallDir } from "../utils/paths";
 // TYPE-ONLY import: erased at compile time, so this creates no runtime cycle
 // even though `nodeAuth` imports this module for its fs/validation helpers.
 import type { PeerEndpoint } from "./nodeAuth";
@@ -104,61 +105,31 @@ function isPackaged(): boolean {
 }
 
 /**
- * Walks up from `start` looking for the project root (the folder holding
- * package.json). Bounded to 8 levels so a symlinked/odd layout can never loop
- * forever. Returns "" when nothing is found.
- */
-function findProjectRoot(start: string): string {
-  let dir = start;
-  for (let i = 0; i < 8; i += 1) {
-    try {
-      if (fs.existsSync(path.join(dir, "package.json"))) return dir;
-    } catch {
-      /* unreadable dir — keep walking up */
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return "";
-}
-
-/**
  * ROOT DIRECTORY THAT HOLDS `config.json`.
  *
- * CRITICAL (pkg): `__dirname` is NOT usable to locate a writable config file
- * inside a `pkg` executable — it points into the read-only virtual snapshot
- * filesystem bundled into the exe, so reads/writes there either fail or land
- * somewhere that vanishes on the next build. The packaged path is therefore
- * derived from `process.execPath` (the real .exe on disk) so `config.json` is
- * always written right next to `rippa-node.exe`, which is the only location
- * that survives an app update and is the folder the user copies between PCs.
+ * This is the OS PERSISTENT data directory, NOT the executable's folder. It used
+ * to be `path.dirname(process.execPath)`, which meant an OTA update — the node
+ * replaces its own .exe in place — wiped the operator's config, node code, mesh
+ * key, pairing record and dashboard passkey on every single deploy. The folder
+ * beside the exe is now used only for read-only bundled assets (`public/`) and
+ * as the migration source in `utils/paths.migrateLegacyData`.
  *
  * Resolution order:
  *   1. `RIPPA_CONFIG_ROOT` — explicit override (tests / custom deployments).
- *   2. pkg executable       — `path.dirname(process.execPath)`.
- *   3. dev / `node dist/…`  — `process.cwd()`, refined by walking up to the
- *      folder containing package.json so `node dist/index.js` still finds the
- *      project config when launched from a subdirectory.
+ *   2. `RIPPA_DATA_DIR`     — explicit persistent-dir override.
+ *   3. `%LOCALAPPDATA%\RippaNode` on Windows, `~/.rippa-node` elsewhere.
+ *
+ * The directory is created here (recursively) on every call, so a first boot
+ * on a clean machine has somewhere to write before anything else runs.
  */
 export function resolveAppRoot(): string {
   const override = process.env.RIPPA_CONFIG_ROOT;
   if (override && override.trim()) {
-    return path.resolve(override.trim());
+    const dir = path.resolve(override.trim());
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
   }
-
-  const isPkg = isPackaged();
-  const basePath = isPkg ? path.dirname(process.execPath) : process.cwd();
-
-  if (isPkg) {
-    // Already correct for the portable-app layout: config.json lives beside
-    // the .exe. No further walking — a parent folder would be wrong.
-    return basePath;
-  }
-
-  // Dev: prefer the project root so config.json is not duplicated per folder.
-  // If cwd already is the project root, findProjectRoot returns it unchanged.
-  return findProjectRoot(basePath) || basePath;
+  return ensureDataDir();
 }
 
 /** Absolute path of `config.json` for the given (or resolved) root. */
@@ -531,7 +502,10 @@ export function validateConfigInput(
 export function resolvePublicDir(): string | null {
   const candidates: string[] = [];
   try {
-    candidates.push(path.join(resolveAppRoot(), "public"));
+    // Read-only bundled assets still belong beside the EXECUTABLE (that is
+    // where packaging stages the fallback copy), so this deliberately uses the
+    // install dir rather than the persistent data dir.
+    candidates.push(path.join(resolveInstallDir(), "public"));
   } catch {
     /* ignore */
   }

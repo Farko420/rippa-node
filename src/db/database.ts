@@ -1,20 +1,37 @@
 import "../pkgNativeShim"; // must load before better-sqlite3 (packaged-exe native addon hook)
 import Database from "better-sqlite3";
+import fs from "node:fs";
 import path from "node:path";
 import { env } from "../config";
 import { resolveAppRoot } from "../config/configManager";
+import { ensureDataDir } from "../utils/paths";
 
 /**
  * THE DEEP BRAIN — local SQLite knowledge store.
  *
  * Master-only: satellites are stateless and never touch this file.
- * The database lives at `<app-root>/local_knowledge.db` — the project folder
- * in dev, or next to `rippa-node.exe` when packaged (the exe's virtual
- * filesystem is read-only, so it must never be created inside the snapshot).
+ * The database lives in the OS PERSISTENT data directory (`%LOCALAPPDATA%\
+ * RippaNode` on Windows, `~/.rippa-node` elsewhere) — never next to the
+ * executable, because the OTA updater replaces the .exe in place and anything
+ * written there is destroyed by every update.
  */
 
 const DB_FILENAME = "local_knowledge.db";
-const DB_PATH = path.join(resolveAppRoot(), DB_FILENAME);
+
+/**
+ * Resolved lazily, NOT at module load: `initializeDeepBrain()` runs long after
+ * boot has migrated any legacy database across, so a module-level constant
+ * would freeze the pre-migration location.
+ */
+function resolveDbPath(): string {
+  const dir = ensureDataDir();
+  try {
+    fs.mkdirSync(path.dirname(path.join(dir, DB_FILENAME)), { recursive: true });
+  } catch {
+    /* ensureDataDir already created it; a failure here surfaces on open */
+  }
+  return path.join(resolveAppRoot(), DB_FILENAME);
+}
 
 export interface RawLoreRow {
   id: number;
@@ -191,7 +208,10 @@ export function initializeDeepBrain(): Database.Database | null {
     return instance;
   }
 
-  instance = new Database(DB_PATH);
+  // Explicit absolute path into the persistent data directory — SQLite will
+  // not create the file's parent folder on its own, so it must already exist.
+  const dbPath = resolveDbPath();
+  instance = new Database(dbPath);
   instance.pragma("journal_mode = WAL");
   instance.exec(TABLES_SQL);
 
@@ -213,7 +233,7 @@ export function initializeDeepBrain(): Database.Database | null {
 
   instance.exec(INDEXES_SQL);
 
-  console.log(`[Deep Brain] Initialized at ${DB_PATH}`);
+  console.log(`[Deep Brain] Initialized at ${dbPath}`);
   return instance;
 }
 

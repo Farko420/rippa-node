@@ -1,4 +1,5 @@
 import { ensureConfiguration, isConfigComplete, openDashboard } from "./config/configManager";
+import { ensureDataDir, migrateLegacyData } from "./utils/paths";
 import { APP_VERSION } from "./version";
 import { startVitalsSampler } from "./services/telemetry";
 import { describeRuntime, supportsBrowserScraping } from "./platform";
@@ -20,7 +21,16 @@ import { describeRuntime, supportsBrowserScraping } from "./platform";
  * POST /api/system/config re-initializes services with the new parameters.
  */
 async function main(): Promise<void> {
-  // --- 0. Non-blocking config load (GUI collects settings when missing) ---
+  // --- 0a. Persistent storage, BEFORE anything reads or writes user data -----
+  // The OTA updater replaces rippa-node.exe in place, so any file written beside
+  // it is lost on every update. Data now lives in the OS app-data directory;
+  // this step rescues the files older builds left next to the executable so an
+  // existing node keeps its config, node code, mesh key and Deep Brain.
+  const dataDir = ensureDataDir();
+  console.log(`[Boot] Persistent data directory: ${dataDir}`);
+  migrateLegacyData();
+
+  // --- 0b. Non-blocking config load (GUI collects settings when missing) ---
   const boot = await ensureConfiguration();
 
   // Loaded via require() INSIDE main() so config above always applies first.
