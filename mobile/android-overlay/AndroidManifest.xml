@@ -12,6 +12,14 @@
 
     INTERNET              the whole point — Mothership and Master traffic.
     ACCESS_NETWORK_STATE  required before Android grants INTERNET on API 28+.
+    BATTERY_STATS         requested for parity with the power-awareness feature.
+                           HONEST CAVEAT, since it reads as load-bearing and is
+                           not: it is a signature|privileged permission that is
+                           NEVER granted to a sideloaded app, so declaring it
+                           changes nothing at runtime. The battery reading itself
+                           comes from ACTION_BATTERY_CHANGED via
+                           @capacitor/device's getBatteryInfo(), which needs no
+                           permission at all. It is declared, not relied upon.
     WAKE_LOCK             keeps the CPU on with the screen off. Without it the
                            device sleeps between fetches and the node silently
                            stops mid-run around 11pm.
@@ -42,6 +50,7 @@
 
   <uses-permission android:name="android.permission.INTERNET" />
   <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+  <uses-permission android:name="android.permission.BATTERY_STATS" />
   <uses-permission android:name="android.permission.WAKE_LOCK" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
@@ -50,7 +59,6 @@
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
   <application
-      android:name="com.rippaadventures.node.RippaNodeApplication"
       android:allowBackup="true"
       android:icon="@mipmap/ic_launcher"
       android:label="@string/app_name"
@@ -58,6 +66,33 @@
       android:supportsRtl="true"
       android:theme="@style/AppTheme"
       android:usesCleartextTraffic="true">
+
+    <!--
+      NO `android:name` ON THE <application> TAG. DO NOT ADD ONE.
+
+      This used to read `android:name="com.rippaadventures.node.RippaNodeApplication"`
+      and THAT IS WHY THE APK CRASHED INSTANTLY ON EVERY LAUNCH.
+
+      Android instantiates the Application class in ActivityThread.handleBindApplication,
+      BEFORE any Activity is created, before the WebView exists and before the
+      package's data directory is populated. Naming a class that is not in the APK
+      therefore kills the process at the earliest possible moment, with:
+
+        java.lang.RuntimeException: Unable to create application
+          com.rippaadventures.node.RippaNodeApplication: ClassNotFoundException
+
+      No <uses-permission> can prevent or fix that — the app never reaches the point
+      where a permission is consulted. The diagnostic signature is exactly what was
+      reported: instant crash, zero bytes of Data/Cache, because /data/data/<pkg>
+      is never created.
+
+      Nothing needs a custom Application class here. Capacitor's BridgeActivity
+      builds the bridge and registers plugins itself (RippaNodePlugin via
+      @CapacitorPlugin, the Device plugin via cap sync), so the default
+      android.app.Application is correct. `scripts/package-apk.mjs` now fails the
+      build if this overlay ever names a component class that is not actually
+      staged, so this cannot silently come back.
+    -->
 
     <!--
       THE LAUNCHER ACTIVITY. THE REASON THIS APK HAD NO APP-DRAWER ICON.

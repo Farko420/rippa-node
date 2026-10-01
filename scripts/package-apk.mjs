@@ -374,22 +374,25 @@ if (!fs.existsSync(androidDir)) {
 }
 
 /*
-  SYNC THE WEB ASSETS IN — THIS STEP IS NOT OPTIONAL.
+  `cap sync` — NOT `cap copy`, and the difference is load-bearing.
 
-  `cap add android` is a ONE-TIME scaffolding step. It runs only when `android/`
-  is missing, and it writes its own placeholder `index.html` into the app's
-  assets. Nothing in this script ever pushes `mobile/www/` across afterwards, so
-  Gradle dutifully packages whatever was staged the first time `cap add` ran —
-  which is how a build can report success while shipping a worker.js from weeks
-  ago. That failure is invisible: the APK installs, the launcher icon is there,
-  and the node simply runs an old bundle (or an empty page) forever.
+  `cap copy` only moves `webDir` into `app/src/main/assets/public/`. `cap sync`
+  is `copy` PLUS `update`, and `update` is what actually wires NATIVE PLUGINS:
+  it writes `app/src/main/assets/capacitor.plugins.json` and regenerates
+  `app/capacitor.build.gradle` with the plugin projects on its dependencies.
 
-  `cap copy` is what moves `webDir` into `app/src/main/assets/public/`. It is
-  cheap, idempotent, and must run on EVERY build, not just the first.
+  With `cap copy` alone, this project shipped `capacitor.plugins.json` = `[]` and
+  an EMPTY dependencies block in capacitor.build.gradle — i.e. `@capacitor/device`
+  was installed in mobile/node_modules but was NOT IN THE APK AT ALL. The app
+  booted fine and simply reported `source: "unavailable"` forever, because the
+  bridge had no Device plugin to talk to. A silent capability loss, not an error.
+
+  So: sync on every build, then VERIFY the plugin registry below rather than
+  trusting the exit code.
 */
 const npxCap = isWindows ? "npx.cmd" : "npx";
-if (!tryRun(npxCap, ["cap", "copy", "android"], { cwd: mobileDir, ...shellOpts })) {
-  console.error("[APK] `npx cap copy android` failed — the APK would ship stale web assets.");
+if (!tryRun(npxCap, ["cap", "sync", "android"], { cwd: mobileDir, ...shellOpts })) {
+  console.error("[APK] `npx cap sync android` failed — the APK would ship stale web assets.");
   process.exit(1);
 }
 
@@ -424,6 +427,49 @@ for (const [staged, packaged] of [
 console.log("[APK] Synced and verified the web assets in the Android project.");
 
 /*
+  ...AND VERIFY THE PLUGIN REGISTRY IS NOT EMPTY.
+
+  `cap sync` writes `app/src/main/assets/capacitor.plugins.json`. An empty `[]`
+  means no native plugin was linked, which is precisely the state that shipped
+  before: the app launches and runs perfectly, while every battery reading comes
+  back `source: "unavailable"` because the bridge has no Device plugin behind it.
+  That is a capability regression with no error message anywhere, so it is
+  asserted here instead of discovered on a tablet at 2am.
+*/
+const pluginsJson = path.join(
+  androidDir,
+  "app",
+  "src",
+  "main",
+  "assets",
+  "capacitor.plugins.json",
+);
+let pluginNames = [];
+try {
+  const parsed = JSON.parse(fs.readFileSync(pluginsJson, "utf8"));
+  // Capacitor 6 writes a FLAT ARRAY of {pkg, classpath}; earlier majors wrote an
+  // object keyed by plugin name. Both shapes are handled so this check does not
+  // become a version tripwire.
+  const entries = Array.isArray(parsed)
+    ? parsed.map((entry) => entry?.classpath ?? "")
+    : Object.keys(parsed?.plugins ?? {});
+  pluginNames = entries.filter(Boolean).map((entry) => entry.split(".").pop());
+} catch (error) {
+  console.error(`[APK] Could not read ${pluginsJson}: ${error.message}`);
+  process.exit(1);
+}
+if (!pluginNames.includes("DevicePlugin")) {
+  console.error(
+    `[APK] The Device plugin was not synced (registered: ${pluginNames.join(", ") || "none"}).\n` +
+      "       @capacitor/device is what reports battery level while the screen is\n" +
+      "       off. Without it the node runs, but blind. Check mobile/package.json\n" +
+      "       and that `cap sync` (not `cap copy`) is running.",
+  );
+  process.exit(1);
+}
+console.log(`[APK] Capacitor plugins registered: ${pluginNames.join(", ")}`);
+
+/*
   THE OVERLAY IS APPLIED AFTER GENERATION, ALWAYS.
 
   Capacitor regenerates AndroidManifest.xml from its own template, so patching it
@@ -449,7 +495,56 @@ fs.mkdirSync(javaTarget, { recursive: true });
 for (const file of ["RippaNodeService.java", "RippaNodePlugin.java", "RippaNodeBootReceiver.java"]) {
   fs.copyFileSync(path.join(overlayDir, file), path.join(javaTarget, file));
 }
+
+/** The application id, taken from the single source of truth for it. */
+const manifestAppPackage = JSON.parse(
+  fs.readFileSync(path.join(mobileDir, "capacitor.config.json"), "utf8"),
+).appId;
 console.log("[APK] Installed the native service, plugin and boot receiver.");
+
+/*
+  EVERY CLASS THIS OVERLAY NAMES MUST ACTUALLY EXIST. CHECKED, NOT ASSUMED.
+
+  This is the guard for the crash that shipped as "instant native crash on
+  launch, 0 bytes of Data/Cache". The overlay declared
+  `android:name="com.rippaadventures.node.RippaNodeApplication"`, no such class
+  existed in ANY toolchain output, and Android killed the process in
+  handleBindApplication before it ever reached a WebView.
+
+  Gradle cannot catch it. A missing Application class is not a compile error and
+  not a manifest-merger error — the manifest is perfectly valid and the merger
+  is perfectly happy. The APK builds, installs, and dies on tap. Worse, the
+  failure is invisible until someone installs it on a physical device, which is
+  exactly how it reached a tablet.
+
+  So the component classes the overlay wires up are resolved here, against the
+  real staged .java files, at build time. `MainActivity` is the one legitimate
+  exception: it is generated by `cap add android` into the app's own source set,
+  not shipped in the overlay.
+*/
+const overlaySource = fs.readFileSync(path.join(overlayDir, "AndroidManifest.xml"), "utf8");
+const declaredComponents = [...overlaySource.matchAll(/android:name="(\.[A-Za-z0-9_]+)"/g)].map(
+  (match) => `${manifestAppPackage}.${match[1].slice(1)}`,
+);
+for (const className of declaredComponents) {
+  if (className === `${manifestAppPackage}.MainActivity`) continue;
+  const simple = className.slice(className.lastIndexOf(".") + 1);
+  const staged = fs
+    .readdirSync(javaTarget)
+    .some((file) => file === `${simple}.java`);
+  if (!staged) {
+    console.error(
+      `[APK] The manifest names ${className} but no ${simple}.java is staged.\n` +
+        "       Android instantiates these before the WebView exists, so a missing\n" +
+        "       one is an instant crash on launch with no build-time error at all.\n" +
+        `       Add the class to ${path.relative(root, overlayDir)}/ or stop naming it.`,
+    );
+    process.exit(1);
+  }
+}
+console.log(
+  `[APK] Verified ${declaredComponents.length} manifest component class(es) exist.`,
+);
 
 // --- 5. Gradle ---------------------------------------------------------------
 if (skipGradle) {

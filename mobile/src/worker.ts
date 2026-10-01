@@ -476,42 +476,71 @@ function installTimers(): void {
  * the tablet in needs no interaction.
  */
 export async function checkPower(): Promise<void> {
-  const limits = normaliseLimits(config.powerLimits);
-  powerSnapshot = await readPowerSnapshot();
-  const verdict = evaluatePower(powerSnapshot, limits);
+  /*
+    FAIL OPEN, AND NEVER THROW OUT OF HERE.
 
-  // --- SUSPEND -------------------------------------------------------------
-  if (!verdict.allowed && !powerSuspended) {
-    powerSuspended = true;
-    powerReason = verdict.reason;
-    for (const timer of timers) window.clearInterval(timer);
-    timers = [];
-    satelliteWorker.setSuspended(true);
-    log(`Swarm dispatcher suspended. ${verdict.reason}`);
-    publish({ type: "power", suspended: true, reason: powerReason, power: powerStatus() });
-    return;
-  }
+    `startWorker()` awaits this BEFORE it starts any poller, so anything that
+    escapes it does not just lose power awareness — it aborts the boot sequence
+    entirely and the tablet shows a dead node.
 
-  // --- RESUME --------------------------------------------------------------
-  if (verdict.allowed && powerSuspended) {
-    powerSuspended = false;
-    powerReason = "";
-    satelliteWorker.setSuspended(false);
-    log("Swarm dispatcher resumed — power limits satisfied.");
-    publish({ type: "power", suspended: false, reason: "", power: powerStatus() });
-  }
+    The readers in DevicePower.ts already swallow their own failures (both the
+    Capacitor bridge call and navigator.getBattery()), so in practice this catch
+    should never fire. It is here because "should never fire" is not a guarantee
+    a 24/7 unattended device gets to rely on: a plugin that rejects, a bridge
+    that throws during teardown, or a future reader added without a try/catch
+    would all take the whole worker down with it.
 
-  // --- THROTTLE ------------------------------------------------------------
-  const factor = throttleFactor(powerSnapshot, limits);
-  if (factor !== powerThrottle) {
-    powerThrottle = factor;
-    // Only meaningful while running; a suspended worker has no timers to rebuild.
-    if (!powerSuspended) installTimers();
-    log(
-      factor === 1
-        ? "Polling back to normal frequency."
-        : `Polling throttled ${factor}x to conserve battery.`,
-    );
+    A lost power check must degrade to "no limits enforced", never to "no node".
+  */
+  try {
+    const limits = normaliseLimits(config.powerLimits);
+    powerSnapshot = await readPowerSnapshot();
+    const verdict = evaluatePower(powerSnapshot, limits);
+
+    // --- SUSPEND -------------------------------------------------------------
+    if (!verdict.allowed && !powerSuspended) {
+      powerSuspended = true;
+      powerReason = verdict.reason;
+      for (const timer of timers) window.clearInterval(timer);
+      timers = [];
+      satelliteWorker.setSuspended(true);
+      log(`Swarm dispatcher suspended. ${verdict.reason}`);
+      publish({ type: "power", suspended: true, reason: powerReason, power: powerStatus() });
+      return;
+    }
+
+    // --- RESUME --------------------------------------------------------------
+    if (verdict.allowed && powerSuspended) {
+      powerSuspended = false;
+      powerReason = "";
+      satelliteWorker.setSuspended(false);
+      log("Swarm dispatcher resumed — power limits satisfied.");
+      publish({ type: "power", suspended: false, reason: "", power: powerStatus() });
+    }
+
+    // --- THROTTLE ------------------------------------------------------------
+    const factor = throttleFactor(powerSnapshot, limits);
+    if (factor !== powerThrottle) {
+      powerThrottle = factor;
+      // Only meaningful while running; a suspended worker has no timers to rebuild.
+      if (!powerSuspended) installTimers();
+      log(
+        factor === 1
+          ? "Polling back to normal frequency."
+          : `Polling throttled ${factor}x to conserve battery.`,
+      );
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    log(`Power check failed (${detail}) — continuing with no power limits.`);
+
+    // Recover the suspended state explicitly: if the node was already paused for
+    // a low battery we cannot re-read, we stay paused (a suspended node is safe
+    // and will be re-checked on the next tick), but the UI is told why it is
+    // quiet rather than being left showing a stale reason.
+    if (powerSuspended) {
+      publish({ type: "power", suspended: true, reason: powerReason, power: powerStatus() });
+    }
   }
 }
 
