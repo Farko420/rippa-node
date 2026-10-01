@@ -523,6 +523,44 @@ console.log("[APK] Installed the native service, plugin and boot receiver.");
   not shipped in the overlay.
 */
 const overlaySource = fs.readFileSync(path.join(overlayDir, "AndroidManifest.xml"), "utf8");
+
+/*
+  AND NO PRIVILEGED/SIGNATURE PERMISSIONS AT ALL. CHECKED, NOT ASSUMED.
+
+  `android.permission.BATTERY_STATS` was declared in the overlay purely "for
+  parity with the power-awareness feature". It is a signature|privileged
+  permission, so a sideloaded APK is never granted it — the declaration was
+  inert by construction — and carrying a privileged permission the app cannot
+  hold is what produced the reported fatal `SecurityException` at launch
+  ("Something went wrong with Rippa Node").
+
+  Nothing needs it: @capacitor/device reads the battery via
+  ACTION_BATTERY_CHANGED, a broadcast any app may observe with zero permissions.
+
+  This is checked because the failure is invisible to every other tool in the
+  chain. The manifest stays valid, the merger stays happy, Gradle exits 0, and
+  the APK only reveals itself on a physical device as an instant crash on tap —
+  precisely the class of bug that already cost this project one tablet.
+
+  `FOREGROUND_SERVICE` and the typed `FOREGROUND_SERVICE_*` permissions are
+  deliberately NOT matched here: those are normal, requestable permissions and
+  the service genuinely needs them.
+*/
+const forbiddenPermissions = ["android.permission.BATTERY_STATS"];
+for (const permission of forbiddenPermissions) {
+  if (overlaySource.includes(`android:name="${permission}"`)) {
+    console.error(
+      `[APK] The manifest declares ${permission}, which was removed on purpose.\n` +
+        "       It is a signature|privileged permission that a sideloaded APK is\n" +
+        "       never granted, and declaring it crashes the app at launch. Battery\n" +
+        "       reporting comes from ACTION_BATTERY_CHANGED via @capacitor/device\n" +
+        "       and needs no permission. Remove the <uses-permission> line from\n" +
+        `       ${path.relative(root, overlayDir)}/AndroidManifest.xml.`,
+    );
+    process.exit(1);
+  }
+}
+
 const declaredComponents = [...overlaySource.matchAll(/android:name="(\.[A-Za-z0-9_]+)"/g)].map(
   (match) => `${manifestAppPackage}.${match[1].slice(1)}`,
 );
