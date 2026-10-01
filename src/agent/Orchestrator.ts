@@ -43,12 +43,24 @@ const DYNAMIC_SKILL = "DYNAMIC_SKILL";
 export interface AdminCommandDeps {
   /** Gracefully stop every service and exit so the batch script relaunches. */
   restartNode: () => Promise<void> | void;
-  /** Fetch, verify and swap to the latest published release. */
-  forceUpdate: () => Promise<void> | void;
+  /**
+   * Fetch, verify and swap to the latest published release.
+   *
+   * @returns true when a swap is committed (the process is about to exit). The
+   *          boolean is only observable on paths that do NOT exit, but it is
+   *          what lets the caller report a refused update honestly instead of
+   *          claiming a restart that never happened.
+   */
+  forceUpdate: () => Promise<boolean> | boolean | void;
   /** Reports whether mesh routing is currently enabled on this node. */
   isP2pEnabled: () => boolean;
   /** Enables or disables mesh routing. */
   setP2pEnabled: (enabled: boolean) => Promise<void> | void;
+  /**
+   * Reports an admin command back to the Mothership before it is carried out.
+   * Optional so a host with no uplink can omit it entirely.
+   */
+  acknowledgeCommand?: (command: RemoteCommandName, detail: string) => Promise<void> | void;
 }
 
 export class Orchestrator {
@@ -236,14 +248,21 @@ export class Orchestrator {
    * Delegates to the SAME executor the heartbeat's `pending_commands` path uses,
    * which is what guarantees the behaviours that matter are identical either way:
    * the allowlist gate, the once-per-id de-duplication, the operator kill-switch
-   * (`RIPPA_REMOTE_COMMANDS=false`), and the dashboard overlay published before
-   * the handler runs.
+   * (`RIPPA_REMOTE_COMMANDS=false`), the dashboard overlay published before the
+   * handler runs, and the acknowledgement sent before the node exits.
    *
-   * The outcome is marked `reported: true` because `executePendingCommands`
-   * reports its own progress; a second generic `task_result` would contradict it.
-   * A `restart` that succeeds ends in `process.exit()`, so nothing after this
-   * returns in practice — the return exists for the case where a shutdown is
-   * suppressed and the node legitimately carries on.
+   * WHY `reported` IS NOT SET HERE ANY MORE. The old comment claimed
+   * `executePendingCommands` reported its own progress, and used that to suppress
+   * the engine's `task_result`. It did not: it only logs and publishes a local
+   * overlay, so nothing ever reached the Mothership. Combined with the handler
+   * ending in `process.exit(0)`, every forced update produced NO result record at
+   * all — the command vanished from the fleet view exactly when it was being
+   * acted on, which is the "received but ignored" symptom from the other side.
+   *
+   * The engine now files the `task_result` on every path that does not exit, and
+   * the executor sends its own pre-shutdown acknowledgement on the paths that do.
+   * A `restart` or `update` that succeeds never reaches this return; it exists for
+   * the refused/suppressed cases, where the outcome must still be truthful.
    */
   private async handleAdminTask(
     task: SwarmTask,
@@ -264,6 +283,11 @@ export class Orchestrator {
         forceUpdate: () => this.admin.forceUpdate(),
         setP2pEnabled: (enabled) => this.admin.setP2pEnabled(enabled),
         isP2pEnabled: () => this.admin.isP2pEnabled(),
+        // Routed through so the queue-task channel is acknowledged to the
+        // Mothership on exactly the same terms as the heartbeat channel.
+        ...(this.admin.acknowledgeCommand
+          ? { acknowledgeCommand: this.admin.acknowledgeCommand }
+          : {}),
       },
     );
 
@@ -281,7 +305,6 @@ export class Orchestrator {
         executed.length > 0
           ? `admin command ${command} executed`
           : `admin command ${command} was not executed (disabled or already run)`,
-      reported: true,
     };
   }
 

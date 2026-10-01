@@ -2,12 +2,26 @@ import axios from "axios";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import { APP_VERSION, isVersionNewer } from "../version";
 import { ensureNodeIdentity } from "../config/nodeAuth";
 import type { PeerEndpoint } from "../config/nodeAuth";
 import type { SwarmDispatcher } from "./swarmDispatcher";
+import {
+  HANDOFF_STAMP,
+  PARTIAL_SUFFIX,
+  TEMP_UPDATE_FILE,
+  claimHandoffSlot,
+  currentExecutable,
+  installDir,
+  isPackagedExe,
+  releaseHandoffClaim,
+  spawnDetached,
+  stagingDir,
+  writeSwapScript,
+} from "../update/swapHandoff";
+
+export { claimHandoffSlot, releaseHandoffClaim, isPackagedExe, installDir };
 
 /**
  * AUTONOMOUS OTA SWARM UPDATER.
@@ -21,11 +35,12 @@ import type { SwarmDispatcher } from "./swarmDispatcher";
  *                  `latest` GitHub Release.
  *   2. POLL      — every 60 minutes the Master asks GitHub for the latest
  *                  release and compares its tag against the local version.
- *   3. SELF      — on a newer build the Master downloads `rippa-node-update.exe`.
+ *   3. SELF      — on a newer build the Master downloads `temp_update.exe` into
+ *                  the persistent data directory.
  *   4. BROADCAST — the Master walks every ONLINE satellite in the swarm registry
  *                  and sends it a `SWARM_UPDATE_TRIGGER` carrying the release
  *                  version and the download URL.
- *   5. SWAP      — each satellite downloads, verifies, writes `updater.bat`,
+ *   5. SWAP      — each satellite downloads, verifies, writes `update.bat`,
  *                  spawns it fully detached, then `process.exit(0)` to release
  *                  the Windows image lock so the script can swap the binary.
  *
@@ -33,6 +48,8 @@ import type { SwarmDispatcher } from "./swarmDispatcher";
  * Node process cannot replace its own binary. The batch script is spawned
  * detached so it survives `process.exit`, waits for the lock to clear, swaps the
  * files and relaunches — the node replaces itself with nobody at the keyboard.
+ * The script itself is built by `update/swapHandoff`, which is shared with the
+ * Mothership-driven `OtaUpdater` so the two paths cannot drift apart again.
  *
  * SECURITY: only a mesh-key authenticated Master can trigger an update on a
  * satellite, so no peer node can force a binary swap on another node.
@@ -42,11 +59,19 @@ import type { SwarmDispatcher } from "./swarmDispatcher";
  * so they can never both exit the process mid-swap.
  */
 
-/** GitHub repository publishing the fleet releases ("owner/name"). */
-const GITHUB_REPO = process.env.RIPPA_GITHUB_REPO || "rippaadventures/rippa-node";
+/**
+ * GitHub repository publishing the fleet releases ("owner/name").
+ *
+ * THIS REPO ID IS WHY "Force OTA Update" DID NOTHING. The default pointed at
+ * `rippaadventures/rippa-node`, which does not exist — `api.github.com` answers
+ * 404 for it, the 404 is swallowed as "no releases published yet", and the node
+ * sat there politely doing nothing forever. The real repository is
+ * `Farko420/rippa-node`. Overridable so a fork can point at its own releases.
+ */
+const GITHUB_REPO = process.env.RIPPA_GITHUB_REPO || "Farko420/rippa-node";
 /** How often the Master polls GitHub for a newer release. */
 const CHECK_INTERVAL_MS = 60 * 60_000; // hourly
-/** Delay before the first check, so boot finishes before a 126 MB download. */
+/** Delay before the first check, so boot finishes before a large exe download. */
 const FIRST_CHECK_DELAY_MS = 45_000;
 /** Streaming timeout — the exe is ~126 MB and links can be slow. */
 const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
@@ -54,16 +79,6 @@ const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
 const MIN_UPDATE_BYTES = 1024 * 1024;
 /** Sanity ceiling: the exe is ~126 MB, not gigabytes. */
 const MAX_UPDATE_BYTES = 1024 * 1024 * 1024;
-
-/** Downloaded release, sitting beside the running exe until it is swapped. */
-const UPDATE_FILE_NAME = "rippa-node-update.exe";
-const PARTIAL_SUFFIX = ".part";
-/** Name of the detached swap script (per spec). */
-const HANDOFF_SCRIPT = "updater.bat";
-/** Windows can hold the image lock a little longer than the initial wait. */
-const HANDOFF_DELAY_SECONDS = 3;
-/** Marks that this process has already committed to a handoff. */
-const HANDOFF_STAMP = ".ota-handoff";
 
 /** A published GitHub release, reduced to what the fleet actually needs. */
 export interface ReleaseInfo {
@@ -86,46 +101,6 @@ interface ReleaseAsset {
   name?: string;
   browser_download_url?: string;
   size?: number;
-}
-
-/**
- * On-disk guard against two updaters both calling `process.exit(0)`.
- *
- * The Mothership-driven `OtaUpdater` and this GitHub updater can both decide to
- * update in the same window. Without a shared claim the first to finish would
- * exit while the other was mid-write, leaving a half-swapped install. The claim
- * is a FILE (not just a module variable) because the relaunched process imports
- * this module fresh and must not immediately re-trigger the same swap.
- *
- * The stamp is cleared on the next successful boot start, so a node is never
- * permanently wedged by a leftover file from a crashed attempt.
- */
-export function claimHandoffSlot(stampPath: string): boolean {
-  try {
-    if (fs.existsSync(stampPath)) return false;
-    fs.writeFileSync(stampPath, String(process.pid), "utf8");
-    return true;
-  } catch {
-    // Read-only install dir: fall back to a process-local guard so a single
-    // process still never exits twice.
-    return !claimedInProcess;
-  }
-}
-
-/** Releases a previous claim at boot. */
-export function releaseHandoffClaim(stampPath: string): void {
-  try {
-    fs.rmSync(stampPath, { force: true });
-  } catch {
-    /* nothing to clear */
-  }
-  claimedInProcess = false;
-}
-
-/** True when this process is a packaged .exe (the only safely replaceable case). */
-export function isPackagedExe(): boolean {
-  const packaged = Boolean((process as NodeJS.Process & { pkg?: unknown }).pkg);
-  return packaged && path.basename(process.execPath).toLowerCase().endsWith(".exe");
 }
 
 /** Reads a version out of a semver-looking string, or null. */
@@ -255,9 +230,6 @@ function describeError(error: unknown): string {
   }
   return error instanceof Error ? error.message : String(error);
 }
-export function installDir(): string | null {
-  return isPackagedExe() ? path.dirname(process.execPath) : null;
-}
 
 /** Minimal shape of the GitHub releases API response. */
 interface GithubRelease {
@@ -266,9 +238,6 @@ interface GithubRelease {
   body?: string;
   assets?: ReleaseAsset[];
 }
-
-/** Process-local fallback claim, used when the install dir is not writable. */
-let claimedInProcess = false;
 
 /**
  * AUTONOMOUS OTA SWARM UPDATER (Master poller + fleet broadcaster + self-swap).
@@ -290,7 +259,9 @@ export class SwarmUpdater {
     if (this.running) return;
     this.running = true;
     // A stamp left behind by a crashed attempt must not wedge the node forever.
-    releaseHandoffClaim(path.join(this.dir(), HANDOFF_STAMP));
+    // It is cleared HERE, on the boot of the freshly-swapped build — which is
+    // precisely when the previous attempt is known to have finished.
+    releaseHandoffClaim(path.join(stagingDir(), HANDOFF_STAMP));
 
     this.firstCheck = setTimeout(() => {
       this.firstCheck = null;
@@ -327,11 +298,7 @@ export class SwarmUpdater {
     return this.dispatcher.isMaster;
   }
 
-  /** Directory holding the running exe, falling back to cwd in dev. */
-  private dir(): string {
-    return installDir() || process.cwd();
-  }
-/**
+  /**
    * One full cycle: poll GitHub, and on a newer release update this node and
    * broadcast to every online satellite. Never throws — a failed check must
    * leave the node running its normal tasks.
@@ -340,12 +307,20 @@ export class SwarmUpdater {
    *   is what an operator's "Force OTA Update" means: repair a node stuck on a
    *   bad build. The unattended path leaves `force` off, so a routine hourly
    *   check can never reinstall the version already running.
+   *
+   * @returns true when this node's own swap is committed and the process is
+   *          about to exit. False for every other outcome — including "nothing
+   *          to do", "already in flight" and "GitHub unreachable" — so a caller
+   *          reporting to the fleet never claims a restart that will not happen.
    */
-  async checkNow(force = false): Promise<void> {
-    if (this.updating) return; // an update is already in flight
+  async checkNow(force = false): Promise<boolean> {
+    if (this.updating) {
+      console.log("[Updater] An update is already in flight — standing down.");
+      return false;
+    }
     if (process.env.OTA_ENABLED === "false") {
       console.log("[Updater] Idle — disabled via OTA_ENABLED=false.");
-      return;
+      return false;
     }
 
     let release: ReleaseInfo | null = null;
@@ -356,21 +331,31 @@ export class SwarmUpdater {
       // reaching here is a genuine fault (rate limit, 5xx, DNS, timeout) and is
       // still worth a warning line.
       console.warn(`[Updater] GitHub check failed — ${describeError(error)}`);
-      return;
+      return false;
     }
-    if (!release) return;
+    if (!release) {
+      // THE MOST IMPORTANT LOG LINE IN THIS MODULE. A wrong RIPPA_GITHUB_REPO
+      // surfaces here as "no releases" rather than as an error, and a node that
+      // silently finds nothing is indistinguishable from one ignoring the
+      // command. Name the repo so the cause is one glance away.
+      console.log(
+        `[Updater] No release asset found for ${GITHUB_REPO} — ` +
+          "nothing to update. Check RIPPA_GITHUB_REPO if this node was told to update.",
+      );
+      return false;
+    }
     this.latest = release;
 
     if (!force && !isVersionNewer(release.version)) {
       console.log(`[Updater] Fleet is up to date (v${APP_VERSION}).`);
-      return;
+      return false;
     }
     if (!force && release.version === this.lastAttempted) {
       console.warn(
         `[Updater] v${release.version} already attempted and did not complete — ` +
           "waiting for a newer build.",
       );
-      return;
+      return false;
     }
 
     this.updating = true;
@@ -383,6 +368,7 @@ export class SwarmUpdater {
       if (swapped) {
         await this.broadcast(release);
       }
+      return swapped;
     } finally {
       this.updating = false;
     }
@@ -398,10 +384,14 @@ export class SwarmUpdater {
    * GitHub is already at this node's version — that is precisely the case where
    * a node is stuck on a corrupt or half-swapped build and the only fix is to
    * put the same good bytes back down.
+   *
+   * @returns true when a swap is committed. The process exits inside
+   *          `applyToSelf`, so in practice this returns only on the refused /
+   *          aborted paths; it exists so the caller knows the difference.
    */
-  async forceUpdate(): Promise<void> {
+  async forceUpdate(): Promise<boolean> {
     console.log("[Updater] FORCE UPDATE requested by the fleet controller.");
-    await this.checkNow(true);
+    return this.checkNow(true);
   }
 
   /**
@@ -484,14 +474,12 @@ export class SwarmUpdater {
     return { ok: false, reason, name: target.nodeName };
   }
 /**
-   * Downloads, verifies and hands off to `updater.bat`.
+   * Downloads, verifies and hands off to the shared `update.bat`.
    *
    * @returns true when the process is committed to exiting (a swap is about to
    *          happen), false when the update was skipped or aborted.
    */
   async applyToSelf(release: ReleaseInfo): Promise<boolean> {
-    const dir = this.dir();
-
     if (!isPackagedExe()) {
       console.warn(
         `[Updater] v${release.version} is available but this is a dev run — ` +
@@ -500,38 +488,41 @@ export class SwarmUpdater {
       return false;
     }
 
-    const stampPath = path.join(dir, HANDOFF_STAMP);
+    const stage = stagingDir();
+    const stampPath = path.join(stage, HANDOFF_STAMP);
     if (!claimHandoffSlot(stampPath)) {
       console.log("[Updater] Another updater already owns this handoff — standing down.");
       return false;
     }
 
-    const targetExe = path.basename(process.execPath);
-    const updatePath = path.join(dir, UPDATE_FILE_NAME);
+    const updatePath = path.join(stage, TEMP_UPDATE_FILE);
     const partialPath = `${updatePath}${PARTIAL_SUFFIX}`;
-    const scriptPath = path.join(dir, HANDOFF_SCRIPT);
 
     try {
       console.log(`[Updater] Downloading v${release.version} (from v${APP_VERSION})...`);
+      console.log(`[Updater] Staging to ${updatePath}`);
       await this.download(release, partialPath);
 
       // Only a fully written, verified file is promoted to its real name.
       fs.rmSync(updatePath, { force: true });
       fs.renameSync(partialPath, updatePath);
       const { size } = fs.statSync(updatePath);
-      console.log(`[Updater] Verified download — ${UPDATE_FILE_NAME} (${formatMb(size)}).`);
+      console.log(`[Updater] Verified download — ${TEMP_UPDATE_FILE} (${formatMb(size)}).`);
 
-      this.writeSwapScript(scriptPath, targetExe);
-      this.spawnDetached(scriptPath, dir);
+      const targetExe = currentExecutable();
+      const scriptPath = writeSwapScript(updatePath, targetExe);
+      console.log(`[Updater] Swap script written — ${path.basename(scriptPath)}`);
+      const pid = spawnDetached(scriptPath, path.dirname(targetExe));
+      console.log(`[Updater] Handoff script spawned (detached, pid ${pid ?? "unknown"}).`);
 
       console.log("[Updater] Handoff complete — restarting into the new build...");
-      // Release the .exe image lock so the script's `del` can succeed.
+      // Release the .exe image lock so the script's overwrite can succeed.
       process.exit(0);
       return true; // unreachable: process.exit does not return
     } catch (error) {
       // Abort cleanly: no half-written update, no restart, node carries on.
       console.warn(`[Updater] Update to v${release.version} aborted — ${describeError(error)}`);
-      this.cleanup(partialPath, updatePath, scriptPath, stampPath);
+      this.cleanup(partialPath, updatePath, stampPath);
       return false;
     }
   }
@@ -584,58 +575,6 @@ export class SwarmUpdater {
     } else {
       console.log("[Updater] No checksum published — relying on size and PE magic checks.");
     }
-  }
-
-  /**
-   * Writes `updater.bat`, which performs the swap after this process exits.
-   *
-   * Follows the required sequence: wait for the Windows image lock, delete the
-   * old exe, move the update into place, relaunch, self-delete.
-   *
-   * The `del` is wrapped in a bounded retry loop because Windows can keep the
-   * mapped image locked a little longer than the initial wait. Without it a
-   * late-releasing lock would make `del` fail and leave the node with NO
-   * executable at all — a self-inflicted brick. `move /y` then overwrites
-   * cleanly and always relaunches whatever ended up in place.
-   */
-  private writeSwapScript(scriptPath: string, targetExe: string): void {
-    const lines = [
-      "@echo off",
-      'cd /d "%~dp0"',
-      `timeout /t ${HANDOFF_DELAY_SECONDS} /nobreak > NUL`,
-      "for /l %%i in (1,1,10) do (",
-      `  if exist "${targetExe}" del "${targetExe}"`,
-      `  if not exist "${targetExe}" goto :swapped`,
-      "  ping -n 2 127.0.0.1 > NUL",
-      ")",
-      ":swapped",
-      `move /y "${UPDATE_FILE_NAME}" "${targetExe}"`,
-      `start "" "${targetExe}"`,
-      // Self-delete through a short-lived child: a bare `del "%~f0"` makes cmd
-      // report "batch file cannot be found" as it reads past its own deleted
-      // file. This removes the script cleanly with no error output.
-      'start "" /b cmd /c "timeout /t 1 /nobreak > NUL & del ""%~f0"""',
-    ];
-    fs.writeFileSync(scriptPath, `${lines.join("\r\n")}\r\n`, "utf8");
-    console.log(`[Updater] Swap script written — ${path.basename(scriptPath)}`);
-  }
-
-  /**
-   * Launches `updater.bat` in its own session so it outlives this process.
-   *
-   * `detached: true` + `stdio: "ignore"` + `unref()` detaches it from our
-   * console, pipes and event loop — it keeps running after `process.exit(0)`.
-   * Windows cannot exec a .bat directly, so it must go through cmd.exe.
-   */
-  private spawnDetached(scriptPath: string, cwd: string): void {
-    const child = spawn("cmd.exe", ["/c", scriptPath], {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-      cwd,
-    });
-    child.unref();
-    console.log(`[Updater] updater.bat spawned (detached, pid ${child.pid ?? "unknown"}).`);
   }
 
   /** Removes artefacts of a failed attempt. Best-effort, never throws. */

@@ -112,7 +112,8 @@ async function main(): Promise<void> {
       return;
     }
     if (swarm) return; // already running
-    swarm = new SwarmClient();
+    const client = new SwarmClient();
+    swarm = client;
 
     // CPU load needs two samples separated by an interval, so the sampler
     // must be running before the first heartbeat to report a real figure.
@@ -121,6 +122,60 @@ async function main(): Promise<void> {
     // Wire the rich heartbeat telemetry + remote command execution. The swarm
     // dispatcher owns the registry, so it supplies the P2P link list and the
     // node's own task counters; the handlers below close the loop on commands.
+    /*
+      ONE ADMIN-COMMAND IMPLEMENTATION, SHARED BY BOTH CHANNELS.
+
+      Admin work arrives two ways — a `pending_commands` entry on the heartbeat
+      reply, and an ordinary queue task whose type is FORCE_OTA_UPDATE /
+      RESTART_NODE_SERVICE — and both must behave identically. Building the
+      handler object once (rather than twice) is what guarantees that: a fix
+      applied here, such as forceUpdate bypassing the "already latest" check or
+      acknowledging before the swap, applies on both paths at once. A second copy
+      is how these two channels drifted apart in the first place.
+    */
+    const acknowledgeUpstream = async (command: string, detail: string): Promise<void> => {
+      /*
+        SENT AS A PROFILE SUBMISSION, WHICH IS THE ROUTE THAT ALWAYS EXISTS.
+
+        `/api/swarm/submit` is the endpoint every deployment already accepts, so
+        this cannot 404 the way an un-shipped dedicated ack route would — and a
+        404 here would leave the command looking un-acknowledged forever. The
+        command name and detail ride along so the fleet dashboard can show which
+        command this node accepted rather than an opaque record.
+      */
+      await client.submitProfile({
+        kind: "admin_command_result",
+        command,
+        status: "completed",
+        nodeName: env.NODE_NAME,
+        role: env.NODE_ROLE,
+        appVersion: APP_VERSION,
+        detail,
+        reportedAt: new Date().toISOString(),
+      });
+    };
+
+    const adminCommands = {
+      restartNode: () => shutdown("REMOTE_COMMAND"),
+      // `forceUpdate`, NOT `checkNow`. checkNow() is the unattended poll and
+      // deliberately refuses to reinstall the running build, so a "Force OTA
+      // Update" that arrived on a node already at the latest version logged
+      // "up to date" and did nothing — received and ignored, which is exactly
+      // the reported symptom. forceUpdate() bypasses that check and returns
+      // whether a swap is actually committed, so a refused update is reported
+      // honestly instead of looking like a restart that never happened.
+      forceUpdate: (): Promise<boolean> => swarmUpdater.forceUpdate(),
+      setP2pEnabled: async (enabled: boolean) => {
+        // Persisted through nodeAuth so the choice survives a restart.
+        require("./config/nodeAuth").setP2pEnabled(enabled);
+      },
+      isP2pEnabled: () => require("./config/nodeAuth").p2pEnabled(),
+      // Sent BEFORE the shutdown sequence begins: the update and restart handlers
+      // both end in process.exit(0), so anything reported afterwards would never
+      // reach the Mothership and the command would sit in the queue unacked.
+      acknowledgeCommand: acknowledgeUpstream,
+    };
+
     swarm.setTelemetrySources({
       connectedSatellites: () => {
         /*
@@ -143,20 +198,30 @@ async function main(): Promise<void> {
         const total = succeeded + (metrics.tasksFailed || 0) + (metrics.tasksTimedOut || 0);
         return { succeeded, total };
       },
-      commandHandlers: {
-        restartNode: () => shutdown("REMOTE_COMMAND"),
-        // `forceUpdate`, NOT `checkNow`. checkNow() is the unattended poll and
-        // deliberately refuses to reinstall the running build, so a "Force OTA
-        // Update" that arrived on a node already at the latest version logged
-        // "up to date" and did nothing — received and ignored, which is exactly
-        // the reported symptom. forceUpdate() bypasses that check.
-        forceUpdate: () => swarmUpdater.forceUpdate(),
-        setP2pEnabled: async (enabled: boolean) => {
-          // Persisted through nodeAuth so the choice survives a restart.
-          require("./config/nodeAuth").setP2pEnabled(enabled);
-        },
-        isP2pEnabled: () => require("./config/nodeAuth").p2pEnabled(),
-      },
+      commandHandlers: adminCommands,
+    });
+
+    /*
+      AUTOMATIC MESH KEY SYNC.
+
+      Rippa AI can rotate the swarm connection key on any heartbeat reply, and
+      this hook applies it: the Master persists the new key to config.json, drops
+      revoked peer keys and unregistered nodes, then pushes the new credential to
+      every satellite so the whole fleet re-keys itself with no operator action.
+      A satellite ignores the directive (it has no registry of its own) — its
+      Master is what issues its credential.
+
+      Registered through the require() indirection used by index.ts so the
+      bundler keeps the module statically analysable for the pkg build.
+    */
+    swarm.setMeshKeySyncHandler((directive) => {
+      void dispatcher.applyMothershipSync(directive).catch((error: unknown) => {
+        console.warn(
+          `[Boot] Mesh key sync failed — ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
     });
 
     swarm.startHeartbeat();
@@ -175,12 +240,15 @@ async function main(): Promise<void> {
       forceUpdate bypassing the "already latest" check) applies to both.
     */
     orchestrator = new Orchestrator(swarm, {
-      restartNode: () => shutdown("REMOTE_COMMAND"),
-      forceUpdate: () => swarmUpdater.forceUpdate(),
-      setP2pEnabled: (enabled: boolean) => {
-        require("./config/nodeAuth").setP2pEnabled(enabled);
-      },
-      isP2pEnabled: () => require("./config/nodeAuth").p2pEnabled(),
+      /*
+        THE SAME OBJECT THE HEARTBEAT PATH USES — see `adminCommands` above. Not
+        a lookalike: the same reference, so the two channels cannot drift again.
+      */
+      restartNode: adminCommands.restartNode,
+      forceUpdate: adminCommands.forceUpdate,
+      setP2pEnabled: adminCommands.setP2pEnabled,
+      isP2pEnabled: adminCommands.isP2pEnabled,
+      acknowledgeCommand: adminCommands.acknowledgeCommand,
     });
     orchestrator.start();
 

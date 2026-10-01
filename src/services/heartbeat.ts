@@ -102,16 +102,40 @@ export interface HeartbeatTelemetry extends SystemVitals {
   connected_satellites: string[];
 }
 
-/** Hooks the host wires in so this module stays free of framework imports. */
+/**
+ * Hooks the host wires in so this module stays free of framework imports.
+ *
+ * `forceUpdate` returns whether the swap is actually committed. That matters
+ * because the OTA pipeline ends in `process.exit(0)`: a handler that returned
+ * nothing would make "I am about to restart" and "the update was refused" look
+ * identical, and the Mothership would be told a node rebooted when it did not.
+ */
 export interface CommandHandlers {
   /** Gracefully stop work and exit. */
   restartNode: () => Promise<void> | void;
-  /** Run the OTA pipeline now (download + detached swap). */
-  forceUpdate: () => Promise<void> | void;
+  /**
+   * Run the OTA pipeline now (download + detached swap).
+   *
+   * @returns true when a swap is committed and the process is exiting. Only
+   *          meaningful on paths that do NOT exit (refused, aborted, dev mode).
+   */
+  forceUpdate: () => Promise<boolean> | boolean | void;
   /** Enable or disable satellite-to-satellite mesh routing. */
   setP2pEnabled: (enabled: boolean) => Promise<void> | void;
   /** Reports the node's current P2P state, so TOGGLE_P2P can invert it. */
   isP2pEnabled: () => boolean;
+  /**
+   * Reports an admin command back to the Mothership.
+   *
+   * WHY THIS IS NEEDED. An OTA update ends in `process.exit(0)` from inside the
+   * handler, so anything the engine would normally report afterwards — the
+   * `task_result` the engine files when `reported` is false — never runs. The
+   * command was received, acted on, and the fleet was never told; from the
+   * dashboard the node simply went silent and then came back, which is
+   * indistinguishable from ignoring the command. The host supplies this so the
+   * acknowledgement is sent BEFORE the shutdown sequence begins.
+   */
+  acknowledgeCommand?: (command: RemoteCommandName, detail: string) => Promise<void> | void;
 }
 
 /** Efficiency inputs: successful vs. total task attempts. */
@@ -240,6 +264,28 @@ function remoteCommandsEnabled(): boolean {
 }
 
 /**
+ * Sends an admin-command acknowledgement upstream, if the host wired one up.
+ *
+ * Never throws: an unreachable Mothership must not prevent a command from being
+ * carried out. A node that cannot reach the cloud should still update itself.
+ */
+async function acknowledge(
+  handlers: CommandHandlers,
+  command: RemoteCommandName,
+  detail: string,
+): Promise<void> {
+  if (!handlers.acknowledgeCommand) return;
+  try {
+    await handlers.acknowledgeCommand(command, detail);
+  } catch (error) {
+    console.warn(
+      `[Heartbeat] Could not acknowledge ${command} upstream — ` +
+        (error instanceof Error ? error.message : String(error)),
+    );
+  }
+}
+
+/**
  * Executes the `pending_commands` returned by the Mothership.
  *
  * Each command is dispatched independently: one failing must not prevent the
@@ -278,6 +324,9 @@ export async function executePendingCommands(
             detail: "The Mothership asked this node to restart. The service will come back automatically.",
             blocking: true,
           });
+          // Restart also exits from inside its handler, so it is acknowledged up
+          // front for the same reason FORCE_UPDATE is.
+          await acknowledge(handlers, "RESTART_NODE", "accepted — restarting the node");
           await handlers.restartNode();
           break;
         case "FORCE_UPDATE":
@@ -292,7 +341,28 @@ export async function executePendingCommands(
               "Downloading the latest release, verifying it, then swapping the executable and restarting.",
             blocking: true,
           });
-          await handlers.forceUpdate();
+          /*
+            ACKNOWLEDGE *BEFORE* THE SWAP, NOT AFTER.
+
+            The OTA pipeline ends in process.exit(0) from inside the handler, so a
+            report filed afterwards would never be sent. Worse, the command would
+            sit in the fleet queue unacknowledged and be re-dispatched on the next
+            poll, starting a second download every cycle.
+
+            The acknowledgement is therefore sent up front, describing the update
+            as accepted-and-in-progress, and the returned boolean is only used to
+            correct the record on the paths that do NOT exit (refused, aborted or
+            dev mode) — where "accepted" would otherwise be a lie.
+          */
+          await acknowledge(handlers, "FORCE_UPDATE", "accepted — downloading the latest release");
+          const committed = await handlers.forceUpdate();
+          if (committed === false) {
+            await acknowledge(
+              handlers,
+              "FORCE_UPDATE",
+              "not applied — no swap was committed (refused, aborted, or not a packaged exe)",
+            );
+          }
           break;
         case "TOGGLE_P2P": {
           // An explicit `enabled` argument wins; otherwise invert current state.

@@ -6,7 +6,7 @@ import path from "node:path";
  * PERSISTENT DATA DIRECTORY.
  *
  * WHY THIS EXISTS. Rippa Node ships as a single `rippa-node.exe` that replaces
- * ITSELF over the air (see `src/update/OtaUpdater.ts`): a new build is streamed
+ * ITSELF over the air (see `src/update/swapHandoff.ts`): a new build is streamed
  * in, verified, and swapped over the running executable in the same folder.
  * Anything the node wrote *beside that executable* is therefore destroyed by
  * every OTA update — the operator's config.json, node code, mesh key, pairing
