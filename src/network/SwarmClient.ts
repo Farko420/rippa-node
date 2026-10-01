@@ -67,6 +67,59 @@ export interface LatestVersionInfo {
 export type UpdateSignalHandler = (info: LatestVersionInfo) => void;
 
 /**
+ * Invoked the moment the Mothership hands this node work, on whichever channel
+ * delivered it first (the 15s poll or a heartbeat reply). Owned by the task
+ * engine, which uses it to preempt the idle forager.
+ */
+export type TaskDispatchHandler = (tasks: SwarmTask[]) => void;
+
+/**
+ * THE QUARANTINE INGESTION ROUTE — where an autonomous discovery is filed for
+ * review by the Mothership rather than trusted into `verified_knowledge`.
+ */
+export const FORAGE_QUARANTINE_PATH = "/api/brain/quarantine";
+
+/**
+ * Where discoveries go once the Mothership has answered 404 on the route above.
+ * Every deployment already accepts `/api/swarm/submit`, so this is a floor that
+ * keeps a newer node useful against an older cloud rather than a silent loss.
+ */
+export const FORAGE_FALLBACK_PATH = "/api/swarm/submit";
+
+/**
+ * One autonomous discovery, shaped for the Mothership's quarantine intake.
+ *
+ * Field names are snake_case because this crosses the wire — see the note on
+ * {@link HeartbeatPayload}.
+ */
+export interface ForageDiscoveryPayload {
+  /** Stable `RIPPA-XXXX-XXXX` identity, so the cloud can attribute the find. */
+  nodeCode: string;
+  /** ISO timestamp the fact was learned. */
+  discoveredAt: string;
+  /** Which gap this closed: `stale_place` | `unverified_lore` | `incomplete_place`. */
+  targetKind: string;
+  /** Human-readable name of the thing that was learned about. */
+  targetLabel: string;
+  /** The page the evidence came from, when there was one. */
+  sourceUrl: string | null;
+  /** The mirrored place this updates, when it updates one. */
+  placeId: string | null;
+  /** Local `raw_lore` row holding the scraped evidence. */
+  loreId: number | null;
+  /** `location` | `rule` | `hazard` | `description`. */
+  category: string;
+  /** The extracted sentence. */
+  factSummary: string;
+  /** 0-1, exactly as the local model scored it. */
+  confidence: number;
+  /** "lat, lon" when the page identifies a place, else null. */
+  coordinates: string | null;
+  /** True when this passed the confidence gate locally. */
+  promoted: boolean;
+}
+
+/**
  * Backoff for a failing task endpoint.
  *
  * The orchestrator polls `/api/swarm/tasks` every 15s. A Mothership that
@@ -85,6 +138,14 @@ export class SwarmClient {
   private heartbeatTask: ScheduledTask | null = null;
   private status: NodeStatus = "idle";
   private updateSignal: UpdateSignalHandler | null = null;
+  /** Fired when the Mothership pushes work down the heartbeat channel. */
+  private taskDispatch: TaskDispatchHandler | null = null;
+  /**
+   * Set once the Mothership has answered 404/405 on the quarantine route, after
+   * which discoveries go straight to {@link FORAGE_FALLBACK_PATH}. See
+   * {@link SwarmClient.pushForageDiscovery}.
+   */
+  private quarantineUnsupported = false;
 
   /**
    * Node codes currently linked peer-to-peer, reported as `connected_satellites`.
@@ -231,6 +292,22 @@ export class SwarmClient {
           }
         }
       }
+
+      /*
+        WORK PUSHED DOWN THE HEARTBEAT. Checked last so a release advertisement
+        and a forced update are never delayed behind a task dispatch, and
+        dispatched fire-and-forget so a handler that throws cannot retroactively
+        mark this heartbeat as failed.
+      */
+      const pushed = parseTaskPayload(data);
+      if (pushed.length > 0 && this.taskDispatch) {
+        console.log(`[Swarm] Heartbeat carried ${pushed.length} task(s) — dispatching now.`);
+        try {
+          this.taskDispatch(pushed);
+        } catch (error) {
+          console.warn(`[Swarm] Task dispatch handler failed — ${describeError(error)}`);
+        }
+      }
     } catch (error) {
       console.warn(`[Swarm] Heartbeat failed â€” ${describeError(error)}`);
     }
@@ -239,6 +316,23 @@ export class SwarmClient {
   /** Registers the handler fired when a newer version is advertised. */
   setUpdateSignalHandler(handler: UpdateSignalHandler | null): void {
     this.updateSignal = handler;
+  }
+
+  /**
+   * Registers the handler fired when a heartbeat reply carries queued work.
+   *
+   * WHY THIS EXISTS ALONGSIDE `fetchTasks`. The 15-second task poll is the
+   * guaranteed floor on latency, but a heartbeat fires on its own schedule and
+   * a Mothership that pushes a task down the same socket deserves to have it
+   * noticed on the heartbeat rather than up to 15 seconds later. That is the
+   * difference between "instantly preempts" and "eventually preempts".
+   *
+   * The handler is only ever handed ALREADY-VALIDATED task shapes, and the
+   * dispatch itself is fire-and-forget: a throwing handler must not turn a
+   * successful heartbeat into a reported failure.
+   */
+  setTaskDispatchHandler(handler: TaskDispatchHandler | null): void {
+    this.taskDispatch = handler;
   }
 
   /**
@@ -350,6 +444,60 @@ export class SwarmClient {
       return true;
     } catch (error) {
       console.warn(`[Swarm] Profile submission failed â€” ${describeError(error)}`);
+      return false;
+    }
+  }
+
+  /**
+   * PUSHES AN AUTONOMOUS DISCOVERY UPSTREAM — the idle tier's feedback line.
+   *
+   * WHY IMMEDIATE RATHER THAN QUEUED. A discovery is only worth anything to the
+   * fleet while it is still new; the 10-minute trickle in SyncManager exists to
+   * make cloud costs predictable, which is the right trade for routine verified
+   * facts and the wrong one for "this page says the creek is closed and nobody
+   * else knows yet". Foraging therefore pushes the moment it learns something.
+   *
+   * WHY A FALLBACK. The quarantine route is the intended home, but a Mothership
+   * that has not shipped it answers 404/405, and a forager that only logged a
+   * warning would drop every discovery it ever made. On the first such answer
+   * the client permanently switches to `/api/swarm/submit`, which every
+   * deployment already accepts — and records that it did so, so a missing
+   * endpoint cannot become one failed request per discovery, forever.
+   *
+   * The node's id and api key travel in the body as well as the Authorization
+   * header, because the Mothership attributes a quarantine record to the node
+   * that found it.
+   */
+  async pushForageDiscovery(payload: ForageDiscoveryPayload): Promise<boolean> {
+    const body = {
+      ...payload,
+      nodeId: env.NODE_NAME,
+      role: env.NODE_ROLE,
+      apiKey: env.NODE_API_KEY,
+      mothershipUrl: env.MOTHERSHIP_URL,
+    };
+    const route = this.quarantineUnsupported ? FORAGE_FALLBACK_PATH : FORAGE_QUARANTINE_PATH;
+
+    try {
+      await this.client.post(route, body);
+      console.log(
+        `[Swarm] Discovery fed upstream via ${route} — ` +
+          `${payload.targetKind} "${payload.targetLabel}".`,
+      );
+      return true;
+    } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (route === FORAGE_QUARANTINE_PATH && (status === 404 || status === 405)) {
+        // Remember the downgrade so the next discovery goes straight to the
+        // endpoint that works instead of re-probing one that does not exist.
+        this.quarantineUnsupported = true;
+        console.warn(
+          `[Swarm] Mothership has no ${FORAGE_QUARANTINE_PATH} (HTTP ${status}) — ` +
+            `feeding discoveries to ${FORAGE_FALLBACK_PATH} instead.`,
+        );
+        return this.pushForageDiscovery(payload);
+      }
+      console.warn(`[Swarm] Discovery feed failed — ${describeError(error)}`);
       return false;
     }
   }
@@ -482,6 +630,39 @@ function firstString(source: Record<string, unknown>, keys: string[]): string | 
     }
   }
   return undefined;
+}
+
+/**
+ * Extracts queued work from a heartbeat reply.
+ *
+ * Tolerates the shapes a Mothership may realistically use: a bare array, or an
+ * envelope under `tasks` / `pending_tasks` / `queue`. Entries without an `id`
+ * are dropped — a task the node cannot report a result against is a task it
+ * cannot acknowledge, and acknowledging it would corrupt the fleet's view of
+ * what is still outstanding.
+ */
+function parseTaskPayload(payload: unknown): SwarmTask[] {
+  if (!payload || typeof payload !== "object") return [];
+  const root = payload as Record<string, unknown>;
+  const raw = Array.isArray(root) ? root : (root["tasks"] ?? root["pending_tasks"] ?? root["queue"]);
+  if (!Array.isArray(raw)) return [];
+
+  const tasks: SwarmTask[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const id = firstString(record, ["id", "taskId", "task_id"]);
+    if (!id) continue;
+    const payloadField = record["payload"] ?? record["input"] ?? record["data"];
+    tasks.push({
+      id,
+      type: firstString(record, ["type", "taskType", "task_type"]) ?? "unknown",
+      ...(payloadField && typeof payloadField === "object"
+        ? { payload: payloadField as Record<string, unknown> }
+        : {}),
+    });
+  }
+  return tasks;
 }
 
 /**

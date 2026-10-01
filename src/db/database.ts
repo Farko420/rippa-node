@@ -332,3 +332,212 @@ export function markPlaceVerified(id: string, at = new Date().toISOString()): vo
     .prepare("UPDATE brain_places SET last_verified = ? WHERE id = ?")
     .run(at, id);
 }
+
+// ---------------------------------------------------------------------------
+// AUTONOMOUS FORAGING TARGETS (the idle tier's work queue)
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY THREE KINDS. "The node is never idle" needs a question the database can
+ * actually answer, and "what should I learn next?" has exactly three answers
+ * once the Mothership queue is empty:
+ *
+ *   OUTDATED   — a mirrored place whose live page has not been re-read in long
+ *                (or ever). The mirror is a snapshot; it decays.
+ *   UNVERIFIED — text already scraped into `raw_lore` that never became a
+ *                verified fact. The cheapest possible win: the bytes are ALREADY
+ *                on disk, so the forager pays only for extraction.
+ *   INCOMPLETE — a mirrored place with no summary or description. Nothing in the
+ *                node can answer questions about it yet.
+ *
+ * Three tables with three failure modes, so they stay three SELECTs. The
+ * interleaving further down is what turns them into one queue.
+ */
+
+/** Which kind of gap a forage target fills. */
+export type ForageTargetKind = "stale_place" | "unverified_lore" | "incomplete_place";
+
+/** One unit of idle work, normalised across the three kinds above. */
+export interface ForageTargetRow {
+  kind: ForageTargetKind;
+  /** The page to re-read. Null only for targets that carry their own text. */
+  url: string | null;
+  /** Human-readable identity for the log and the upstream payload. */
+  label: string;
+  /** The mirrored place this belongs to, when it belongs to one. */
+  place_id: string | null;
+  /** The `raw_lore` row this belongs to, when it belongs to one. */
+  lore_id: number | null;
+  /** ISO timestamp of the last live check, or NULL when never checked. */
+  last_verified: string | null;
+  /**
+   * Text already on disk (unverified-lore targets). When present the forager
+   * SKIPS the scrape entirely — re-fetching a page to re-read text we already
+   * own would spend a network round-trip to learn nothing new.
+   */
+  raw_text: string | null;
+}
+
+/** Mirrored places that exist in the brain but carry no usable prose. */
+export function selectIncompletePlaces(limit: number): ForageTargetRow[] {
+  return getDeepBrain()
+    .prepare(
+      `SELECT 'incomplete_place' AS kind,
+              source_url         AS url,
+              name               AS label,
+              id                 AS place_id,
+              NULL               AS lore_id,
+              last_verified      AS last_verified,
+              NULL               AS raw_text
+         FROM brain_places
+        WHERE source_url IS NOT NULL AND source_url <> ''
+          AND (summary IS NULL OR TRIM(summary) = ''
+               OR description IS NULL OR TRIM(description) = '')
+        ORDER BY last_verified ASC
+        LIMIT ?`,
+    )
+    .all(limit) as ForageTargetRow[];
+}
+
+/**
+ * Scraped text that was never promoted to a verified fact.
+ *
+ * `status IN ('pending','unverified')` covers both ways a row can stall: the
+ * process died between the scrape and the extraction, or the model returned
+ * something below the confidence gate. Either way the text is on disk and the
+ * extraction can be retried without a single HTTP request.
+ *
+ * The text is truncated in SQL rather than in the caller. A 200 kB page is
+ * 200 kB copied into this process's heap for every candidate examined, and the
+ * extraction prompt cannot use past the first slice anyway.
+ */
+export function selectUnverifiedLore(limit: number): ForageTargetRow[] {
+  return getDeepBrain()
+    .prepare(
+      `SELECT 'unverified_lore'            AS kind,
+              source_url                 AS url,
+              'raw_lore #' || id         AS label,
+              NULL                       AS place_id,
+              id                         AS lore_id,
+              NULL                       AS last_verified,
+              SUBSTR(raw_text, 1, 20000) AS raw_text
+         FROM raw_lore
+        WHERE status IN ('pending', 'unverified')
+          AND source_url IS NOT NULL AND source_url <> ''
+        ORDER BY created_at ASC
+        LIMIT ?`,
+    )
+    .all(limit) as ForageTargetRow[];
+}
+
+/** Turns the stale-place rows into the shared forage shape. */
+function stalePlaceTargets(rows: StalePlaceRow[]): ForageTargetRow[] {
+  return rows.map((row) => ({
+    kind: "stale_place" as const,
+    url: row.source_url,
+    label: row.name,
+    place_id: row.id,
+    lore_id: null,
+    last_verified: row.last_verified,
+    raw_text: null,
+  }));
+}
+
+/**
+ * THE IDLE TIER'S WORK QUEUE — one ordered, de-duplicated list of everything
+ * the node could usefully learn next.
+ *
+ * INTERLEAVED, NOT APPENDED. Concatenating the three lists would let one kind
+ * starve the others indefinitely: a mirror with 10 000 stale places would never
+ * reach the unverified-lore backlog, so a single extraction failure would sit
+ * unretried forever. Round-robin across the three sources fixes that — each
+ * pass touches all three, so no category can be crowded out by the size of
+ * another. Within a category the existing starvation-free ordering is kept
+ * (never-verified first, then stalest).
+ *
+ * AND DE-DUPLICATED BY WHAT THE ROW IS, NOT BY WHICH LIST FOUND IT. A place
+ * that is both overdue and missing a description is ONE piece of work found
+ * twice, and spending two passes on it would be slower than doing either. When
+ * that happens the row is PROMOTED to `incomplete_place`: it is the more
+ * specific gap, and it is the one whose fix (attaching a chunk to the place)
+ * the stale check would not perform.
+ */
+export function selectForageTargets(limit: number): ForageTargetRow[] {
+  const perKind = Math.max(1, Math.ceil(limit / 3));
+  const queues: ForageTargetRow[][] = [
+    stalePlaceTargets(selectStalePlaces(perKind)),
+    selectUnverifiedLore(perKind),
+    selectIncompletePlaces(perKind),
+  ];
+
+  const merged: ForageTargetRow[] = [];
+  // Identity -> its position in `merged`, so a later kind can upgrade an
+  // earlier one instead of appending a duplicate.
+  const positions = new Map<string, number>();
+
+  for (let index = 0; merged.length < limit; index += 1) {
+    let addedThisRound = 0;
+    for (const queue of queues) {
+      const row = queue[index];
+      if (!row) continue;
+      addedThisRound += 1;
+
+      const key = String(row.place_id ?? row.lore_id ?? row.url ?? row.label);
+      const existing = positions.get(key);
+      if (existing !== undefined) {
+        // Same row, second sighting: keep the more specific kind.
+        if (row.kind === "incomplete_place") merged[existing].kind = "incomplete_place";
+        continue;
+      }
+      positions.set(key, merged.length);
+      merged.push(row);
+      if (merged.length >= limit) break;
+    }
+    if (addedThisRound === 0) break; // every queue exhausted
+  }
+  return merged;
+}
+
+/**
+ * Links a newly learned fact to a mirrored place as a brain chunk.
+ *
+ * This is what closes the INCOMPLETE gap: a place with no prose gains prose,
+ * and the knowledge is attached to the place rather than floating free in
+ * `verified_knowledge` with no way to find it again. Returns the chunk id.
+ */
+export function insertBrainChunk(chunk: {
+  id?: string;
+  placeId: string | null;
+  category: string | null;
+  text: string;
+  sourceUrl: string | null;
+  confidence: number;
+}): number {
+  const result = getDeepBrain()
+    .prepare(
+      `INSERT INTO brain_chunks (id, place_id, category, text, source_url, confidence)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      chunk.id ??
+        `kc_forage_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      chunk.placeId,
+      chunk.category,
+      chunk.text,
+      chunk.sourceUrl,
+      chunk.confidence,
+    );
+  return Number(result.lastInsertRowid);
+}
+
+/**
+ * True when this node has a usable local brain.
+ *
+ * The forager asks this before every pass instead of relying on NODE_ROLE
+ * alone: a Master whose database failed to open would otherwise throw out of
+ * `getDeepBrain()` on the first query, and an idle-time crash must never be
+ * able to take down the priority loop.
+ */
+export function isDeepBrainReady(): boolean {
+  return instance !== null;
+}
