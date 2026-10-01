@@ -421,3 +421,72 @@ export function workerStatus(): Record<string, unknown> {
     maxConcurrentTasks: MAX_CONCURRENT_TASKS,
   };
 }
+
+// --- SATELLITE WORKER BRIDGE -------------------------------------------------
+/*
+  WIRING THE ABSTRACTED STORAGE LAYER INTO THE APK.
+
+  `src/satellite/mobile-worker.ts` is the WebView-safe satellite core: it polls
+  a Master for assignments and persists state through the StorageProvider
+  abstraction, which resolves to a browser implementation in this runtime and to
+  better-sqlite3 on the desktop. It carries the storage abstraction that the
+  APK build depends on, so it must be part of the bundle.
+
+  It is instantiated but NOT auto-started. Two independent pollers (this
+  module's Mothership loop above and the satellite's Master loop) would both
+  claim tasks and double-report results against the same node code. The
+  dashboard starts the satellite explicitly via `startSatellite()` once a Master
+  URL is configured, so the two protocols never overlap by accident.
+*/
+import { satelliteWorker, SatelliteWorker } from "../../src/satellite/mobile-worker";
+
+/*
+  RE-EXPORTED so the bundled IIFE exposes them on `window.RippaMobileWorker`.
+  esbuild only promotes the entrypoint module's OWN exports onto the global name
+  — an imported binding is internal to the bundle and invisible from the page.
+  Without this the satellite core would be bundled and completely unreachable,
+  which is the kind of silent no-op that looks like a healthy build right up
+  until the tablet fails to join the mesh.
+*/
+export { satelliteWorker, SatelliteWorker };
+
+let satelliteStarted = false;
+
+/**
+ * Starts the satellite core against a Master. Safe to call repeatedly; only the
+ * first call with a usable `masterUrl` starts anything.
+ */
+export async function startSatellite(): Promise<boolean> {
+  const masterUrl = String(config.masterUrl || "").trim();
+  if (!masterUrl || satelliteStarted) return false;
+  try {
+    await satelliteWorker.initialize({
+      nodeRole: "satellite",
+      nodeName: config.nodeName || DEFAULT_CONFIG.nodeName,
+      masterUrl,
+      meshKey: config.apiKey || "",
+      port: 0,
+    });
+    satelliteStarted = true;
+    publish({ type: "satellite", started: true, masterUrl });
+    return true;
+  } catch (error) {
+    // Never fatal: the Mothership loop above is the primary protocol, and a
+    // Master that is merely offline must not stop the node from working.
+    counters.lastError = describe(error);
+    log(`Satellite core did not start: ${describe(error)}`);
+    return false;
+  }
+}
+
+/** Stops the satellite core's Master polling loop. */
+export async function stopSatellite(): Promise<void> {
+  if (!satelliteStarted) return;
+  satelliteStarted = false;
+  try {
+    await satelliteWorker.shutdown();
+  } catch {
+    /* best effort */
+  }
+  publish({ type: "satellite", started: false });
+}

@@ -32,7 +32,17 @@ export class SatelliteWorker {
   private storage: StorageProvider | null = null;
   private config: SatelliteConfig | null = null;
   private currentTask: TaskAssignment | null = null;
-  private pollTimer: NodeJS.Timeout | null = null;
+  /*
+    A browser-safe timer handle.
+
+    This was `NodeJS.Timeout`, which is a lie on the platform this file actually
+    ships to: the bundle runs in an Android WebView, where setInterval returns a
+    number. It type-checked only because `@types/node` is installed for the
+    desktop build, so the error would have surfaced at runtime on a tablet —
+    not at compile time. Declaring the shape we truly depend on (something
+    clearInterval accepts) keeps this file honest on both platforms.
+  */
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   async initialize(config: SatelliteConfig): Promise<void> {
     this.config = config;

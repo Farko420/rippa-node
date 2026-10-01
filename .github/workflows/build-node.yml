@@ -234,47 +234,162 @@ jobs:
 
 
   # ===========================================================================
-  # ANDROID APK JOB — SUSPENDED 2026-10-01, REMOVED PENDING REFACTOR.
+  # ANDROID APK JOB — RE-ENABLED.
   #
-  # The `build-apk` job has been deleted from this workflow. It failed with:
+  # It was deleted on 2026-10-01 after failing with "Worker bundling failed —
+  # the worker must not depend on Node builtins". That was a real architectural
+  # fault, not a YAML mistake, and it has now actually been fixed:
   #
-  #   Worker bundling failed - the worker must not depend on Node builtins
+  #   * `src/satellite/storage-provider.ts` puts persistence behind a
+  #     StorageProvider interface, with better-sqlite3 kept as the DESKTOP
+  #     implementation only (`storage-desktop.ts`).
+  #   * `src/satellite/mobile-worker.ts` is the browser-safe satellite core and
+  #     IS part of the WebView bundle (re-exported from `mobile/src/worker.ts`).
+  #   * `scripts/build-mobile-worker.mjs` bundles for the browser and remaps the
+  #     desktop provider onto `storage-desktop.browser.ts` via an esbuild plugin.
   #
-  # That failure is architectural, not a YAML or version-pin mistake, so no
-  # amount of CI tuning fixes it. The cause:
+  # WHY THE PLUGIN IS NECESSARY. Guarding the desktop branch with a runtime
+  # check is NOT sufficient: esbuild resolves and parses a dynamically imported
+  # module during its scan phase, BEFORE dead-code elimination, so better-sqlite3
+  # was still pulled in and the build died on `Could not resolve "path"`.
+  # `--alias:` cannot fix it either — esbuild only accepts bare package
+  # specifiers there, never the relative `./storage-desktop.js` that is imported.
+  # A resolve plugin is the only mechanism that keeps the desktop module out of
+  # the browser graph, and `npm run test:mobile:bundle` now proves it by
+  # evaluating the emitted bundle in a WebView-shaped context on every run.
   #
-  #   Capacitor does NOT run in Node.js. It runs the worker inside Android's
-  #   system WebView, i.e. a BROWSER engine. The same backend modules the .exe
-  #   job depends on are unavailable or meaningless there:
-  #
-  #     * `fs`, `path`, `os`, `child_process` — no Node builtins in a WebView.
-  #     * `better-sqlite3` — a native Node addon compiled against a Node ABI
-  #       (NODE_MODULE_VERSION). An Android .so is not loadable from a WebView,
-  #       and the addon has no browser build at all.
-  #
-  # The APK can only work once the storage engine is ABSTRACTED: put SQLite
-  # behind an interface and ship a browser/WASM implementation (wa-sqlite,
-  # sql.js, or Capacitor's own @capacitor-community/sqlite via a plugin) for
-  # the mobile target, keeping better-sqlite3 as the Node/desktop
-  # implementation. The bundler can then tree-shake the native path out of the
-  # worker. That refactor is out of scope for a CI fix and has not been done.
-  #
-  # WHY DELETE RATHER THAN `if: false`:
-  #   A permanently-false job still occupies a runner slot, still shows up red
-  #   or skipped in the checks list, and still needs its YAML kept in sync with
-  #   every change to the .exe job. Deleting it leaves one honest, green job
-  #   that actually builds the artifact the fleet's Master downloads.
-  #
-  # NOTHING IS LOST: the .exe job has no `needs:` on the APK and vice versa, so
-  # the Windows release path was never blocked by this. The full job definition
-  # remains in git history (commit 63b805f) and can be restored verbatim once
-  # the storage abstraction lands.
-  #
-  # TO RE-ENABLE:
-  #   1. Abstract the SQLite storage layer; add a browser/WASM implementation.
-  #   2. Restore the job with `git show 63b805f:.github/workflows/build-node.yml`
-  #      and re-attach the `build-apk:` block below the header comments.
-  #   3. Verify the worker bundle with a grep for `require('fs')` /
-  #      `better-sqlite3` before spending a Gradle cycle on it.
+  # INDEPENDENCE. This job has no `needs:` on the Windows job and vice versa, so
+  # an Android-only failure can never block the fleet's .exe release.
   # ===========================================================================
+  build-apk:
+    name: Build rippa-satellite.apk
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 17 is what Capacitor 6 / AGP 8.x / Gradle 8 target. The build fails
+      # cryptically on 11, so this pin is load-bearing, not cosmetic.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # NO setup-android step on purpose. The ubuntu-latest image already ships
+      # the Android SDK and exports ANDROID_HOME / ANDROID_SDK_ROOT, which
+      # Capacitor's Gradle build resolves from. android-actions/setup-android
+      # only added a slow SDK re-download and another failure point. If Gradle
+      # ever needs a missing component, install it with sdkmanager explicitly
+      # rather than reintroducing the action.
+
+      # Gradle's own cache. Without it every run re-downloads the Android
+      # toolchain and dependency graph from scratch, which is most of the job.
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-apk-${{ runner.os }}-${{ hashFiles('mobile/android/**/build.gradle') }}
+          restore-keys: |
+            gradle-apk-${{ runner.os }}-
+
+      # `npm ci` needs a lockfile in sync with package.json; fall back so a
+      # lockfile mismatch can never hard-fail the release pipeline.
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      # -------------------------------------------------------------------------
+      # THE BUNDLE IS VERIFIED BEFORE GRADLE IS SPENT.
+      #
+      # This step needs no Android SDK and takes about a second, and it is the
+      # check that would have caught the original failure in seconds instead of
+      # after a multi-minute Gradle run. It builds the worker, asserts it holds
+      # no better-sqlite3 / node builtins, then evaluates the bundle in a
+      # WebView-shaped context.
+      # -------------------------------------------------------------------------
+      - name: Verify the mobile worker bundle is WebView-safe
+        run: npm run test:mobile:bundle
+
+      # Compiles web assets, stages mobile/www/, generates mobile/android/,
+      # applies the manifest overlay and runs Gradle assembleDebug. The script
+      # copies the result to ./rippa-satellite.apk at the workspace root.
+      - name: Build the APK
+        run: npm run build:apk
+
+      # Prefer the root copy the packager makes, and fall back to searching the
+      # Gradle output tree. `|| true` on the find keeps `set -e` from killing the
+      # step before the explicit "no APK" error below can explain what happened.
+      - name: Locate the APK
+        id: apk
+        run: |
+          set -euo pipefail
+          if [ -f rippa-satellite.apk ]; then
+            APK=rippa-satellite.apk
+          else
+            APK=$(find mobile/android/app/build/outputs/apk -name '*.apk' 2>/dev/null | head -n 1 || true)
+          fi
+          if [ -z "${APK:-}" ]; then
+            echo "::error::Gradle produced no APK"
+            exit 1
+          fi
+          echo "Found $APK ($(du -h "$APK" | cut -f1))"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      # Asserts the foreground-service configuration really made it into the
+      # binary. A silently-missing WAKE_LOCK is the exact failure that makes a
+      # tablet stop at midnight, so it is worth failing the build over. Skips
+      # cleanly when aapt2 is absent rather than failing on a missing tool.
+      - name: Verify the APK manifest
+        run: |
+          set -euo pipefail
+          AAPT=$(ls "${ANDROID_HOME}"/build-tools/*/aapt2 2>/dev/null | head -n 1 || true)
+          if [ -z "$AAPT" ]; then
+            echo "::warning::aapt2 not found; skipping manifest verification"
+            exit 0
+          fi
+          DUMP="$("$AAPT" dump xmltree --file AndroidManifest.xml "${{ steps.apk.outputs.path }}" | tr -d '\r')"
+          for NEEDLE in WAKE_LOCK FOREGROUND_SERVICE RippaNodeService; do
+            if ! grep -q "$NEEDLE" <<<"$DUMP"; then
+              echo "::error::APK manifest is missing $NEEDLE"
+              exit 1
+            fi
+            echo "ok: $NEEDLE present"
+          done
+
+      # THE DELIVERABLE. This is what a tablet operator downloads and sideloads,
+      # so it is a first-class artifact with a stable name rather than something
+      # buried in release assets.
+      - name: Upload rippa-satellite.apk
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rippa-satellite-apk
+          # Static path, never a step output: the Locate step exits 1 when Gradle
+          # emits nothing, and `if: always()` would then pass an EMPTY output,
+          # which upload-artifact@v4 rejects with "Input required and not
+          # supplied: path" — masking the real Gradle failure.
+          path: rippa-satellite.apk
+          # `error`, not `warn`: the APK is the entire purpose of this job, so a
+          # missing artifact must surface as a red run rather than a green check
+          # that produced nothing.
+          if-no-files-found: error
+          retention-days: 30
+
+      # DIAGNOSTIC. A Gradle failure deep in the Android build is hard to read
+      # without knowing what was actually staged.
+      - name: List build outputs
+        if: always()
+        run: |
+          ls -la
+          ls -la mobile/www || true
+          ls -laR mobile/android/app/build/outputs/apk 2>/dev/null || true
 

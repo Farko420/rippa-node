@@ -149,36 +149,26 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
 `;
 
 // --- 1. Bundle the worker ----------------------------------------------------
-console.log("[APK] 1/5 Bundling the mobile worker (esbuild, browser target)...");
+console.log("[APK] 1/5 Bundling the mobile worker (browser target)...");
 
 /*
-  THE BUNDLE TARGETS esnext AND THE BROWSER PLATFORM, with every Node builtin
-  marked external. That last part is deliberate: if the worker ever reaches for
-  `node:fs`, this build FAILS LOUDLY here rather than producing an APK that dies
-  at runtime on a tablet. A broken APK is far more expensive to diagnose than a
-  red build step.
+  DELEGATED TO scripts/build-mobile-worker.mjs, which owns the bundling and —
+  critically — the esbuild plugin that remaps the desktop SQLite provider onto
+  a browser stub.
+
+  It used to be inline here, which is exactly how the pipeline broke: a plain
+  `esbuild --platform=browser` invocation cannot exclude `storage-desktop.ts`
+  because a dynamic import does not tree-shake (esbuild resolves it during its
+  scan phase, before dead-code elimination), so the build died on
+  `Could not resolve "path"` from inside better-sqlite3. Splitting it out means
+  the fix is unit-testable on its own — `npm run test:mobile:bundle` — with no
+  Android SDK, no Gradle and no network.
+
+  The script also guards its own output for Node builtins and exits non-zero on
+  a hit, so a regression fails here in a second rather than producing an APK
+  that dies on a tablet.
 */
-const buildResult = spawnSync(
-  process.execPath,
-  [
-    path.join(root, "node_modules", "esbuild", "bin", "esbuild"),
-    path.join(mobileDir, "src", "worker.ts"),
-    "--bundle",
-    "--format=iife",
-    "--global-name=RippaMobileWorker",
-    "--platform=browser",
-    "--target=es2020",
-    "--outfile=" + path.join(wwwDir, "worker.js"),
-    "--external:node:*",
-    "--external:fs",
-    "--log-level=warning",
-  ],
-  { cwd: root, stdio: "inherit" },
-);
-if (buildResult.error || buildResult.status !== 0) {
-  console.error("[APK] Worker bundling failed — the worker must not depend on Node builtins.");
-  process.exit(1);
-}
+run(process.execPath, [path.join(root, "scripts", "build-mobile-worker.mjs"), "--out", path.join(wwwDir, "worker.js")]);
 
 // --- 2. Stage the dashboard --------------------------------------------------
 console.log("[APK] 2/5 Staging the dashboard into mobile/www/ ...");
@@ -259,6 +249,17 @@ if (skipGradle) {
 }
 
 console.log("[APK] 5/5 Building the APK with Gradle ...");
+
+/*
+  PREFLIGHT. Gradle needs BOTH an Android SDK and a JDK, and when the JDK is
+  missing Gradle exits 9009 after a confusing multi-line banner that mentions
+  JAVA_HOME but never says which tool was not found. Checking both up front lets
+  this script name the actual missing piece.
+
+  The SDK check also honours the Windows default install location, because a
+  developer machine typically has the SDK installed but neither ANDROID_HOME nor
+  ANDROID_SDK_ROOT exported — the common case, not an edge case.
+*/
 const hasSdk =
   Boolean(process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT) ||
   fs.existsSync(path.join(process.env.LOCALAPPDATA || "", "Android", "Sdk"));
@@ -271,8 +272,44 @@ if (!hasSdk) {
   process.exit(1);
 }
 
+/** True when a JDK is reachable, via JAVA_HOME or java on PATH. */
+function hasJdk() {
+  if (process.env.JAVA_HOME && fs.existsSync(process.env.JAVA_HOME)) return true;
+  const probe = isWindows ? spawnSync("where", ["java"]) : spawnSync("which", ["java"]);
+  return probe.status === 0;
+}
+
+if (!hasJdk()) {
+  console.error(
+    "[APK] No JDK found. Gradle needs a Java 17+ runtime.\n" +
+      "       Set JAVA_HOME, or install a JDK (CI uses Temurin 17 via setup-java).\n" +
+      "       Everything up to this point has been staged and verified —\n" +
+      "       run with --skip-gradle to stage without building.",
+  );
+  process.exit(1);
+}
+
 const gradlew = path.join(androidDir, isWindows ? "gradlew.bat" : "gradlew");
-run(gradlew, ["assembleDebug"], { cwd: androidDir });
+/*
+  TWO Windows-specific hazards, both hit and fixed while verifying this pipeline.
+
+  1. `shell: isWindows` is REQUIRED, not cosmetic, and mirrors what step 3 already
+     does for npm. Since Node 18.20/20.12, spawnSync() of a `.bat` WITHOUT a
+     shell fails with EINVAL.
+  2. With a shell enabled, the command is re-parsed by cmd.exe — and this
+     workspace path contains a space ("Rippa Node"), so an unquoted path dies
+     with "'C:\Projects\Rippa' is not recognized...". Quoting is therefore
+     mandatory whenever the shell is used, not just when the path has a space:
+     it is the only form that is correct on both.
+
+  `shell: false` when not on Windows keeps the POSIX path free of an extra
+  shell layer, where a quoted argument would become a literal quoted filename.
+*/
+if (isWindows) {
+  run(`"${gradlew}"`, ["assembleDebug"], { cwd: androidDir, shell: true });
+} else {
+  run(gradlew, ["assembleDebug"], { cwd: androidDir });
+}
 
 const apk = path.join(androidDir, "app", "build", "outputs", "apk", "debug", "app-debug.apk");
 if (!fs.existsSync(apk)) {

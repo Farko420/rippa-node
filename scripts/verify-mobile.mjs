@@ -35,6 +35,13 @@ check("runtime flavor on desktop is 'node'", platform.runtimeFlavor() === "node"
 {
   const mobile = await loadAs("dist/platform.js", "webview");
   globalThis.Capacitor = { isNativePlatform: () => true, getPlatform: () => "android" };
+  // Keep a reference to the real `process` before nulling it. Simulating the
+  // WebView requires `process` to be absent for the duration of the block, but
+  // the final `process.exit()` below runs OUTSIDE the block — so without this
+  // the suite reported "28/28 checks passed" and then died with
+  // "TypeError: Cannot read properties of undefined (reading 'exit')",
+  // exiting non-zero on a fully green run.
+  const realProcess = globalThis.process;
   globalThis.process = undefined; // no Node runtime inside a WebView
 
   check("Android bridge -> isAndroid() true", mobile.isAndroid() === true);
@@ -85,6 +92,7 @@ if (built) {
 }
 
 delete globalThis.Capacitor;
+globalThis.process = realProcess; // restore Node for the rest of the suite
 }
 // --- 3. HTML -> text extraction quality -------------------------------------
 const fixture = `
