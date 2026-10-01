@@ -1134,11 +1134,25 @@ export function createApp(): Express {
     });
     console.log(`[API] Serving Local Web GUI from ${publicDir}`);
   } else {
+    // Nothing found anywhere, packaged or not. Name the likely cause instead of
+    // leaving the operator staring at a bare 503: on a released .exe this means
+    // the recursive `public/` pkg asset was missing from the build, which is a
+    // packaging bug, not something the user can fix on their PC.
+    console.warn(
+      `[API] No Web GUI assets found. Searched: installDir/public, __dirname/../../public ` +
+        "(the pkg snapshot), __dirname/../public and cwd/public.",
+    );
     app.get("/", (_req: Request, res: Response) => {
       res.status(503).json({
         success: false,
         message: "Web GUI assets (public/) not found in this build.",
       });
+    });
+    // Everything else falls through to the JSON 404 handler, but the SPA-ish
+    // entry points deserve the same explicit answer rather than a bare 404 that
+    // looks like a routing bug.
+    app.get("/dashboard", (_req: Request, res: Response) => {
+      res.redirect("/");
     });
   }
 

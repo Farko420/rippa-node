@@ -13,7 +13,8 @@
     "test:verify": "npm run build && node scripts/verify-units.mjs && node scripts/verify-fixes.mjs",
     "test:paths": "tsx scripts/verify-paths.mts",
     "test:mobile": "npm run build && node scripts/verify-mobile.mjs",
-    "package": "node scripts/package.mjs",
+    "build:webgui": "node scripts/build-webgui.mjs",
+    "package": "npm run build:webgui && node scripts/package.mjs",
     "package:apk": "node scripts/package-apk.mjs",
     "build:apk": "npm run build && node scripts/package-apk.mjs"
   },
@@ -51,7 +52,13 @@
       "node_modules/playwright-core/browsers.json",
       "node_modules/playwright-core/package.json",
       "node_modules/playwright/package.json",
-      "public/**/*"
+      "public/**/*",
+      "public/index.html",
+      "public/app.js",
+      "public/styles.css",
+      "public/dashboard.html",
+      "public/dashboard.css",
+      "public/dashboard.js"
     ]
   }
 }

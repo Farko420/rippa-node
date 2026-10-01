@@ -508,9 +508,25 @@ export function validateConfigInput(
 /**
  * Resolves the `public/` web GUI directory (dev, dist, and pkg snapshot).
  *
- * The app root (folder beside the .exe when packaged) is checked FIRST so a
- * user-supplied `public/` next to the exe always wins over the bundled
- * snapshot. The `__dirname` candidates remain for dev/dist only.
+ * WHY THE `__dirname` CANDIDATES ARE NOT PACKAGE-AWARE ANY MORE. They used to be
+ * skipped when `process.pkg` was set, on the assumption that inside an exe
+ * `__dirname` points at a virtual filesystem no real `fs` call could read. That
+ * assumption is simply wrong: `pkg` patches `fs`, so `/snapshot/...` paths read
+ * perfectly well. Skipping them meant a released exe — which ships as a BARE
+ * `rippa-node.exe`, because the OTA updater replaces only that one file — had no
+ * `public/` beside it and no snapshot lookup either, so the dashboard answered
+ * `503 Web GUI assets (public/) not found in this build`.
+ *
+ * Order is unchanged in spirit and still deliberate:
+ *   1. `installDir()/public` — a `public/` folder the operator dropped beside the
+ *      exe always wins, so the dashboard can be patched without a rebuild.
+ *   2. `__dirname` candidates — the pkg snapshot (and dev/dist). This is what
+ *      makes the single-file exe self-sufficient.
+ *   3. `process.cwd()/public` — last-resort convenience for odd launch folders.
+ *
+ * Caveat on (1): an OTA update replaces the .exe only, so a hand-supplied folder
+ * beside it survives the update and will shadow the newer bundled GUI until it is
+ * removed. That is the intended "I know what I'm doing" escape hatch.
  */
 export function resolvePublicDir(): string | null {
   const candidates: string[] = [];
@@ -522,13 +538,15 @@ export function resolvePublicDir(): string | null {
   } catch {
     /* ignore */
   }
-  if (!isPackaged()) {
-    // Inside a pkg exe __dirname points at the virtual snapshot; only the
-    // staged/bundled asset is valid there, so skip these in the packaged case.
-    candidates.push(path.join(__dirname, "..", "..", "public"));
-    candidates.push(path.join(__dirname, "..", "public"));
-  }
+  // THE PKG SNAPSHOT. `__dirname` is `/snapshot/<name>/dist/config` in the exe
+  // (configManager compiles to `dist/config/`), so `../..` lands on
+  // `/snapshot/<name>/public` — exactly where the recursive `public/` glob in
+  // `pkg.assets` puts the files. In dev (`src/config/`) and dist (`dist/config/`)
+  // `../..` lands on the project root, which is the same folder.
+  candidates.push(path.join(__dirname, "..", "..", "public"));
+  candidates.push(path.join(__dirname, "..", "public"));
   candidates.push(path.join(process.cwd(), "public"));
+
   for (const dir of candidates) {
     try {
       if (fs.existsSync(dir) && fs.existsSync(path.join(dir, "index.html"))) return dir;
@@ -542,6 +560,14 @@ export function resolvePublicDir(): string | null {
     } catch {
       /* try next */
     }
+  }
+  // The caller already answers 503, but say WHERE it looked — a silent miss in
+  // an exe is otherwise near-impossible to diagnose from the user's side.
+  if (isPackaged()) {
+    console.warn(
+      `[Config] Web GUI not found. Searched: ${candidates.join(", ")}. ` +
+        "This exe is missing its `public/**/*` pkg assets — rebuild it with `npm run package`.",
+    );
   }
   return null;
 }

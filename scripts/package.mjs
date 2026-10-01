@@ -4,13 +4,25 @@
  *
  * Builds Rippa Node into a clean, portable `dist/` folder:
  *
- *   3. Bundle  — pkg freezes the JS + required assets (SQLite prebuild,
- *                Playwright registry data, Local Web GUI in public/) into
- *                `dist/rippa-node.exe`.
- *   4. Prune   — drop the intermediate .js/.map files so dist/ only contains
- *                the finished executable (+ any user files created later:
- *                config.json and the Deep Brain database live beside it).
- *                A copy of public/ is staged beside the exe as fallback.
+ *   1. Clean     — wipe dist/ so a stale file can never be frozen in.
+ *   2. Compile   — tsc -> dist/.
+ *   3. Verify    — assert public/ is complete (see scripts/build-webgui.mjs).
+ *   4. Bundle    — pkg freezes the JS + required assets (SQLite prebuild,
+ *                  Playwright registry data, Local Web GUI in public/) into
+ *                  `dist/rippa-node.exe`.
+ *   5. Prune     — drop the intermediate .js/.map files so dist/ only contains
+ *                  the finished executable (+ any user files created later:
+ *                  config.json and the Deep Brain database live beside it).
+ *   6. Stage     — copy public/ beside the exe, for folder-copy deployments.
+ *
+ * THE DASHBOARD LIVES INSIDE THE EXE. Step 4 is what serves the Web GUI on a
+ * released build: `pkg.assets` bundles the whole `public/` tree, and the backend
+ * resolves it through `__dirname`, which inside a `pkg` exe is the virtual
+ * snapshot. The
+ * step-6 copy is a convenience for anyone dragging the whole `dist/` folder
+ * around — it is NOT required, and must never be mistaken for the real source,
+ * because the OTA updater replaces the .exe alone and would leave that copy
+ * stale next to a freshly bundled GUI.
  *
  * The whole dist/ folder can then be copied to any Windows PC. First run of
  * rippa-node.exe opens the Local Configuration Dashboard in the browser.
@@ -67,15 +79,24 @@ function resolvePkgInvocation() {
 }
 
 // --- 1. Clean ---------------------------------------------------------------
-console.log("[Package] 1/4 Cleaning dist/ ...");
+console.log("[Package] 1/6 Cleaning dist/ ...");
 fs.rmSync(distDir, { recursive: true, force: true });
 
 // --- 2. Compile TypeScript ---------------------------------------------------
-console.log("[Package] 2/4 Compiling TypeScript ...");
+console.log("[Package] 2/6 Compiling TypeScript ...");
 run(process.execPath, [path.join(root, "node_modules", "typescript", "bin", "tsc"), "-p", "tsconfig.json"]);
 
-// --- 3. Bundle with pkg ------------------------------------------------------
-console.log("[Package] 3/4 Bundling rippa-node.exe (@yao-pkg/pkg, node22-win-x64) ...");
+// --- 3. Verify the Web GUI ---------------------------------------------------
+// `pkg` snapshots whatever `public/` contains AT THIS MOMENT and that snapshot is
+// frozen into the exe forever after. If the folder is empty or half-copied the
+// only symptom an operator ever sees is a 503 dashboard with no build error, so
+// the packaging is aborted here instead. `npm run package` normally runs this
+// check first via `build:webgui`; running this file directly must be just as safe.
+console.log("[Package] 3/6 Verifying Web GUI assets ...");
+run(process.execPath, [path.join(root, "scripts", "build-webgui.mjs")]);
+
+// --- 4. Bundle with pkg ------------------------------------------------------
+console.log("[Package] 4/6 Bundling rippa-node.exe (@yao-pkg/pkg, node22-win-x64) ...");
 const pkg = resolvePkgInvocation();
 // Relative entry + output paths (no spaces) + cwd:root keep this safe in any
 // checkout. Explicit entry file — pkg doesn't need a package.json "bin".
@@ -102,8 +123,8 @@ if (!fs.existsSync(exePath)) {
   process.exit(1);
 }
 
-// --- 4. Prune build artifacts ------------------------------------------------
-console.log("[Package] 4/4 Pruning intermediate build files from dist/ ...");
+// --- 5. Prune build artifacts ------------------------------------------------
+console.log("[Package] 5/6 Pruning intermediate build files from dist/ ...");
 let pruned = 0;
 const prune = (dir) => {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -123,13 +144,21 @@ const prune = (dir) => {
 };
 prune(distDir);
 
-// --- 5. Stage public/ beside the exe (fallback if snapshot lookup misses) ---
+// --- 6. Stage public/ beside the exe (fallback for folder copies) -------------
+// This is a CONVENIENCE copy for "copy the whole dist/ folder" deployments, NOT
+// the primary source of the dashboard. The primary source is the recursive
+// `public/` glob frozen into the snapshot by pkg, read via `__dirname` in
+// `configManager.resolvePublicDir()` — that is what makes a bare `rippa-node.exe`
+// (which is all the OTA updater replaces) serve its own dashboard.
 const publicSrc = path.join(root, "public");
 const publicDest = path.join(distDir, "public");
 if (fs.existsSync(publicSrc)) {
   fs.rmSync(publicDest, { recursive: true, force: true });
   fs.cpSync(publicSrc, publicDest, { recursive: true });
-  console.log("[Package] 5/5 Staged public/ beside the exe.");
+  console.log("[Package] 6/6 Staged public/ beside the exe (folder-copy convenience).");
+} else {
+  console.error(`[Package] Expected ${publicSrc} to exist after step 3 — aborting.`);
+  process.exit(1);
 }
 
 const sizeMb = fs.statSync(exePath).size / (1024 * 1024);
