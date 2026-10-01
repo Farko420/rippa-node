@@ -40,12 +40,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-           # PINNED STRICTLY TO 20 LTS: Node 20 has guaranteed precompiled .node
-           # binaries for better-sqlite3 on Windows, completely bypassing node-gyp
-           # C++ compilation. Node 22 lacks prebuilds and triggers compilation, which
-           # fails on Windows runners due to missing MSVC toolchain.
-           # shipped binary now agree instead of silently drifting apart.
-           node-version: '20'
+          node-version: '20'
           cache: npm
 
       # -------------------------------------------------------------------------
