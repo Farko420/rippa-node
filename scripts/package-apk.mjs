@@ -12,7 +12,7 @@
  *   1. bundle the mobile worker with esbuild (browser target, no Node builtins)
  *   2. stage the dashboard into `mobile/www/`
  *   3. install the Capacitor deps
- *   4. generate `android/` if absent, then apply the manifest overlay
+ *   4. generate `android/` if absent, sync `www/` into it, then overlay the manifest
  *   5. run Gradle to emit the APK
  *
  * EVERYTHING HERE IS ISOLATED FROM THE WINDOWS BUILD ON PURPOSE. `mobile/` holds
@@ -90,6 +90,41 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
   pre { margin-top:14px; max-height:190px; overflow:auto; font-size:11px;
         color:var(--mut); white-space:pre-wrap; }
+  /* ---- ADVANCED SETTINGS ---------------------------------------------------
+     A collapsible panel, because the node has to work unattended on a tablet:
+     the operator opens this once, sets the limits, and never thinks about it
+     again. Power settings only exist on Android, so the panel is hidden
+     entirely elsewhere rather than shown disabled. */
+  details { margin-top:18px; border:1px solid var(--line); border-radius:12px;
+            background:var(--bg); }
+  details[hidden] { display:none; }
+  summary { cursor:pointer; padding:14px 16px; font-size:14px; font-weight:600;
+            list-style:none; display:flex; align-items:center; gap:8px; }
+  summary::-webkit-details-marker { display:none; }
+  summary::before { content:"\\25B8"; color:var(--mut); font-size:11px; }
+  details[open] summary::before { content:"\\25BE"; }
+  .settings-body { padding:0 16px 16px; }
+  .hint { margin:0 0 12px; font-size:12px; color:var(--mut); line-height:1.5; }
+  .opt { display:flex; align-items:flex-start; gap:10px; padding:10px 0;
+         border-top:1px solid var(--line); }
+  .opt input[type=checkbox] { margin-top:2px; width:16px; height:16px; flex:0 0 auto;
+                              accent-color:var(--ok); }
+  .opt label { font-size:13px; cursor:pointer; }
+  .opt .desc { display:block; color:var(--mut); font-size:11px; margin-top:3px;
+               line-height:1.45; }
+  .num { width:64px; padding:6px 8px; margin-top:6px; font-size:13px;
+         background:var(--bg); color:var(--txt); border:1px solid var(--line);
+         border-radius:8px; }
+  .batt { margin-top:14px; padding:10px 12px; border-radius:10px; font-size:12px;
+          background:var(--bg); border:1px solid var(--line); line-height:1.5; }
+  .banner { margin-top:12px; padding:11px 13px; border-radius:10px; font-size:12px;
+            line-height:1.5; background:rgba(210,153,34,.12);
+            border:1px solid var(--warn); color:var(--warn); }
+  .saved { margin-top:10px; font-size:11px; color:var(--ok); min-height:14px; }
+  .btn { margin-top:12px; padding:10px 16px; font-size:13px; font-weight:600;
+         color:#0d1117; background:var(--ok); border:0; border-radius:9px;
+         cursor:pointer; }
+  .btn:active { opacity:.85; }
 </style>
 </head>
 <body>
@@ -97,6 +132,49 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   <h1>Rippa Node &mdash; Android Satellite</h1>
   <p class="sub">Background worker. The screen may be turned off.</p>
   <div id="rows"></div>
+
+  <!--
+    BATTERY + POWER LIMITS.
+
+    Hidden by default and revealed from render() only once a real power
+    reading exists (source !== 'unavailable'). A panel offering controls that
+    do nothing is worse than no panel, so it appears exactly when it can be
+    effective: on Android, with the Capacitor Device plugin reporting.
+  -->
+  <details id="powerPanel" hidden>
+    <summary>Power &amp; Battery</summary>
+    <div class="settings-body">
+      <div class="batt" id="powerReadout">Reading battery&hellip;</div>
+
+      <div class="opt">
+        <input type="checkbox" id="pCharging" />
+        <label for="pCharging">Run only when charging
+          <span class="desc">Suspend all swarm work the moment the tablet is
+          unplugged, and resume on its own when a charger appears.</span></label>
+      </div>
+
+      <div class="opt">
+        <input type="checkbox" id="pPause" />
+        <label for="pPause">Pause below a battery level
+          <span class="desc">Suspend the swarm at or under the level on the
+          right. Unticked = never pause for low battery.</span></label>
+        <input class="num" type="number" id="pPercent" min="0" max="100" step="1" />
+      </div>
+
+      <div class="opt">
+        <input type="checkbox" id="pThrottle" />
+        <label for="pThrottle">Throttle polling on battery
+          <span class="desc">Stretch every poll interval 6x while discharging,
+          so heartbeats cost almost nothing. Automatic at full speed on
+          mains.</span></label>
+      </div>
+
+      <button class="btn" id="pSave" type="button">Save &amp; apply now</button>
+      <div class="saved" id="pSaved"></div>
+    </div>
+  </details>
+
+  <div class="banner" id="powerBanner" hidden></div>
   <pre id="log">Starting&hellip;</pre>
 </div>
 <script src="worker.js"></script>
@@ -104,6 +182,12 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   var W = window.RippaMobileWorker;
   var logEl = document.getElementById('log');
   var started = false;
+  var powerPanel = document.getElementById('powerPanel');
+  var powerBanner = document.getElementById('powerBanner');
+  var powerReadout = document.getElementById('powerReadout');
+  var savedEl = document.getElementById('pSaved');
+  /** Guards the one-time form fill, so a 2s re-render never clobbers typing. */
+  var powerFormReady = false;
   function line(text) {
     logEl.textContent = (text + '\\n' + logEl.textContent).slice(0, 4000);
   }
@@ -127,7 +211,82 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
       return '<div class="row"><span>' + r[0] + '</span><span class="' + r[2] + '">' +
              r[1] + '</span></div>';
     }).join('');
+    renderPower(status.power);
   }
+
+  /**
+   * Renders battery state, the suspension banner and the limits form.
+   *
+   * The panel stays hidden until the source is a real reading rather than
+   * 'unavailable': showing limit controls on a platform that cannot report a
+   * battery would invite an operator to tick "run only when charging" and watch
+   * it do nothing. evaluatePower() fails open in that case, so the node still
+   * works; we simply do not advertise the setting.
+   */
+  function renderPower(power) {
+    if (!power) return;
+    if (power.source === 'unavailable') { powerPanel.hidden = true; return; }
+    powerPanel.hidden = false;
+
+    var level = power.level === null || power.level === undefined
+      ? 'unknown' : power.level + '%';
+    var state = power.charging ? 'charging' : 'on battery';
+    var extra = power.throttle > 1 ? ' \\u00b7 polling throttled ' +
+      power.throttle + 'x' : '';
+    powerReadout.textContent = 'Battery ' + level + ' \\u00b7 ' + state + extra;
+
+    if (power.suspended) {
+      powerBanner.hidden = false;
+      powerBanner.textContent = power.reason ||
+        'Swarm work is paused by your power limits.';
+    } else {
+      powerBanner.hidden = true;
+    }
+
+    // Seed the controls from the stored limits exactly once. Re-seeding on every
+    // render would undo half-finished edits while the operator types.
+    if (!powerFormReady && power.limits) {
+      document.getElementById('pCharging').checked =
+        power.limits.runOnlyWhenCharging === true;
+      document.getElementById('pThrottle').checked =
+        power.limits.throttlePolling === true;
+      var pct = document.getElementById('pPause');
+      var box = document.getElementById('pPercent');
+      pct.checked = power.limits.pauseBelowPercent !== null;
+      if (pct.checked) box.value = power.limits.pauseBelowPercent;
+      box.disabled = !pct.checked;
+      powerFormReady = true;
+    }
+  }
+
+  document.getElementById('pPause').addEventListener('change', function () {
+    // A greyed-out field next to an unticked box reads as broken; disable it so
+    // the enabled rule is unambiguous at a glance.
+    document.getElementById('pPercent').disabled = !this.checked;
+  });
+
+  /**
+   * Applies the limits immediately.
+   *
+   * setPowerLimits() returns the NORMALISED limits the worker will actually
+   * enforce, so we re-render from that rather than from the form: a blank or
+   * out-of-range number field is coerced by the worker, and the UI must show the
+   * coerced truth, not the operator's typo.
+   */
+  document.getElementById('pSave').addEventListener('click', function () {
+    if (!W || !W.setPowerLimits) return;
+    var paused = document.getElementById('pPause').checked;
+    var box = document.getElementById('pPercent');
+    var applied = W.setPowerLimits({
+      runOnlyWhenCharging: document.getElementById('pCharging').checked,
+      pauseBelowPercent: paused ? box.value : null,
+      throttlePolling: document.getElementById('pThrottle').checked
+    });
+    if (paused) box.value = applied.pauseBelowPercent;
+    savedEl.textContent = 'Saved. Taking effect immediately \\u2014 no restart needed.';
+    setTimeout(function () { savedEl.textContent = ''; }, 4000);
+    if (W.workerStatus) renderPower(W.workerStatus().power);
+  });
   if (W && W.onWorkerEvent) {
     W.onWorkerEvent(function (event) {
       if (event.type === 'log') line(event.message);
@@ -213,6 +372,56 @@ if (!fs.existsSync(androidDir)) {
     process.exit(1);
   }
 }
+
+/*
+  SYNC THE WEB ASSETS IN — THIS STEP IS NOT OPTIONAL.
+
+  `cap add android` is a ONE-TIME scaffolding step. It runs only when `android/`
+  is missing, and it writes its own placeholder `index.html` into the app's
+  assets. Nothing in this script ever pushes `mobile/www/` across afterwards, so
+  Gradle dutifully packages whatever was staged the first time `cap add` ran —
+  which is how a build can report success while shipping a worker.js from weeks
+  ago. That failure is invisible: the APK installs, the launcher icon is there,
+  and the node simply runs an old bundle (or an empty page) forever.
+
+  `cap copy` is what moves `webDir` into `app/src/main/assets/public/`. It is
+  cheap, idempotent, and must run on EVERY build, not just the first.
+*/
+const npxCap = isWindows ? "npx.cmd" : "npx";
+if (!tryRun(npxCap, ["cap", "copy", "android"], { cwd: mobileDir, ...shellOpts })) {
+  console.error("[APK] `npx cap copy android` failed — the APK would ship stale web assets.");
+  process.exit(1);
+}
+
+/*
+  ...AND VERIFY IT TOOK, rather than trusting the exit code.
+
+  Cheap and it catches the whole family: a wrong `webDir`, a silent copy failure,
+  a Gradle task picking up a cached `assets/` directory. Comparing the staged
+  page against the copy Gradle will package turns "the build worked" into "the
+  build packaged the thing you just wrote".
+*/
+const androidAssets = path.join(androidDir, "app", "src", "main", "assets", "public");
+for (const [staged, packaged] of [
+  ["index.html", "index.html"],
+  ["worker.js", "worker.js"],
+]) {
+  const src = path.join(wwwDir, staged);
+  const dst = path.join(androidAssets, packaged);
+  if (!fs.existsSync(dst)) {
+    console.error(`[APK] Assets were not synced: ${dst} is missing.`);
+    process.exit(1);
+  }
+  const a = fs.statSync(src).size;
+  const b = fs.statSync(dst).size;
+  if (a !== b) {
+    console.error(
+      `[APK] Stale asset detected: ${staged} staged ${a} B but Android has ${b} B.`,
+    );
+    process.exit(1);
+  }
+}
+console.log("[APK] Synced and verified the web assets in the Android project.");
 
 /*
   THE OVERLAY IS APPLIED AFTER GENERATION, ALWAYS.

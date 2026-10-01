@@ -25,6 +25,15 @@
 
 import { describeRuntime, runtimeCapabilities, supportsBrowserScraping } from "../../src/platform";
 import { scrapeMobile } from "../../src/agent/MobileScraper";
+import {
+  DEFAULT_POWER_LIMITS,
+  evaluatePower,
+  normaliseLimits,
+  readPowerSnapshot,
+  throttleFactor,
+  type PowerLimits,
+  type PowerSnapshot,
+} from "../../src/agent/DevicePower";
 
 /** How often the Mothership heartbeat is sent (matches the desktop 30s). */
 const HEARTBEAT_MS = 30_000;
@@ -38,6 +47,9 @@ const MAX_CONCURRENT_TASKS = 1;
 /** Where mobile config is persisted. WebView storage survives app restarts. */
 const CONFIG_KEY = "rippa_node_mobile_config";
 
+/** How often power limits are re-evaluated. */
+const POWER_CHECK_MS = 20_000;
+
 interface MobileConfig {
   nodeName: string;
   nodeCode: string;
@@ -45,6 +57,8 @@ interface MobileConfig {
   mothershipUrl: string;
   masterUrl: string;
   dashboardPin: string;
+  /** Operator-set battery/power limits. Absent => defaults. */
+  powerLimits?: PowerLimits;
 }
 
 const DEFAULT_CONFIG: MobileConfig = {
@@ -69,6 +83,29 @@ const counters = {
   lastError: "",
   lastRunAt: "",
 };
+
+/*
+  POWER STATE — the live battery reading and whether the limits currently hold
+  the swarm dispatcher off.
+
+  Kept as module state rather than re-read on every render because the UI polls
+  `workerStatus()` every two seconds: reading the battery that often would mean a
+  bridge round-trip per poll, which is precisely the battery cost this feature
+  exists to avoid. The value is refreshed on POWER_CHECK_MS instead.
+*/
+let powerSnapshot: PowerSnapshot = {
+  level: null,
+  charging: false,
+  pluggedOut: false,
+  state: "unknown",
+  source: "unavailable",
+};
+/** True while the operator's limits are holding the dispatcher off. */
+let powerSuspended = false;
+/** Why it is suspended, verbatim in the UI. Empty when running. */
+let powerReason = "";
+/** Current poll-interval multiplier from the throttle setting. */
+let powerThrottle = 1;
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -125,6 +162,25 @@ export function saveConfig(next: Partial<MobileConfig>): MobileConfig {
     // refusing to work at all.
   }
   return config;
+}
+
+/**
+ * Persists the operator's power limits and re-evaluates immediately.
+ *
+ * Exposed to the page so the Advanced Satellite Settings menu can apply a change
+ * without a restart. Re-evaluating on save (rather than waiting up to
+ * POWER_CHECK_MS) is what makes ticking "run only when charging" visibly suspend
+ * an unplugged tablet straight away, instead of up to 20 seconds later.
+ *
+ * Always returns the normalised limits that were actually stored, so the UI
+ * renders exactly what the worker will enforce rather than what was typed.
+ */
+export function setPowerLimits(next: unknown): PowerLimits {
+  const limits = normaliseLimits(next);
+  config = saveConfig({ powerLimits: limits });
+  void checkPower();
+  publish({ type: "power_limits", limits, power: powerStatus() });
+  return limits;
 }
 
 // --- NATIVE BRIDGE ----------------------------------------------------------
@@ -381,27 +437,130 @@ async function pollMaster(): Promise<void> {
 
 let timers: number[] = [];
 
+/**
+ * Installs (or reinstalls) the recurring loops at their current throttle.
+ *
+ * Split out from `startWorker()` because changing the throttle factor or coming
+ * back from suspension has to REBUILD the intervals: `setInterval` cannot have
+ * its period changed after the fact, so the only way to honour a 6x slowdown is
+ * to clear and recreate the timers. Rebuilding is cheap and idempotent.
+ */
+function installTimers(): void {
+  for (const timer of timers) window.clearInterval(timer);
+  timers = [
+    window.setInterval(() => void sendHeartbeat(), HEARTBEAT_MS * powerThrottle),
+    window.setInterval(() => void pollForTasks(), TASK_POLL_MS * powerThrottle),
+    window.setInterval(() => void pollMaster(), MESH_POLL_MS * powerThrottle),
+    window.setInterval(() => void checkPower(), POWER_CHECK_MS),
+  ];
+}
+
+/**
+ * Re-reads the battery and applies the operator's limits.
+ *
+ * THE CENTRAL POWER GATE. Every path that suspends work goes through here so the
+ * suspended state, the reason and the log line can never disagree with what the
+ * dispatcher is actually doing.
+ *
+ * Suspending does three things, in order:
+ *   1. stops the Mothership/mesh pollers (the swarm dispatcher work itself),
+ *   2. suspends the satellite core's Master polling,
+ *   3. publishes a `power` event so the UI shows WHY the node went quiet.
+ *
+ * The foreground service is deliberately NOT stopped. It is what keeps the
+ * process alive so that the node can resume by itself when a charger appears —
+ * tearing it down would mean the tablet needed a manual restart, which defeats
+ * the purpose of an unattended node.
+ *
+ * Resuming is the mirror image, and is triggered by the same timer, so plugging
+ * the tablet in needs no interaction.
+ */
+export async function checkPower(): Promise<void> {
+  const limits = normaliseLimits(config.powerLimits);
+  powerSnapshot = await readPowerSnapshot();
+  const verdict = evaluatePower(powerSnapshot, limits);
+
+  // --- SUSPEND -------------------------------------------------------------
+  if (!verdict.allowed && !powerSuspended) {
+    powerSuspended = true;
+    powerReason = verdict.reason;
+    for (const timer of timers) window.clearInterval(timer);
+    timers = [];
+    satelliteWorker.setSuspended(true);
+    log(`Swarm dispatcher suspended. ${verdict.reason}`);
+    publish({ type: "power", suspended: true, reason: powerReason, power: powerStatus() });
+    return;
+  }
+
+  // --- RESUME --------------------------------------------------------------
+  if (verdict.allowed && powerSuspended) {
+    powerSuspended = false;
+    powerReason = "";
+    satelliteWorker.setSuspended(false);
+    log("Swarm dispatcher resumed — power limits satisfied.");
+    publish({ type: "power", suspended: false, reason: "", power: powerStatus() });
+  }
+
+  // --- THROTTLE ------------------------------------------------------------
+  const factor = throttleFactor(powerSnapshot, limits);
+  if (factor !== powerThrottle) {
+    powerThrottle = factor;
+    // Only meaningful while running; a suspended worker has no timers to rebuild.
+    if (!powerSuspended) installTimers();
+    log(
+      factor === 1
+        ? "Polling back to normal frequency."
+        : `Polling throttled ${factor}x to conserve battery.`,
+    );
+  }
+}
+
+/** The power block the UI renders. Flat enough to read straight from the DOM. */
+export function powerStatus(): Record<string, unknown> {
+  return {
+    suspended: powerSuspended,
+    reason: powerReason,
+    throttle: powerThrottle,
+    level: powerSnapshot.level,
+    charging: powerSnapshot.charging,
+    state: powerSnapshot.state,
+    source: powerSnapshot.source,
+    limits: normaliseLimits(config.powerLimits ?? DEFAULT_POWER_LIMITS),
+  };
+}
+
 /** Boots the worker and every recurring loop. Safe to call once. */
 export async function startWorker(): Promise<void> {
   loadConfig();
   await ensureBackgroundService();
 
-  await sendHeartbeat();
-  await pollMaster();
-  await pollForTasks();
+  /*
+    POWER IS EVALUATED BEFORE ANY WORK.
 
-  timers = [
-    window.setInterval(() => void sendHeartbeat(), HEARTBEAT_MS),
-    window.setInterval(() => void pollForTasks(), TASK_POLL_MS),
-    window.setInterval(() => void pollMaster(), MESH_POLL_MS),
-  ];
+    On a tablet that is already at 3% and not charging, the correct behaviour is
+    to do nothing at all. Starting the pollers first and suspending them a moment
+    later would burn a Mothership heartbeat and may claim a task the node then
+    abandons, which is exactly the "satellite drops out of the swarm" symptom
+    power limits are supposed to prevent.
+  */
+  powerThrottle = 1;
+  await checkPower();
+
+  if (!powerSuspended) {
+    await sendHeartbeat();
+    await pollMaster();
+    await pollForTasks();
+  }
+
+  installTimers();
 
   log(
     `Worker started. runtime=${describeRuntime()} ` +
       `scraping=${supportsBrowserScraping() ? "chromium" : "fetch"} ` +
-      `concurrency=${MAX_CONCURRENT_TASKS}`,
+      `concurrency=${MAX_CONCURRENT_TASKS} ` +
+      `power=${powerSuspended ? "suspended" : "allowed"}`,
   );
-  publish({ type: "started", capabilities: runtimeCapabilities() });
+  publish({ type: "started", capabilities: runtimeCapabilities(), power: powerStatus() });
 }
 
 /** Stops every loop. The foreground service is left alone on purpose. */
@@ -419,6 +578,7 @@ export function workerStatus(): Record<string, unknown> {
     capabilities: runtimeCapabilities(),
     running: timers.length > 0,
     maxConcurrentTasks: MAX_CONCURRENT_TASKS,
+    power: powerStatus(),
   };
 }
 

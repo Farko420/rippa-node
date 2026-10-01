@@ -29,8 +29,14 @@
                            restarts the service after a reboot, so "overnight"
                            survives someone plugging the tablet in.
     FOREGROUND_SERVICE_SPECIAL_USE
-                           lets the service declare WHY it needs to run (see
-                           the property in the service declaration below).
+                           lets a service declare WHY it must keep running.
+                           NOTE: declared for safety, but NOT used by the service
+                           below, which is typed `dataSync` and therefore pairs
+                           with FOREGROUND_SERVICE_DATA_SYNC instead. Android
+                           requires the permission to MATCH the declared type, so
+                           adding it while keeping `dataSync` is harmless whereas
+                           the reverse (declaring `specialUse` without the
+                           permission) throws at startForeground().
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -41,6 +47,7 @@
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
   <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
   <application
       android:name="com.rippaadventures.node.RippaNodeApplication"
@@ -51,6 +58,47 @@
       android:supportsRtl="true"
       android:theme="@style/AppTheme"
       android:usesCleartextTraffic="true">
+
+    <!--
+      THE LAUNCHER ACTIVITY. THE REASON THIS APK HAD NO APP-DRAWER ICON.
+
+      This overlay REPLACES the manifest Capacitor generates (see the note at the
+      top of this file and scripts/package-apk.mjs). Capacitor's own template
+      declares MainActivity — that is where `npx cap add android` puts the
+      MAIN/LAUNCHER intent-filter. Replacing the file wholesale therefore
+      DELETED the launcher entry along with everything we intended to override.
+
+      The result is a genuinely confusing failure: the APK installs fine, the
+      foreground service runs, the node joins the swarm — and there is no icon
+      anywhere. Nothing errors, so it presents as "the build is broken" when in
+      fact the build was perfect and the app was simply un-launchable.
+
+      `configChanges` is not optional either. Without it, Android destroys and
+      recreates the activity on every rotation or theme change, which tears down
+      the WebView and with it every swarm poll timer. Capacitor's template
+      declares this list; dropping it reintroduces the same class of bug.
+
+      `android:screenOrientation="portrait"` matches the manifest's own intent:
+      this is a wall/desk appliance, not a handheld, so locking orientation
+      avoids a pointless activity recreation on a tablet that gets nudged.
+    -->
+    <activity
+        android:name=".MainActivity"
+        android:exported="true"
+        android:launchMode="singleTask"
+        android:screenOrientation="portrait"
+        android:theme="@style/AppTheme.NoActionBarLaunch"
+        android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation|density|fontScale">
+      <!--
+        THE LAUNCHER INTENT FILTER — verbatim what Capacitor's template emits.
+        Without BOTH lines the app is installed but un-launchable; with only
+        MAIN and no LAUNCHER category it is equally invisible in the drawer.
+      -->
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
 
     <!--
       THE NODE'S OWN FOREGROUND SERVICE.
