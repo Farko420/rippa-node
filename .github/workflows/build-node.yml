@@ -40,7 +40,11 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # PINNED, not floating. better-sqlite3 is a native addon: install either
+          # resolves a prebuilt binary for the running ABI or falls back to
+          # node-gyp, which needs a full MSVC toolchain and failed the job on
+          # Node 22. Pinning the major keeps the ABI the prebuilds ship for.
+          node-version: 20
           cache: npm
 
       # npm ci is preferred over npm install for reproducibility, but it fails
@@ -213,11 +217,15 @@ jobs:
       # `if: always()` is deliberate: a failed or skipped release publish must
       # never cost us the built exe, which is expensive to rebuild and is the
       # only copy of that exact build.
-      - name: Upload build artifact
+      - name: Upload the portable .exe
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rippa-node-exe
+          name: rippa-node-windows
+          # STATIC globs, never a step output. The Locate step above exits 1 when
+          # pkg produces nothing, so this `if: always()` step would otherwise run
+          # with an empty `path` and upload-artifact@v4 aborts the step with
+          # "Input required and not supplied: path" — masking the real pkg error.
           # Glob rather than the literal dist/rippa-node.exe: any *.exe the
           # packager emits is still the artifact we want, even if the output
           # path in scripts/package.mjs is ever changed.
@@ -270,7 +278,10 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # Same pin as the .exe job — the APK build runs `npm ci` for the root
+          # workspace too, so the root better-sqlite3 native addon is resolved
+          # under the same ABI in both jobs.
+          node-version: 20
           cache: npm
 
       - name: Set up Android SDK
@@ -344,6 +355,23 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rippa-node-apk
-          path: ${{ steps.apk.outputs.path }}
+          # STATIC paths, never `${{ steps.apk.outputs.path }}`. The Locate step
+          # exits 1 when Gradle produces nothing, so the `if: always()` upload
+          # still runs with an EMPTY output -> upload-artifact@v4 rejects the
+          # step with "Input required and not supplied: path" and masks the real
+          # Gradle failure. Static globs are always populated, and
+          # `if-no-files-found: warn` keeps a genuinely empty build non-fatal.
+          #
+          # `mobile/android/...` is the real location (scripts/package-apk.mjs
+          # runs Gradle in mobile/android, and the Locate step searches the
+          # same path); the `android/...` and root globs are harmless fallbacks
+          # if the Capacitor project ever moves.
+          path: |
+            mobile/android/app/build/outputs/apk/debug/*.apk
+            mobile/android/app/build/outputs/apk/release/*.apk
+            mobile/android/app/build/outputs/apk/**/*.apk
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/outputs/apk/release/*.apk
+            *.apk
           if-no-files-found: warn
           retention-days: 30
