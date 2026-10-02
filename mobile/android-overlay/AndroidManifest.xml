@@ -126,15 +126,30 @@
       the WebView and with it every swarm poll timer. Capacitor's template
       declares this list; dropping it reintroduces the same class of bug.
 
-      `android:screenOrientation="portrait"` matches the manifest's own intent:
-      this is a wall/desk appliance, not a handheld, so locking orientation
-      avoids a pointless activity recreation on a tablet that gets nudged.
+      `android:screenOrientation` is deliberately NOT LOCKED. It was
+      `portrait`, on the theory that this is a desk appliance that should never
+      rotate. That was wrong for the actual fleet: these tablets are mounted in
+      landscape (dashboard screens, counter-top nodes) and being pinned to
+      portrait left operators rotating a device that did not respond, or
+      installing a build and still seeing the app sideways.
+
+      `unspecified` defers to the device: it honours the user's own auto-rotate
+      setting, which is the correct default for hardware we do not control. Note
+      the deliberate choice NOT to use `fullSensor`, which ignores the user's
+      rotation lock and rotates regardless. That overrides an explicit user
+      preference, and is exactly the kind of "app second-guesses the OS"
+      behaviour that only bites in the field.
+
+      Rotation stays cheap regardless, because `configChanges` above already
+      absorbs `orientation|screenSize`: the activity is NOT recreated on rotate,
+      so the WebView and every swarm poll timer survive a rotation intact. That
+      is the property that makes unlocking safe, and it was already in place.
     -->
     <activity
         android:name=".MainActivity"
         android:exported="true"
         android:launchMode="singleTask"
-        android:screenOrientation="portrait"
+        android:screenOrientation="unspecified"
         android:theme="@style/AppTheme.NoActionBarLaunch"
         android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation|density|fontScale">
       <!--
