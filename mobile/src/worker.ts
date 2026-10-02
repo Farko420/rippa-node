@@ -24,6 +24,7 @@
  */
 
 import { describeRuntime, runtimeCapabilities, supportsBrowserScraping } from "../../src/platform";
+import { isVersionNewer } from "../../src/version-compare";
 import { scrapeMobile } from "../../src/agent/MobileScraper";
 import {
   DEFAULT_POWER_LIMITS,
@@ -851,6 +852,245 @@ export function workerStatus(): Record<string, unknown> {
   };
 }
 
+// --- IN-APP APK UPDATE CHECK -------------------------------------------------
+
+/**
+ * The build's version, for runtimes with no native bridge.
+ *
+ * INSIDE THE APK THIS IS NEVER USED: MobileBridge.getAppVersion() reports
+ * BuildConfig.VERSION_NAME, which scripts/package-apk.mjs derives from the root
+ * package.json, so the native answer is always the real one. This constant only
+ * matters when the same dashboard is opened in a plain desktop browser, where
+ * `window.mobileBridge` does not exist.
+ *
+ * IT MUST MATCH package.json, AND THAT IS ENFORCED: scripts/package-apk.mjs reads
+ * this literal out of the bundle source and fails the APK build if it has drifted.
+ * A silently-stale constant would mean a browser preview nagging to "update" from
+ * 1.0.14 to 1.0.14 forever, which is precisely the kind of self-inflicted noise
+ * that trains operators to ignore update prompts.
+ */
+const FALLBACK_APK_VERSION = "1.0.14";
+
+/**
+ * The Mothership routes this is tried against, in order.
+ *
+ * Two paths because the endpoint was specified under both names and a node must
+ * not care which one its Mothership happens to expose: a 404 falls through to the
+ * next, and the first route that answers wins. Once a route has answered, it is
+ * remembered for the life of the process so every later check costs one request
+ * rather than two.
+ */
+const UPDATE_ENDPOINTS = ["/api/node/latest-version", "/api/node/apk-version"];
+
+/** What the dashboard renders. `state` is the only field it branches on. */
+export interface UpdateCheck {
+  /** "available" (offer the update), "current", "unavailable" or "error". */
+  state: "available" | "current" | "unavailable" | "error";
+  /** Version this device is running, e.g. "1.0.14". */
+  currentVersion: string;
+  /** Version the Mothership publishes, when it answered. */
+  remoteVersion: string;
+  /** Absolute https URL of the .apk. Empty unless `state` is "available". */
+  downloadUrl: string;
+  /** Optional lowercase hex SHA-256, passed straight through to the bridge. */
+  sha256: string;
+  /** Release notes, or "". Rendered as text, never as HTML. */
+  notes: string;
+  /** ISO timestamp, so a stale banner can be explained later. */
+  checkedAt: string;
+}
+
+/** In-flight check, so a manual re-check cannot stack on top of the timer. */
+let updateCheckInFlight: Promise<UpdateCheck> | null = null;
+/** The route that answered last time, so we stop paying for a 404 every 15 minutes. */
+let updateEndpoint: string | null = null;
+
+/**
+ * The version this device is actually running.
+ *
+ * The native bridge is authoritative and is asked first: it reports
+ * BuildConfig.VERSION_NAME, which is the real, installed value. The fallback
+ * constant covers a desktop browser preview, where there is no bridge at all.
+ */
+function installedVersion(): string {
+  try {
+    const bridge = (globalThis as { mobileBridge?: { getAppVersion?: () => string } })
+      .mobileBridge;
+    const version = bridge?.getAppVersion?.();
+    if (typeof version === "string" && version.trim().length > 0) {
+      return version.trim();
+    }
+  } catch (error) {
+    // A bridge that throws must not take the dashboard down with it; the fallback
+    // is always better than an exception out of a render path.
+    log(`Could not read the installed version from the bridge: ${describe(error)}`);
+  }
+  return FALLBACK_APK_VERSION;
+}
+/** First non-empty string among `keys`, or "". Tolerates the shapes Motherships use. */
+function firstString(fields: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = fields[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return "";
+}
+
+/**
+ * Normalises a release payload.
+ *
+ * DELIBERATELY LIBERAL about field names. This payload is written by a service
+ * that is not in this repository, and a rename there must not silently disable
+ * updates on every tablet in the fleet — so `version`/`tag_name`,
+ * `download_url`/`url` and `notes`/`body` are all accepted, and an optional
+ * one-level `{latest: …}` wrapper is unwrapped. Returns null when there is no
+ * usable version AND no usable URL, which is the only case where offering an
+ * update is impossible.
+ */
+function readRelease(
+  payload: unknown,
+): { version: string; downloadUrl: string; sha256: string; notes: string } | null {
+  if (!payload || typeof payload !== "object") return null;
+  const top = payload as Record<string, unknown>;
+  const wrapped = ["latest", "release", "data", "apk"]
+    .map((key) => top[key])
+    .find((value) => value && typeof value === "object");
+  const fields: Record<string, unknown> = wrapped
+    ? { ...top, ...(wrapped as Record<string, unknown>) }
+    : top;
+
+  const version = firstString(fields, [
+    "version",
+    "latest_version",
+    "latestVersion",
+    "tag_name",
+    "tag",
+  ]);
+  const downloadUrl = firstString(fields, [
+    "download_url",
+    "downloadUrl",
+    "apk_url",
+    "apkUrl",
+    "browser_download_url",
+    "url",
+  ]);
+  if (!version || !downloadUrl) return null;
+
+  return {
+    version,
+    downloadUrl,
+    sha256: firstString(fields, ["sha256", "sha256_checksum", "checksum"]),
+    notes: firstString(fields, ["notes", "release_notes", "releaseNotes", "body", "changelog"]),
+  };
+}
+
+/** Absolute-ises a download URL. A Mothership will often return a relative path. */
+function resolveDownloadUrl(url: string): string {
+  if (/^https?:\/\//i.test(url)) return url;
+  const origin = base(config.mothershipUrl);
+  if (!origin) return url;
+  return `${origin}/${url.replace(/^\/+/, "")}`;
+}
+/**
+ * Asks the Mothership what the newest satellite build is, and compares it with the
+ * build actually installed on this device.
+ *
+ * NEVER THROWS. The dashboard calls this on a timer, and a rejected promise with no
+ * handler would surface as an unhandled rejection in the WebView — so every failure
+ * comes back as a state the page can render. That matters more than usual here:
+ * this node is meant to run unattended for a week, and an exception that killed
+ * the page's timer would also stop the update prompt, permanently and silently.
+ *
+ * NOT GATED ON PAIRING. Only a Mothership URL is required. The version route is
+ * normally public, and a node whose key was revoked should still be told there is
+ * a build that fixes the problem, rather than being left on the broken one.
+ */
+export async function checkForUpdate(): Promise<UpdateCheck> {
+  if (updateCheckInFlight) return updateCheckInFlight;
+  updateCheckInFlight = runUpdateCheck().finally(() => {
+    updateCheckInFlight = null;
+  });
+  return updateCheckInFlight;
+}
+
+/** The body of {@link checkForUpdate}, split out so the in-flight guard stays readable. */
+async function runUpdateCheck(): Promise<UpdateCheck> {
+  /*
+    LOAD THE STORED CONFIG FIRST, EVERY TIME.
+
+    `config` is seeded from DEFAULT_CONFIG at module load and only replaced from
+    localStorage inside startWorker(). Reading it without this call means an update
+    check that runs before (or instead of) the worker booting queries the DEFAULT
+    Mothership — https://rippaadventures.com — rather than the one this operator
+    actually paired with. On a LAN deployment that is a request to the wrong
+    server, and it silently never finds the update it was asked to find.
+
+    loadConfig() is idempotent (localStorage read + merge) and this runs at most
+    once every fifteen minutes, so the repetition costs nothing.
+  */
+  loadConfig();
+
+  const currentVersion = installedVersion();
+  const checkedAt = new Date().toISOString();
+  const blank: UpdateCheck = {
+    state: "unavailable",
+    currentVersion,
+    remoteVersion: "",
+    downloadUrl: "",
+    sha256: "",
+    notes: "",
+    checkedAt,
+  };
+
+  const origin = base(config.mothershipUrl);
+  if (!origin) {
+    // No Mothership configured yet. Not an error — the dashboard asks again right
+    // after the operator saves the pairing form.
+    return blank;
+  }
+
+  const routes = updateEndpoint ? [updateEndpoint] : UPDATE_ENDPOINTS;
+  for (const route of routes) {
+    try {
+      const response = await fetch(`${origin}${route}`, { headers: authHeaders() });
+      if (response.status === 404) continue; // try the next spelling of the route
+      if (!response.ok) {
+        log(`Version check on ${route} answered ${response.status}.`);
+        return { ...blank, state: "error" };
+      }
+
+      const release = readRelease(await response.json());
+      if (!release) {
+        // A 200 with nothing usable in it. Worth saying out loud: this is what a
+        // mis-typed route or a renamed field looks like, and it is otherwise
+        // indistinguishable from "no update available".
+        log(`Version check on ${route} returned no recognisable release payload.`);
+        return { ...blank, state: "error" };
+      }
+
+      updateEndpoint = route; // stop paying for the 404 on every future check
+      if (!isVersionNewer(release.version, currentVersion)) {
+        return { ...blank, state: "current", remoteVersion: release.version, notes: release.notes };
+      }
+
+      return {
+        state: "available",
+        currentVersion,
+        remoteVersion: release.version,
+        downloadUrl: resolveDownloadUrl(release.downloadUrl),
+        sha256: release.sha256,
+        notes: release.notes,
+        checkedAt,
+      };
+    } catch (error) {
+      log(`Version check on ${route} failed: ${describe(error)}`);
+      return { ...blank, state: "error" };
+    }
+  }
+
+  log("Neither /api/node/latest-version nor /api/node/apk-version exists on the Mothership.");
+  return blank;
+}
 // --- SATELLITE WORKER BRIDGE -------------------------------------------------
 /*
   WIRING THE ABSTRACTED STORAGE LAYER INTO THE APK.

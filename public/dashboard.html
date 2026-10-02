@@ -127,6 +127,10 @@
     <section class="cc-panel">
       <div class="ollama-head">
         <h2>Embedded Ollama AI Engine</h2>
+        <span id="ollamaHealthBadge" class="health-badge is-offline" title="Probing the local Ollama server…">
+          <span class="health-dot" aria-hidden="true"></span>
+          <span id="ollamaHealthLabel">Probing…</span>
+        </span>
         <span id="ollamaStatusBadge" class="status-badge status-idle">Idle</span>
         <button id="ollamaPadlock" type="button" class="ghost ollama-padlock" title="Click to unlock manual overrides">
           <span id="ollamaPadlockIcon">🔒</span>
@@ -151,7 +155,34 @@
         <div class="tile"><span class="tile-label">Embedding Model</span><strong id="ollamaEmbed">—</strong></div>
       </div>
       <p id="ollamaError" class="hint" hidden></p>
-      <div id="ollamaOverride" class="ollama-override" hidden>
+
+        <!--
+          THE LIVE TERMINAL.
+
+          Everything the engine does is streamed here: the `ollama serve` child's own
+          stdout/stderr (piped from the managed process), model load and pull
+          progress, inference timings, and the output of every command typed at the
+          `$` prompt below.
+
+          The input is NOT a shell. The server matches each line against a fixed
+          allow-list (see src/services/engineCli.ts) and talks to Ollama's HTTP API;
+          nothing typed here is ever passed to a shell or a spawn.
+        -->
+        <div class="term">
+          <div class="term-head">
+            <span class="term-title">Live Engine Terminal</span>
+            <span class="term-hint" id="termHint">help · ollama ps · ollama list · test-infer</span>
+          </div>
+          <div class="term-out" id="termOut" role="log" aria-live="polite" aria-label="Engine terminal output"></div>
+          <form class="term-form" id="termForm" autocomplete="off">
+            <span class="term-prompt" aria-hidden="true">$</span>
+            <input id="termInput" type="text" placeholder="ollama ps" aria-label="Engine command"
+                   spellcheck="false" autocapitalize="off" autocorrect="off" />
+            <button class="save" type="submit">Run</button>
+          </form>
+        </div>
+
+        <div id="ollamaOverride" class="ollama-override" hidden>
         <div class="field">
           <label for="ollamaModelInput">Override model</label>
           <input id="ollamaModelInput" type="text" placeholder="e.g. qwen2.5-coder:7b" />
@@ -185,6 +216,45 @@
         <div class="tile"><span class="tile-label">Runtime</span><strong id="scraperRuntime">—</strong></div>
       </div>
       <p id="scraperMessage" class="hint" hidden></p>
+
+        <!--
+          THE SPLIT: WHAT THE SCRAPER IS DOING, NEXT TO WHAT IT IS LOOKING AT.
+
+          Left is the crawl stream — every navigate, HTTP status and extraction, as it
+          happens. Right is a live thumbnail of the actual headless Chromium page,
+          so "the scraper says it worked" and "I can see it working" are different
+          levels of confidence.
+
+          When nothing is being scraped the viewport shows an idle radar rather than
+          a stale screenshot: a frozen thumbnail from two hours ago reads as
+          "currently scraping", which is the opposite of the truth.
+        -->
+        <div class="scrape-split">
+          <div class="scrape-stream">
+            <div class="term-head">
+              <span class="term-title">Live Scrape Stream</span>
+              <span class="term-hint" id="scrapeCount">0 events</span>
+            </div>
+            <div class="term-out" id="scrapeStream" role="log" aria-live="polite"
+                 aria-label="Live scrape activity"></div>
+          </div>
+          <div class="viewport">
+            <div class="viewport-bar">
+              <span class="viewport-led" id="viewportLed" aria-hidden="true"></span>
+              <span class="viewport-title" id="viewportTitle">No page loaded</span>
+            </div>
+            <div class="viewport-bar">
+              <span class="viewport-url" id="viewportUrl">Waiting for dispatch from Mothership…</span>
+            </div>
+            <div class="viewport-stage">
+              <div class="radar" id="viewportRadar">
+                <div class="radar-sweep" aria-hidden="true"></div>
+                <div class="radar-text">Waiting for dispatch from Mothership...</div>
+              </div>
+              <img id="viewportImg" alt="Live view of the page Chromium is scraping" hidden />
+            </div>
+          </div>
+        </div>
     </section>
   </div>
 

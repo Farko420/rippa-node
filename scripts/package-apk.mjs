@@ -41,6 +41,36 @@ const androidDir = path.join(mobileDir, "android");
 const skipGradle = process.argv.includes("--skip-gradle");
 const isWindows = process.platform === "win32";
 
+/*
+  THE RELEASE VERSION, READ ONCE.
+
+  Three consumers, one read: the APK's versionName/versionCode (patched into the
+  generated build.gradle below), the dashboard's update-check fallback, and the
+  drift assertion that keeps mobile/src/worker.ts honest. They MUST agree — an APK
+  whose BuildConfig says 1.0.14 while the page compares against 1.0.13 is a node
+  that offers itself an update forever — so none of them is allowed to parse
+  package.json on its own.
+*/
+const rootPackage = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+const appVersion = String(rootPackage.version ?? "");
+if (!/^\d+\.\d+\.\d+/.test(appVersion)) {
+  console.error(
+    `[APK] package.json version "${appVersion}" is not MAJOR.MINOR.PATCH.\n` +
+      "       The APK versionCode, the dashboard's update check and the release\n" +
+      "       tooling all derive from it, and a version they cannot order is\n" +
+      "       worse than no version at all.",
+  );
+  process.exit(1);
+}
+/*
+  versionCode = major * 10000 + minor * 100 + patch. Monotonic for any version this
+  project will realistically ship, and — the part that matters — it always INCREASES
+  relative to the previous APK, because the installer refuses to downgrade and
+  MobileBridge refuses to even prompt for one.
+*/
+const [major, minor, patch] = appVersion.split(".").map(Number);
+const appVersionCode = major * 10000 + minor * 100 + patch;
+
 /** Runs a command, inheriting stdio; exits the build on failure. */
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { cwd: root, stdio: "inherit", ...options });
@@ -155,12 +185,75 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   .field input:focus { outline:none; border-color:var(--ok); }
   .pair .btn { width:100%; margin-top:16px; }
   .pair .saved { margin-top:10px; }
+  /* ---- IN-APP UPDATE PROMPT ---------------------------------------------------
+     THE CARD AN OPERATOR SHOULD NEVER HAVE TO GO LOOKING FOR. A satellite is
+     unattended hardware: nobody is reading release notes, and nothing else on
+     this page tells the operator a new build exists. So when there is one it sits
+     ABOVE the pairing card — above everything — in the warning colour rather than
+     the muted greys of the telemetry, and it is the only full-width green button
+     on the screen while it is present. */
+  .update { margin-bottom:20px; padding:18px; border-radius:14px;
+            border:1px solid var(--warn); background:rgba(210,153,34,.14); }
+  .update[hidden] { display:none; }
+  .update-head { display:flex; align-items:center; justify-content:space-between;
+                 gap:10px; margin-bottom:6px; flex-wrap:wrap; }
+  .update-head h2 { margin:0; font-size:15px; color:var(--warn); }
+  .update .badge { color:var(--warn); border-color:var(--warn); }
+  .update-why { margin:0 0 6px; font-size:13px; line-height:1.5; }
+  /* Release notes arrive from the Mothership, so they are inserted as TEXT and
+     never as markup (see renderUpdate). pre-wrap keeps the notes' own line breaks
+     without letting a long URL reflow the card off the screen. */
+  .update-notes { margin:0 0 14px; padding:9px 11px; font-size:12px; line-height:1.5;
+                  color:var(--mut); background:rgba(0,0,0,.25); border-radius:9px;
+                  white-space:pre-wrap; word-break:break-word;
+                  max-height:130px; overflow:auto; }
+  .update .btn { width:100%; }
+  .update .btn[disabled] { opacity:.75; }
+  .update-status { margin-top:10px; font-size:11px; line-height:1.5; min-height:14px; }
+  /* A spinner rather than a disabled label, so a long download on a tablet with
+     no signal reads as "working" and not "broken". */
+  .spinner { display:inline-block; width:12px; height:12px; margin-right:8px;
+             vertical-align:-1px; border:2px solid rgba(13,17,23,.35);
+             border-top-color:#0d1117; border-radius:50%;
+             animation:spin .8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>Rippa Node &mdash; Android Satellite</h1>
   <p class="sub">Background worker. The screen may be turned off.</p>
+
+  <!--
+    THE IN-APP UPDATE PROMPT.
+
+    Above everything else on purpose: it is setup, not telemetry, and a node on a
+    desk is unattended hardware where nobody is watching for "new build available".
+    It stays hidden until the Mothership reports a version genuinely newer than
+    the one MobileBridge.getAppVersion() reports as installed — the comparison
+    itself lives in the worker (checkForUpdate), because the worker is what holds
+    the Mothership URL and the node key.
+
+    The button is NOT disabled while hidden, because the whole card is hidden with
+    it; everything about the update state lives in renderUpdate() and the
+    rippa-update CustomEvent handler below.
+
+    NOTE: this whole document is inside a JS template literal in the packager, so
+    it must not contain a backtick, nor a dollar sign immediately followed by an
+    opening brace — either one silently truncates the page at build time. (This
+    sentence had to be worded twice: the obvious way to write it says the thing it
+    is warning about.)
+  -->
+  <div class="update" id="updateCard" hidden>
+    <div class="update-head">
+      <h2 id="updateTitle">Update Available</h2>
+      <span class="badge" id="updateFrom"></span>
+    </div>
+    <p class="update-why">A new version of Rippa Satellite is ready to install.</p>
+    <p class="update-notes" id="updateNotes" hidden></p>
+    <button class="btn" id="updateBtn" type="button">Update &amp; Install Now</button>
+    <div class="update-status" id="updateStatus"></div>
+  </div>
 
   <!--
     NODE PAIRING SETUP.
@@ -268,6 +361,22 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   var powerFormReady = false;
   /** Same guard for the pairing fields: re-seeding mid-typing would erase a key. */
   var pairFormReady = false;
+  /* ---- IN-APP UPDATE PROMPT ---------------------------------------------------
+     DOM handles, plus the two pieces of state the prompt needs. updatePayload is
+     the last "available" result, kept so the click handler always has a URL to act
+     on: an operator who taps Update fourteen minutes after the banner appeared
+     must not have to wait on a fresh request, and must not lose the prompt if the
+     Mothership has gone quiet in between. updateBusy is the one-tap guard. */
+  var updateCard = document.getElementById('updateCard');
+  var updateTitle = document.getElementById('updateTitle');
+  var updateFrom = document.getElementById('updateFrom');
+  var updateNotes = document.getElementById('updateNotes');
+  var updateBtn = document.getElementById('updateBtn');
+  var updateStatus = document.getElementById('updateStatus');
+  var updatePayload = null;
+  var updateBusy = false;
+  /** How often the Mothership is asked whether a newer build exists. */
+  var UPDATE_CHECK_MS = 15 * 60 * 1000;
   function line(text) {
     logEl.textContent = (text + '\\n' + logEl.textContent).slice(0, 4000);
   }
@@ -296,6 +405,185 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   }
 
   /**
+   * Paints or hides the update prompt from a worker checkForUpdate() result.
+   *
+   * state is the only thing that decides visibility, and only "available" shows
+   * the card. "current", "unavailable" and "error" all hide it: a failed version
+   * check on an unattended tablet must be invisible, because the alternative — a
+   * red banner about an unreachable Mothership sitting above a node that is
+   * working perfectly well — is how operators learn to ignore banners.
+   *
+   * EVERYTHING FROM THE NETWORK IS INSERTED AS TEXT (textContent), never as HTML.
+   * The release notes are written by the Mothership, and innerHTML here would make
+   * a note field into a script-injection surface on a device that then has the
+   * power to install an APK.
+   *
+   * The button is deliberately NOT reset while an install is in flight: the 2s
+   * telemetry tick and the 15-minute version check both land here, and re-enabling
+   * the button mid-download would invite a second tap that the native bridge then
+   * rejects with "An update is already downloading".
+   */
+  function renderUpdate(check) {
+    if (!check) return;
+    if (check.state !== 'available' || !check.downloadUrl) {
+      updateCard.hidden = true;
+      return;
+    }
+    updatePayload = check;
+    updateCard.hidden = false;
+    updateTitle.textContent = 'Update Available (v' + check.remoteVersion + ')';
+    updateFrom.textContent = 'v' + (check.currentVersion || '?') +
+      ' \\u2192 v' + check.remoteVersion;
+    if (check.notes) {
+      updateNotes.hidden = false;
+      updateNotes.textContent = check.notes;
+    } else {
+      updateNotes.hidden = true;
+    }
+    if (!updateBusy) {
+      updateBtn.disabled = false;
+      updateBtn.innerHTML = 'Update &amp; Install Now';
+      updateStatus.textContent = bridgeHint();
+      updateStatus.style.color = 'var(--mut)';
+    }
+  }
+
+  /**
+   * One line of advice about the Android install grant, or '' when it does not
+   * apply. Checked here rather than discovered mid-download: Android 8+ makes the
+   * operator grant "install unknown apps" manually, and the bridge takes them to
+   * that Settings screen itself — but only if they know to expect it.
+   */
+  function bridgeHint() {
+    try {
+      if (window.mobileBridge && window.mobileBridge.canInstallPackages &&
+          !window.mobileBridge.canInstallPackages()) {
+        return 'Android will ask you to allow this app to install updates the ' +
+          'first time. That setting is remembered.';
+      }
+    } catch (error) {
+      /* a bridge that throws must not break the prompt */
+    }
+    return '';
+  }
+
+  /**
+   * Asks the worker what the newest build is. Called on mount, on a 15-minute
+   * timer, and once more after the pairing form is saved.
+   *
+   * The catch is not ceremony: checkForUpdate() is written never to reject, and
+   * this second layer means a bug in it cannot take down the page's timer either.
+   */
+  function refreshUpdate() {
+    if (!W || !W.checkForUpdate) return;
+    W.checkForUpdate().then(renderUpdate).catch(function (error) {
+      line('Update check failed: ' + error);
+    });
+  }
+  /**
+   * Sets the button into (or out of) its downloading state.
+   *
+   * The spinner is built with createElement rather than typed into innerHTML, so
+   * the label can never be a source of markup.
+   */
+  function setUpdateBusy(busy, message, tone) {
+    updateBusy = busy;
+    updateBtn.disabled = busy;
+    while (updateBtn.firstChild) updateBtn.removeChild(updateBtn.firstChild);
+    if (busy) {
+      var spinner = document.createElement('span');
+      spinner.className = 'spinner';
+      updateBtn.appendChild(spinner);
+      updateBtn.appendChild(document.createTextNode(message || 'Downloading update\\u2026'));
+    } else {
+      updateBtn.textContent = 'Update & Install Now';
+    }
+    if (message !== undefined) {
+      updateStatus.textContent = message;
+      updateStatus.style.color = tone || 'var(--mut)';
+    }
+  }
+
+  /**
+   * THE ONE-TAP PATH.
+   *
+   * Native bridge: hand the URL (and the checksum, when the Mothership published
+   * one) to MobileBridge, which downloads it, verifies the archive really is a
+   * newer build of THIS app, and hands it to the Android package installer.
+   *
+   * Browser fallback: a plain navigation to the .apk. Deliberately NOT an <a
+   * download> element — the same dashboard is served over http on a LAN for
+   * checking a node, and in that context "Update & Install Now" has to download a
+   * file rather than navigate to one.
+   *
+   * The button is guarded twice: updateBusy here, and a second rejection in the
+   * bridge. A double-tap that got past both would leave the operator with two
+   * threads writing one file, and the installer offered a truncated APK.
+   */
+  updateBtn.addEventListener('click', function () {
+    if (updateBusy || !updatePayload || !updatePayload.downloadUrl) return;
+    var bridge = window.mobileBridge;
+    var url = updatePayload.downloadUrl;
+
+    if (!bridge || typeof bridge.installApkUpdate !== 'function') {
+      setUpdateBusy(true, 'Downloading in your browser\\u2026', 'var(--mut)');
+      try {
+        window.location.href = url;
+      } catch (error) {
+        setUpdateBusy(false, 'Could not start the download: ' + error, 'var(--bad)');
+      }
+      return;
+    }
+
+    setUpdateBusy(true, 'Downloading update\\u2026', 'var(--mut)');
+    try {
+      if (updatePayload.sha256) bridge.installApkUpdate(url, updatePayload.sha256);
+      else bridge.installApkUpdate(url);
+    } catch (error) {
+      // A synchronous throw means the bridge object was replaced or is not the one
+      // we expect. Falling back to a browser download beats a dead button.
+      setUpdateBusy(false, 'Native install unavailable (' + error +
+        '). Downloading in your browser\\u2026', 'var(--warn)');
+      window.location.href = url;
+    }
+  });
+
+  /**
+   * Progress from the native download.
+   *
+   * MobileBridge cannot call back into the page directly, so it dispatches this
+   * CustomEvent with detail.state/detail.message. Without this the operator would
+   * be left looking at a spinner with no way to tell a 40 MB download on a weak
+   * link from a hung one.
+   *
+   * Messages arrive as "state: detail" for failures, so the prefix is stripped
+   * rather than shown twice.
+   */
+  window.addEventListener('rippa-update', function (event) {
+    var detail = (event && event.detail) || {};
+    var state = detail.state || '';
+    var message = String(detail.message || '');
+    var text = message.indexOf(': ') > -1 ? message.split(': ').slice(1).join(': ') : message;
+
+    if (state === 'started') {
+      setUpdateBusy(true, 'Starting download\\u2026', 'var(--mut)');
+    } else if (state === 'progress') {
+      updateStatus.textContent = 'Downloading update \\u00b7 ' + message;
+    } else if (state === 'downloaded') {
+      setUpdateBusy(true, 'Downloaded. Opening the installer\\u2026', 'var(--mut)');
+    } else if (state === 'installing') {
+      setUpdateBusy(true, 'Handing over to Android\\u2026', 'var(--ok)');
+    } else if (state === 'error') {
+      // "busy" is the bridge refusing a second concurrent download, which is a
+      // transient state rather than a failure — so it must not re-enable the
+      // button and leave the operator with nothing to press.
+      var transient = message.indexOf('busy:') === 0;
+      setUpdateBusy(transient, text || 'The update failed.', 'var(--bad)');
+      line('Update failed: ' + text);
+    }
+  });
+  // __UPDATE_UI_TAIL__
+  /**
    * Persists the credentials and proves them against the Mothership.
    *
    * The button is disabled for the duration and the badge is left to the worker,
@@ -314,6 +602,11 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
       nodeName: document.getElementById('pName').value
     }).then(function (conn) {
       renderPairing({ connection: conn, config: W.workerStatus().config });
+      // Re-check for a new build the moment the Mothership URL exists. Before this,
+      // a node that had never been paired sat on the "no Mothership, nothing to
+      // compare against" path until the 15-minute timer happened to fire, so the
+      // update prompt could not appear for up to a quarter of an hour after setup.
+      refreshUpdate();
       // A 401 or a dead network is reported as its own outcome, not as a failure
       // to save: the key IS stored either way, so the operator is not told to
       // retype something that was correctly written.
@@ -451,6 +744,15 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
     W.startWorker();
     setInterval(function () { render(W.workerStatus()); }, 2000);
   }
+
+  // The update check runs on ITS OWN timer, not on the 2s telemetry tick. A
+  // version check is a network round-trip to the Mothership; on that cadence it
+  // would be 720 requests an hour against a device that may be on a metered
+  // tablet connection. Fifteen minutes is also the right answer to "how stale can
+  // an unattended node's software get" — a fix published at 9am is picked up the
+  // same morning.
+  refreshUpdate();
+  setInterval(refreshUpdate, UPDATE_CHECK_MS);
 </script>
 </body>
 </html>
@@ -628,7 +930,7 @@ console.log(`[APK] Capacitor plugins registered: ${pluginNames.join(", ")}`);
 */
 const manifestTarget = path.join(androidDir, "app", "src", "main", "AndroidManifest.xml");
 fs.copyFileSync(path.join(overlayDir, "AndroidManifest.xml"), manifestTarget);
-console.log("[APK] Applied the manifest overlay (WAKE_LOCK + foreground service).");
+console.log("[APK] Applied the manifest overlay (WAKE_LOCK + foreground service + updater).");
 
 const javaTarget = path.join(
   androidDir,
@@ -641,9 +943,120 @@ const javaTarget = path.join(
   "node",
 );
 fs.mkdirSync(javaTarget, { recursive: true });
-for (const file of ["RippaNodeService.java", "RippaNodePlugin.java", "RippaNodeBootReceiver.java"]) {
+/*
+  MainActivity is in this list NOW, which is a change of ownership worth stating.
+
+  It used to be the one class `npx cap add android` generated and nobody owned:
+  `public class MainActivity extends BridgeActivity {}`, five lines long. The WebView
+  bridge has to be registered from inside it, and patching a generated file in
+  place would revert on the next regeneration — the exact failure mode the overlay
+  exists to prevent. So it is shipped here like every other class, and the
+  component check below now verifies it too instead of excusing it.
+*/
+for (const file of [
+  "RippaNodeService.java",
+  "RippaNodePlugin.java",
+  "RippaNodeBootReceiver.java",
+  "MainActivity.java",
+  "MobileBridge.java",
+]) {
   fs.copyFileSync(path.join(overlayDir, file), path.join(javaTarget, file));
 }
+
+/*
+  THE PROVIDER'S FILE ROOTS.
+
+  `res/xml/file_paths.xml` is NOT optional garnish. FileProvider resolves
+  getUriForFile() against it, and Capacitor's template version maps `external-path`
+  (the whole shared volume) and `cache-path` but not `external-cache-path` — which
+  is exactly where MobileBridge downloads the update APK. Left alone, the failure
+  is an IllegalArgumentException the first time an operator taps Update, reported
+  nowhere but in a Java stack trace on a device nobody is holding.
+*/
+const resTarget = path.join(androidDir, "app", "src", "main", "res");
+for (const file of ["xml/file_paths.xml"]) {
+  const destination = path.join(resTarget, file);
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.copyFileSync(path.join(overlayDir, "res", file), destination);
+}
+console.log("[APK] Staged res/xml/file_paths.xml (the FileProvider roots).");
+
+/*
+  THE GENERATED app/build.gradle NEEDS THREE FIXES, AND NONE OF THEM IS OPTIONAL.
+
+  `app/build.gradle` is written by `npx cap add android` and has never been
+  hand-maintained — until now, because the in-app updater needs `BuildConfig`.
+
+  1. `buildFeatures { buildConfig true }`
+     AGP 8 stopped generating BuildConfig unless you ask. MobileBridge.getAppVersion()
+     reads BuildConfig.VERSION_NAME, so without this the Kotlin/Java compile fails
+     with "cannot find symbol: BuildConfig". Verified against this repo's own last
+     successful build: there is no `generated/source/buildConfig` directory and no
+     BuildConfig.class in the javac output, i.e. the class genuinely does not exist
+     by default here. It is a compile error, not a runtime one, so it cannot be
+     worked around in Java.
+
+  2. `versionCode` / `versionName` from the root package.json
+     Capacitor's template hard-codes versionCode 1 / versionName "1.0". Left alone,
+     EVERY build this repo has ever shipped claims to be the same version — so the
+     version the dashboard reports to the Mothership is "1.0" on every tablet in
+     the fleet, forever, and an updater that compares versions has nothing to
+     compare. package.json is already the release version (.github bumps it for
+     each release), so it is the single source of truth to read.
+
+  3. `androidx.core:core` as an explicit dependency
+     MobileBridge uses FileProvider. It is already on the classpath transitively
+     through appcompat, and relying on that is fine until an appcompat downgrade or
+     a `api` -> `implementation` change upstream turns it into an unsolvable
+     compile error. variables.gradle already pins the version.
+
+  THE PATCH IS VERIFIED, NOT ASSUMED. Each rewrite is re-read from disk below and
+  the build fails loudly if any of the three did not land, because a silently
+  unpatched build.gradle is exactly how a "works on my machine" updater ships.
+*/
+const gradleTarget = path.join(androidDir, "app", "build.gradle");
+
+let gradle = fs.readFileSync(gradleTarget, "utf8");
+gradle = gradle.replace(/versionCode\s+\d+/, `versionCode ${appVersionCode}`);
+gradle = gradle.replace(/versionName\s+"[^"]*"/, `versionName "${appVersion}"`);
+
+if (!/buildFeatures\s*{/.test(gradle)) {
+  gradle = gradle.replace(
+    /^(android\s*{\s*)$/m,
+    `$1\n    // Emitted by scripts/package-apk.mjs — see the comment in that script.\n` +
+      `    // Without this, AGP 8 does not generate BuildConfig and MobileBridge\n` +
+      `    // will not compile.\n` +
+      `    buildFeatures {\n        buildConfig true\n    }\n`,
+  );
+}
+
+if (!gradle.includes("androidx.core:core:")) {
+  gradle = gradle.replace(
+    /(dependencies\s*{)/,
+    `$1\n    // FileProvider, used by MobileBridge to hand a downloaded APK to the\n` +
+      `    // system installer. Staged by scripts/package-apk.mjs.\n` +
+      `    implementation "androidx.core:core:$androidxCoreVersion"`,
+  );
+}
+fs.writeFileSync(gradleTarget, gradle);
+
+const gradleApplied = fs.readFileSync(gradleTarget, "utf8");
+const gradleProblems = [];
+if (!/buildConfig\s+true/.test(gradleApplied)) gradleProblems.push("buildFeatures { buildConfig true }");
+if (!gradleApplied.includes(`versionCode ${appVersionCode}`)) gradleProblems.push(`versionCode ${appVersionCode}`);
+if (!gradleApplied.includes(`versionName "${appVersion}"`)) gradleProblems.push(`versionName "${appVersion}"`);
+if (!gradleApplied.includes("androidx.core:core:")) gradleProblems.push("androidx.core:core");
+if (gradleProblems.length) {
+  console.error(
+    `[APK] Could not patch ${path.relative(root, gradleTarget)}:\n` +
+      `       missing ${gradleProblems.join(", ")}.\n` +
+      "       Capacitor's Android template must have changed shape. The updater\n" +
+      "       needs BuildConfig at compile time, so this has to fail here rather\n" +
+      "       than halfway through a multi-minute Gradle run.",
+  );
+  process.exit(1);
+}
+console.log(`[APK] Patched app/build.gradle (BuildConfig on, version ${appVersion} / ${appVersionCode}).`);
 
 /** The application id, taken from the single source of truth for it. */
 const manifestAppPackage = JSON.parse(
@@ -667,9 +1080,10 @@ console.log("[APK] Installed the native service, plugin and boot receiver.");
   exactly how it reached a tablet.
 
   So the component classes the overlay wires up are resolved here, against the
-  real staged .java files, at build time. `MainActivity` is the one legitimate
-  exception: it is generated by `cap add android` into the app's own source set,
-  not shipped in the overlay.
+  real staged .java files, at build time. `MainActivity` used to be the one
+  legitimate exception — it was generated by `cap add android` into the app's own
+  source set and not shipped in the overlay — but it now ships here too, because
+  the WebView bridge has to be registered from inside it, so nothing is excused.
 */
 const overlaySource = fs.readFileSync(path.join(overlayDir, "AndroidManifest.xml"), "utf8");
 
@@ -713,13 +1127,10 @@ for (const permission of forbiddenPermissions) {
 const declaredComponents = [...overlaySource.matchAll(/android:name="(\.[A-Za-z0-9_]+)"/g)].map(
   (match) => `${manifestAppPackage}.${match[1].slice(1)}`,
 );
+const stagedJava = new Set(fs.readdirSync(javaTarget));
 for (const className of declaredComponents) {
-  if (className === `${manifestAppPackage}.MainActivity`) continue;
   const simple = className.slice(className.lastIndexOf(".") + 1);
-  const staged = fs
-    .readdirSync(javaTarget)
-    .some((file) => file === `${simple}.java`);
-  if (!staged) {
+  if (!stagedJava.has(`${simple}.java`)) {
     console.error(
       `[APK] The manifest names ${className} but no ${simple}.java is staged.\n` +
         "       Android instantiates these before the WebView exists, so a missing\n" +
@@ -732,6 +1143,161 @@ for (const className of declaredComponents) {
 console.log(
   `[APK] Verified ${declaredComponents.length} manifest component class(es) exist.`,
 );
+
+/*
+  THE IN-APP UPDATER IS WIRED END TO END. CHECKED HERE, BECAUSE IT CANNOT BE CHECKED
+  ANYWHERE ELSE.
+
+  Every one of these is a silent failure if it goes missing — the APK builds,
+  installs, launches, the dashboard renders, the node joins the swarm, and the
+  single "Update" button does nothing at all:
+
+    - REQUEST_INSTALL_PACKAGES missing  -> the installer refuses the intent.
+    - the FileProvider missing          -> FileProvider.getUriForFile throws
+      IllegalArgumentException("Failed to find configured root"), on a tablet,
+      with a stack trace nobody will ever read.
+    - the provider's authority drifting from the string MobileBridge builds at
+      runtime with `getPackageName() + ".provider"` -> same exception, and the two
+      halves live in different files, so nothing but an assertion keeps them
+      together.
+    - file_paths.xml not mapping `external-cache-path` -> the updater downloads to
+      getExternalCacheDir() and the provider cannot see that directory.
+    - MainActivity not registering the interface -> `window.mobileBridge` is simply
+      undefined in the page and every call site throws TypeError.
+
+  Each of those is a runtime error on hardware, so the build asserts them instead.
+*/
+const updaterChecks = [
+  [
+    overlaySource.includes('android:name="android.permission.REQUEST_INSTALL_PACKAGES"'),
+    "REQUEST_INSTALL_PACKAGES permission",
+  ],
+  [
+    overlaySource.includes('android:name="androidx.core.content.FileProvider"'),
+    "the androidx FileProvider",
+  ],
+  [
+    overlaySource.includes('android:authorities="${applicationId}.provider"'),
+    'the provider authority ${applicationId}.provider',
+  ],
+  [
+    overlaySource.includes("android.support.FILE_PROVIDER_PATHS") &&
+      overlaySource.includes('android:resource="@xml/file_paths"'),
+    "the provider's @xml/file_paths metadata",
+  ],
+];
+
+const bridgeSource = fs.readFileSync(path.join(overlayDir, "MobileBridge.java"), "utf8");
+updaterChecks.push(
+  [
+    bridgeSource.includes('getPackageName() + ".provider"'),
+    "the runtime authority MobileBridge passes to FileProvider",
+  ],
+  [
+    /@JavascriptInterface\s+public void installApkUpdate\(String apkUrl\)/.test(bridgeSource),
+    "mobileBridge.installApkUpdate(String)",
+  ],
+  [
+    /@JavascriptInterface\s+public String getAppVersion\(\)/.test(bridgeSource),
+    "mobileBridge.getAppVersion()",
+  ],
+  [
+    /@JavascriptInterface\s+public boolean canInstallPackages\(\)/.test(bridgeSource),
+    "mobileBridge.canInstallPackages()",
+  ],
+);
+
+const mainActivitySource = fs.readFileSync(path.join(overlayDir, "MainActivity.java"), "utf8");
+updaterChecks.push([
+  /addJavascriptInterface\(\s*new MobileBridge\(/.test(mainActivitySource),
+  "MainActivity registering MobileBridge as a JavascriptInterface",
+]);
+
+const filePathsSource = fs.readFileSync(path.join(overlayDir, "res", "xml", "file_paths.xml"), "utf8");
+updaterChecks.push(
+  [
+    filePathsSource.includes("<external-cache-path"),
+    "an external-cache-path root in file_paths.xml (where the APK is downloaded)",
+  ],
+  [
+    filePathsSource.includes("<cache-path"),
+    "a cache-path root in file_paths.xml (the no-external-volume fallback)",
+  ],
+);
+
+const missingUpdaterPieces = updaterChecks.filter(([present]) => !present).map(([, label]) => label);
+if (missingUpdaterPieces.length) {
+  console.error(
+    `[APK] The in-app updater is not wired end to end:\n` +
+      missingUpdaterPieces.map((piece) => `         - missing ${piece}\n`).join("") +
+      "       Each of these fails only at runtime, on a tablet, as a button that\n" +
+      "       does nothing. Fix them here rather than in the field.",
+  );
+  process.exit(1);
+}
+console.log(`[APK] Verified ${updaterChecks.length} in-app updater wiring check(s).`);
+
+/*
+  THE UPDATE PROMPT IS WIRED TOO, AND THE FALLBACK VERSION HAS NOT DRIFTED.
+
+  The prompt is the half of this feature that fails SILENTLY. A missing
+  `refreshUpdate()` call, a renamed element id, or a `checkForUpdate` that never
+  made it into the bundle all produce the same result on a tablet: a node that
+  runs perfectly and never mentions that a newer build exists. There is no stack
+  trace, no red screen, nothing in logcat.
+
+  The version constant is checked for the same reason and with the same stakes.
+  MobileBridge.getAppVersion() reports BuildConfig.VERSION_NAME, which is this
+  same package.json version — so if the fallback constant drifts below it, a
+  browser preview of the dashboard starts offering tablets an update they already
+  have, and an operator learns to dismiss the banner. The APK build is where that
+  is cheapest to catch.
+*/
+const workerSource = fs.readFileSync(path.join(mobileDir, "src", "worker.ts"), "utf8");
+const fallbackVersion = /FALLBACK_APK_VERSION\s*=\s*"([^"]+)"/.exec(workerSource)?.[1];
+if (fallbackVersion !== appVersion) {
+  console.error(
+    `[APK] mobile/src/worker.ts has FALLBACK_APK_VERSION = "${fallbackVersion}" but\n` +
+      `       package.json says ${appVersion}.\n` +
+      "       This constant is only used when there is no native bridge, but a\n" +
+      "       stale one makes a browser preview offer an update from\n" +
+      `       ${fallbackVersion} to ${appVersion} forever. Bump it, or take it from\n` +
+      "       package.json at build time.",
+  );
+  process.exit(1);
+}
+
+const dashboard = fs.readFileSync(path.join(wwwDir, "index.html"), "utf8");
+const promptChecks = [
+  [dashboard.includes('id="updateCard"'), "the update card in the dashboard"],
+  [dashboard.includes("Update &amp; Install Now"), 'the "Update & Install Now" button'],
+  [dashboard.includes("checkForUpdate"), "the worker version check being called"],
+  [dashboard.includes("installApkUpdate"), "the native install trigger"],
+  [dashboard.includes("window.location.href = url"), "the browser download fallback"],
+  [dashboard.includes("rippa-update"), "the native progress event listener"],
+  [dashboard.includes("15 * 60 * 1000"), "the 15-minute re-check interval"],
+  /*
+    TEMPLATE-LITERAL LEAKAGE. The page is a JS template literal in this file, so a
+    stray interpolation marker survives into the output and renders as literal
+    source, and a botched one renders a bare `undefined` where a value should be.
+    Both are checked by their actual signatures rather than by a bare substring
+    search for "undefined", which the page legitimately contains twice
+    (`!== undefined` and `=== undefined`) and would fail on forever.
+  */
+  [!dashboard.includes("${"), "no un-interpolated template marker in the page"],
+  [!/'undefined'|"undefined"/.test(dashboard), "no interpolated value rendered as undefined"],
+];
+const missingPromptPieces = promptChecks.filter(([present]) => !present).map(([, label]) => label);
+if (missingPromptPieces.length) {
+  console.error(
+    `[APK] The in-app update prompt is not wired:\n` +
+      missingPromptPieces.map((piece) => `         - missing ${piece}\n`).join("") +
+      "       Each of these fails silently on a tablet. Check the dashboard\n" +
+      "       template in scripts/package-apk.mjs.",
+  );
+  process.exit(1);
+}
+console.log(`[APK] Verified ${promptChecks.length} update-prompt check(s); fallback version ${appVersion}.`);
 
 // --- 5. Gradle ---------------------------------------------------------------
 if (skipGradle) {

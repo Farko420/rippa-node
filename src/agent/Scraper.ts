@@ -2,6 +2,7 @@ import "../pkgNativeShim"; // must load before playwright (exe loader shims)
 import type { Browser, Page } from "playwright";
 import { describeRuntime, supportsBrowserScraping } from "../platform";
 import { scrapeMobile } from "./MobileScraper";
+import { hasSubscribers, publishScrape, publishViewport } from "../services/engineTelemetry";
 
 /**
  * EVERY NODE-ONLY DEPENDENCY IN THIS FILE IS LOADED LAZILY, AND THAT IS LOAD-
@@ -371,7 +372,49 @@ export class ScraperService {
     });
 
     console.log("[Scraper] Headless Chromium launched.");
+    publishScrape("launch", "Headless Chromium launched — eyes open.");
     return this.browser;
+  }
+
+  /**
+   * CAPTURES WHAT CHROMIUM IS ACTUALLY LOOKING AT.
+   *
+   * This is the "live viewport" panel in the Control Center: the operator can see
+   * the page the node is reading, which is the difference between "the scraper says
+   * it worked" and "I can see it working".
+   *
+   * THREE GUARDS, BECAUSE THIS RUNS ON THE SCRAPE HOT PATH:
+   *
+   *   1. SKIPPED ENTIRELY WITH NO DASHBOARD WATCHING. A screenshot costs a render
+   *      and a JPEG encode. This node forages unattended overnight; paying that on
+   *      every scrape for nobody to look at it is pure waste.
+   *   2. JPEG at quality 40 and a downscaled viewport. The panel is ~500px wide;
+   *      a full-fidelity PNG would be both larger on the wire and slower to encode.
+   *   3. NEVER THROWS. If the page is mid-navigation, mid-teardown, or the context
+   *      died, the capture is skipped. A screenshot failing must NEVER turn a
+   *      successful scrape into a failed one.
+   */
+  private async captureViewport(page: Page, url: string): Promise<void> {
+    if (!hasSubscribers()) return;
+    try {
+      const buffer = await page.screenshot({
+        type: "jpeg",
+        quality: 40,
+        // "css" keeps the capture at the CSS pixel size rather than device pixels,
+        // which halves the bytes on a HiDPI viewport for no visible difference here.
+        scale: "css",
+        timeout: 5_000,
+      });
+      const title = (await page.title().catch(() => "")) || url;
+      publishViewport({
+        dataUrl: `data:image/jpeg;base64,${buffer.toString("base64")}`,
+        title,
+        url,
+      });
+    } catch {
+      // A page that navigates away mid-capture is normal, not an error worth
+      // surfacing. The crawl stream already says what is happening.
+    }
   }
 
   /** Scrapes a URL and returns sanitized body text. Throws on navigation failure / empty page. */
@@ -386,6 +429,7 @@ export class ScraperService {
       idle forager) has no idea which engine produced the text.
     */
     if (!this.canUseBrowser) {
+      publishScrape("idle", "Lightweight fetch scraper in use (no Chromium on this runtime).", url);
       return scrapeMobile(url);
     }
 
@@ -442,12 +486,18 @@ export class ScraperService {
 
     try {
       const page = await context.newPage();
+      publishScrape("navigate", `[NAVIGATE] ${url}`, url);
       const response = await page.goto(url, {
         waitUntil: "domcontentloaded",
         timeout: NAV_TIMEOUT_MS,
       });
 
       const status = response?.status();
+      publishScrape(
+        status !== undefined && status >= 400 ? "error" : "status",
+        `[STATUS ${status ?? "?"}]`,
+        url,
+      );
       if (status !== undefined && status >= 400) {
         throw new Error(`HTTP ${status} for ${url}`);
       }
@@ -456,13 +506,29 @@ export class ScraperService {
       await page.waitForLoadState("networkidle", { timeout: NETWORK_IDLE_CAP_MS }).catch(() => undefined);
 
       const title = (await page.title().catch(() => "")) || url;
+      // Taken before extraction so the operator sees the page as Chromium rendered
+      // it, not as the sanitiser will go on to strip it down to.
+      await this.captureViewport(page, url);
       const text = await extractSanitizedBody(page);
 
       if (!text) {
+        publishScrape("error", `[EXTRACT] no usable body text`, url);
         throw new Error(`No extractable body text at ${url}`);
       }
 
+      publishScrape(
+        "extract",
+        `[EXTRACT] ${text.length.toLocaleString("en-AU")} chars · ${countPlaceCandidates(text)} place candidates`,
+        url,
+      );
       return { url, title, text };
+    } catch (error) {
+      publishScrape(
+        "error",
+        `[FAIL] ${error instanceof Error ? error.message : String(error)}`,
+        url,
+      );
+      throw error;
     } finally {
       // One context per scrape: cookies/storage never leak between sources.
       await context.close().catch(() => undefined);
@@ -476,6 +542,7 @@ export class ScraperService {
       this.browser = null;
       await browser.close().catch(() => undefined);
       console.log("[Scraper] Headless Chromium closed.");
+      publishScrape("close", "Headless Chromium closed.");
     }
   }
 
@@ -549,4 +616,33 @@ async function extractSanitizedBody(page: Page): Promise<string> {
     .replace(/\n{3,}/g, "\n\n")
     .trim()
     .slice(0, MAX_TEXT_CHARS);
+}
+
+/**
+ * COUNTS THINGS WORTH SENDING TO THE LLM — a cheap "is this page worth anything?"
+ * signal for the live crawl stream.
+ *
+ * THE HEURISTIC IS DELIBERATELY CRUDE AND DELIBERATELY NOT A CLAIM. It counts lines
+ * that mention a named place-type or carry coordinates, because that is what the
+ * extractor downstream actually wants. It is shown to an operator as "N place
+ * candidates" — a glanceable hint about yield, not a verdict, and nothing in the
+ * node's behaviour depends on the number being right.
+ *
+ * `countPlaceCandidates` rather than a general "score" so the terminal line reads as
+ * what it is: a rough count, not a score the node trusts.
+ */
+function countPlaceCandidates(text: string): number {
+  const patterns =
+    /\b(?:national park|state park|reservoir|campground|campsite|caravan park|lookout|waterfall|beach|track|trail|gorge|creek|river|mountain|lagoon|hot springs)\b/gi;
+  const coords = /-?\d{1,3}\.\d{3,}\s*,\s*-?\d{1,3}\.\d{3,}/g;
+  const lines = String(text ?? "").split("\n");
+  let hits = 0;
+  for (const line of lines) {
+    if (patterns.test(line) || coords.test(line)) hits += 1;
+    // Global regexes carry lastIndex between calls, so reset rather than let a
+    // second line silently skip the match — the same trap as in verify-mobile.
+    patterns.lastIndex = 0;
+    coords.lastIndex = 0;
+  }
+  return hits;
 }

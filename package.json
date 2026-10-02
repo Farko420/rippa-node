@@ -15,6 +15,8 @@
     "test:mobile": "npm run build && node scripts/verify-mobile.mjs",
     "test:mobile:bundle": "node scripts/build-mobile-worker.mjs && node scripts/verify-mobile-bundle.mjs",
     "test:release-workflow": "node scripts/verify-release-workflow.mjs",
+    "test:engine": "npm run build && node scripts/verify-engine-cli.mjs && node scripts/verify-engine-health.mjs",
+    "test:engine:routes": "node scripts/verify-engine-routes.mjs && node scripts/verify-engine-ui.mjs",
     "build:webgui": "node scripts/build-webgui.mjs",
     "package": "npm run build:webgui && node scripts/package.mjs",
     "build:apk:bundle": "node scripts/build-mobile-worker.mjs",

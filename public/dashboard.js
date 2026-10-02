@@ -922,6 +922,10 @@ function showAdminOverlay(event) {
 /** Wires the brain panel and opens the node event stream. */
 function startNodeEvents() {
   startEventStream();
+  // The engine stream carries the terminal, the crawl stream and the viewport, and
+  // opening it is ALSO what tells the node a dashboard is watching — which is the
+  // signal that permits it to spend the cost of capturing a Chromium screenshot.
+  startEngineStream();
 }
 
 // --- WIRING -----------------------------------------------------------------
@@ -977,6 +981,9 @@ function showView(viewId) {
   if (viewId === "viewOllama") void refreshOllama();
   if (viewId === "viewScraper") void refreshScraper();
   if (viewId === "viewMesh") void refreshMesh();
+  // Starts the 5s readiness ping when the Embedded AI tab is opened, and stops it
+  // when the operator navigates away. See syncHealthPolling for why it is scoped.
+  syncHealthPolling();
 }
 
 document.querySelectorAll(".cc-nav-item").forEach((btn) => {
@@ -1162,6 +1169,289 @@ function wireSelfHeal(btnId, path, after) {
 wireSelfHeal("ollamaSelfHeal", "/api/ollama/self-heal", refreshOllama);
 wireSelfHeal("scraperSelfHeal", "/api/scraper/self-heal", () => refreshScraper());
 wireSelfHeal("meshSelfHeal", "/api/mesh/self-heal", () => refreshMesh());
+
+// --- LIVE ENGINE TERMINAL + SCRAPER VISUALISER -------------------------------
+//
+// ONE SSE CONNECTION CARRIES ALL FOUR LIVE SURFACES:
+//
+//   line     engine stdout/stderr, command echo, command output -> the terminal
+//   health   the readiness probe result                          -> the status dot
+//   scrape   navigate / status / extract                         -> the crawl stream
+//   viewport a JPEG of the page Chromium is reading              -> the thumbnail
+//
+// A SECOND stream from /api/system/events rather than more kinds on that one,
+// because that endpoint retains the latest event per KIND — correct for an overlay
+// you may have missed, wrong for scrollback where only the last line would survive.
+// See /api/engine/stream in src/server.ts.
+//
+// RECONNECTION IS THE BROWSER'S JOB. EventSource re-establishes itself on a drop
+// with no code here, and the server replays a backlog frame on every connect, so a
+// reconnect restores the terminal, the crawl stream and the current screenshot
+// without a single extra request.
+
+let engineSource = null;
+
+/** Lines already painted, so a reconnect cannot duplicate the backlog. */
+let termCount = 0;
+let scrapeCount = 0;
+
+/** Caps the DOM as well as the server's ring buffer. */
+const TERM_DOM_LIMIT = 400;
+const SCRAPE_DOM_LIMIT = 80;
+
+/**
+ * Auto-scroll, but ONLY when the operator is already at the bottom.
+ *
+ * Without the check, a terminal that scrolls itself down is unusable: you cannot
+ * scroll up to read a stack trace, because the next log line yanks you back. This is
+ * the difference between a log viewer and a log spammer.
+ */
+function stickToBottom(el) {
+  if (!el) return;
+  const near = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+  if (near) el.scrollTop = el.scrollHeight;
+}
+
+/** Appends one terminal line, colouring it by stream. */
+function appendTermLine(line) {
+  const out = $("termOut");
+  if (!out) return;
+  if (termCount === 0) {
+    const empty = out.querySelector(".term-empty");
+    if (empty) empty.remove();
+  }
+  const row = document.createElement("span");
+  row.className = "term-line is-" + (line.stream || "out");
+  row.textContent = line.text;
+  out.appendChild(row);
+  termCount += 1;
+  while (termCount > TERM_DOM_LIMIT && out.firstChild) {
+    out.removeChild(out.firstChild);
+    termCount -= 1;
+  }
+  stickToBottom(out);
+}
+
+/** Appends one crawl-stream event. */
+function appendScrapeLine(event) {
+  const out = $("scrapeStream");
+  if (!out) return;
+  const row = document.createElement("span");
+  row.className = "scrape-line is-" + (event.kind || "status");
+  row.textContent = event.message;
+  out.appendChild(row);
+  scrapeCount += 1;
+  while (scrapeCount > SCRAPE_DOM_LIMIT && out.firstChild) {
+    out.removeChild(out.firstChild);
+    scrapeCount -= 1;
+  }
+  const counter = $("scrapeCount");
+  if (counter) counter.textContent = scrapeCount + (scrapeCount === 1 ? " event" : " events");
+  stickToBottom(out);
+  if (event.url) eventUrl = event.url;
+  trackViewportActivity(event.kind);
+}
+
+/*
+  THE VIEWPORT'S IDLE CYCLE.
+
+  A screenshot is only ever captured DURING a scrape, so between scrapes the panel
+  holds a frozen thumbnail. Left alone that is actively misleading — a still of a
+  campsite page from 40 minutes ago reads exactly like "this is what the scraper is
+  looking at now". So the crawl stream drives the state: a NAVIGATE cancels the
+  idle countdown and says Chromium is working; an EXTRACT, ERROR or CLOSE schedules
+  the return to the radar a few seconds later.
+
+  The delay exists so the final frame of a finished scrape stays on screen long
+  enough to be read, instead of vanishing the instant the job ends.
+*/
+let viewportIdleTimer = null;
+function trackViewportActivity(kind) {
+  if (viewportIdleTimer) {
+    clearTimeout(viewportIdleTimer);
+    viewportIdleTimer = null;
+  }
+  if (kind === "navigate") {
+    setText("viewportTitle", "Chromium is navigating…");
+    setText("viewportUrl", eventUrl || "");
+    return;
+  }
+  if (kind === "extract" || kind === "error" || kind === "close") {
+    viewportIdleTimer = setTimeout(markViewportIdle, 8_000);
+  }
+}
+
+/** The URL of the most recent crawl event, used to label the viewport mid-scrape. */
+let eventUrl = "";
+
+/** Paints a readiness reading into the health dot. */
+function renderHealth(reading) {
+  const badge = $("ollamaHealthBadge");
+  const label = $("ollamaHealthLabel");
+  if (!badge || !reading) return;
+  const text = { ready: "Ready", busy: "Busy", pulling: "Pulling", offline: "Offline" };
+  badge.className = "health-badge is-" + (reading.state || "offline");
+  if (label) label.textContent = text[reading.state] || "Offline";
+  // The tooltip says WHY the dot is the colour it is, including the honest
+  // "no model resident" case that is entirely normal between jobs.
+  badge.title = reading.detail || "";
+}
+
+/** Shows a captured Chromium frame, or falls back to the idle radar. */
+function renderViewport(frame) {
+  const img = $("viewportImg");
+  const radar = $("viewportRadar");
+  const led = $("viewportLed");
+  if (!img) return;
+  if (!frame || !frame.dataUrl) {
+    markViewportIdle();
+    return;
+  }
+  if (radar) radar.hidden = true;
+  img.hidden = false;
+  if (led) led.classList.add("on");
+  if (img.getAttribute("src") !== frame.dataUrl) img.setAttribute("src", frame.dataUrl);
+  setText("viewportTitle", frame.title || "No page loaded");
+  setText("viewportUrl", frame.url || "");
+}
+
+/** Returns the viewport to the idle radar. */
+function markViewportIdle() {
+  const img = $("viewportImg");
+  const radar = $("viewportRadar");
+  const led = $("viewportLed");
+  if (img) img.hidden = true;
+  if (radar) radar.hidden = false;
+  if (led) led.classList.remove("on");
+  setText("viewportTitle", "No page loaded");
+  setText("viewportUrl", "Waiting for dispatch from Mothership…");
+}
+function handleEngineFrame(frame) {
+  if (!frame || !frame.type) return;
+  if (frame.type === "line") appendTermLine(frame);
+  else if (frame.type === "scrape") appendScrapeLine(frame);
+  else if (frame.type === "health") renderHealth(frame);
+  else if (frame.type === "viewport") renderViewport(frame);
+  else if (frame.type === "hello") renderBacklog(frame);
+}
+
+/**
+ * Paints the backlog frame the server sends on every connect.
+ *
+ * `replaceChildren` rather than appending: a reconnect replays the same lines, and
+ * appending them would double every entry in the scrollback. The DOM is rebuilt from
+ * the server's capped ring buffer, which is also why the server's cap (300) and this
+ * one's (400) are allowed to differ — the DOM may hold a little more than the server
+ * remembers, never less.
+ */
+function renderBacklog(frame) {
+  const out = $("termOut");
+  const stream = $("scrapeStream");
+  if (out) {
+    out.replaceChildren();
+    termCount = 0;
+    if (!frame.lines || frame.lines.length === 0) {
+      const empty = document.createElement("span");
+      empty.className = "term-empty";
+      empty.textContent = "No engine output yet. Type `help` for commands.";
+      out.appendChild(empty);
+    }
+    (frame.lines || []).forEach(appendTermLine);
+  }
+  if (stream) {
+    stream.replaceChildren();
+    scrapeCount = 0;
+    (frame.scrapes || []).forEach(appendScrapeLine);
+  }
+  if (frame.health) renderHealth(frame.health);
+  if (frame.viewport) renderViewport(frame.viewport);
+  else markViewportIdle();
+}
+
+/** Opens the engine stream. Idempotent. */
+function startEngineStream() {
+  if (engineSource) return;
+  if (typeof EventSource === "undefined") return;
+  try {
+    engineSource = new EventSource("/api/engine/stream", { withCredentials: true });
+  } catch (err) {
+    return; // unsupported — the status tiles and self-heal still work
+  }
+  engineSource.onmessage = (message) => {
+    try {
+      handleEngineFrame(JSON.parse(message.data));
+    } catch (err) {
+      /* a malformed frame must not kill the stream */
+    }
+  };
+  engineSource.onerror = () => {
+    // EventSource retries on its own for transient drops. CLOSED (readyState 2) is
+    // the one case needing help — an expired session, which would otherwise retry
+    // against a 401 forever. The snapshot poll sends the page back to the lock screen.
+    if (engineSource && engineSource.readyState === 2) {
+      engineSource.close();
+      engineSource = null;
+    }
+  };
+}
+
+// The $ prompt. Enter submits; the server streams the output back over the SSE
+// connection, so this handler only reports a TRANSPORT failure — the command's own
+// output already arrived over the stream by the time this response does.
+const termForm = $("termForm");
+if (termForm) {
+  termForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const input = $("termInput");
+    if (!input) return;
+    const command = input.value.trim();
+    if (!command) return;
+    input.value = "";
+    try {
+      const { response, data } = await api("/api/engine/exec", {
+        method: "POST",
+        body: JSON.stringify({ command }),
+      });
+      if (!response.ok) showAlert(data.message || "The node could not run that command.", "err");
+    } catch (err) {
+      showAlert("Command could not be sent to the node.", "err");
+    }
+  });
+}
+
+/*
+  THE 5-SECOND READINESS PING.
+
+  Polled, not pushed: the badge's most important job is to be able to say OFFLINE,
+  and a push stream cannot report the absence of its own events. Five seconds is the
+  specified cadence and is cheap — a loopback GET against a server this node already
+  talks to constantly.
+
+  It runs only while the Embedded AI tab is visible. Pinging an Ollama nobody is
+  looking at every five seconds, for as long as the tab sits open in a background
+  window, is exactly the kind of cost this node should not carry overnight.
+*/
+let healthTimer = null;
+function refreshEngineHealth() {
+  return api("/api/engine/health")
+    .then(({ response, data }) => {
+      if (response.ok && data && data.state) renderHealth(data);
+    })
+    .catch(() => {
+      /* the badge keeps its last reading; the next tick retries */
+    });
+}
+function syncHealthPolling() {
+  const view = $("viewOllama");
+  const shouldRun = Boolean(view) && !view.hidden;
+  if (shouldRun && !healthTimer) {
+    void refreshEngineHealth();
+    healthTimer = setInterval(refreshEngineHealth, 5000);
+  } else if (!shouldRun && healthTimer) {
+    clearInterval(healthTimer);
+    healthTimer = null;
+  }
+}
 
 // --- PLAYWRIGHT SCRAPER PANEL -------------------------------------------------
 

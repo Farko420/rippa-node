@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  THE PROVIDER'S FILE ROOTS — what FileProvider is allowed to hand out as a
+  content:// URI.
+
+  Staged into the APK by scripts/package-apk.mjs from mobile/android-overlay/res/.
+  It REPLACES the file Capacitor's template generates, on purpose: the template's
+  version maps `external-path` (the entire shared volume) and `cache-path`, but
+  NOT `external-cache-path`, which is exactly where MobileBridge downloads the
+  update APK. Against the template's file_paths.xml,
+  FileProvider.getUriForFile() throws
+
+      java.lang.IllegalArgumentException: Failed to find configured root ...
+
+  which surfaces as "the update button does nothing" on the tablet and nowhere
+  else. Both roots the bridge uses are mapped here, so the two can never disagree.
+
+  `path="."` means the root itself. Wider paths are deliberately NOT used: every
+  extra byte of exposed tree is another thing the WebView could hand to another
+  app through a granted URI, and this provider exists to share one downloaded APK
+  and nothing else.
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- context.getExternalCacheDir() — where the update APK is downloaded. -->
+    <external-cache-path name="apk_cache" path="." />
+    <!-- context.getCacheDir() — the fallback when external cache is unavailable. -->
+    <cache-path name="internal_apk_cache" path="." />
+</paths>

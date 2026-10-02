@@ -502,10 +502,13 @@ jobs:
           echo "Found $APK ($(du -h "$APK" | cut -f1))"
           echo "path=$APK" >> "$GITHUB_OUTPUT"
 
-      # Asserts the foreground-service configuration really made it into the
-      # binary. A silently-missing WAKE_LOCK is the exact failure that makes a
-      # tablet stop at midnight, so it is worth failing the build over. Skips
-      # cleanly when aapt2 is absent rather than failing on a missing tool.
+      # Asserts the foreground-service configuration AND the in-app updater's
+      # permissions really made it into the binary. A silently-missing WAKE_LOCK is
+      # the exact failure that makes a tablet stop at midnight, and a missing
+      # REQUEST_INSTALL_PACKAGES or FileProvider is the exact failure that makes the
+      # Update button do nothing — both are invisible until a human is holding the
+      # device. Skips cleanly when aapt2 is absent rather than failing on a missing
+      # tool.
       - name: Verify the APK manifest
         run: |
           set -euo pipefail
@@ -515,7 +518,7 @@ jobs:
             exit 0
           fi
           DUMP="$("$AAPT" dump xmltree --file AndroidManifest.xml "${{ steps.apk.outputs.path }}" | tr -d '\r')"
-          for NEEDLE in WAKE_LOCK FOREGROUND_SERVICE RippaNodeService; do
+          for NEEDLE in WAKE_LOCK FOREGROUND_SERVICE RippaNodeService REQUEST_INSTALL_PACKAGES FileProvider; do
             if ! grep -q "$NEEDLE" <<<"$DUMP"; then
               echo "::error::APK manifest is missing $NEEDLE"
               exit 1

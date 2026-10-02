@@ -46,6 +46,12 @@ import {
   validateConfigInput,
   writeConfig,
 } from "./config/configManager";
+import {
+  backlog,
+  publishHealth,
+  subscribeTelemetry,
+} from "./services/engineTelemetry";
+import { runEngineCommand } from "./services/engineCli";
 
 /**
  * THE INTERROGATION ENDPOINT — where the cloud-based Rippa AI pings the
@@ -1325,6 +1331,95 @@ export function createApp(): Express {
         message: error instanceof Error ? error.message : String(error),
       });
     }
+  });
+
+  /*
+    GET /api/engine/stream — live terminal, health badge and scraper viewport.
+
+    A SECOND SSE STREAM rather than more kinds on /api/system/events, deliberately.
+    That endpoint retains the latest event per KIND, which is exactly right for an
+    overlay ("the restart you missed") and exactly wrong for a terminal: scrollback
+    where only the last line survives is not a terminal. Splitting them keeps the
+    overlay channel's replay semantics clean and keeps log spam out of it.
+
+    THE BACKLOG FRAME IS SENT FIRST. A dashboard that opens mid-session (the normal
+    case) must paint the last 300 log lines, the recent crawl events and the current
+    Chromium frame immediately, rather than sitting blank until the next thing
+    happens. `hasSubscribers()` — which gates screenshot capture — therefore becomes
+    true the moment this endpoint connects, which is the correct and intended signal.
+  */
+  app.get("/api/engine/stream", requireDashboardAuth, (req: Request, res: Response) => {
+    res.status(200).set({
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    res.flushHeaders?.();
+
+    const write = (frame: unknown): void => {
+      res.write(`data: ${JSON.stringify(frame)}\n\n`);
+    };
+    write(backlog());
+
+    const unsubscribe = subscribeTelemetry(write);
+
+    // Same keep-alive reasoning as the other stream: a terminal is idle most of the
+    // time, and an intermediary that reaps idle connections would kill it during
+    // exactly the quiet period it is meant to be showing.
+    const heartbeat = setInterval(() => res.write(": keep-alive\n\n"), 20_000);
+
+    const cleanup = (): void => {
+      clearInterval(heartbeat);
+      unsubscribe();
+    };
+    req.on("close", cleanup);
+    req.on("error", cleanup);
+    res.on("error", cleanup);
+  });
+
+  /*
+    GET /api/engine/health — the 5-second readiness probe behind the status dot.
+
+    Polled rather than pushed on purpose: the badge must be able to say OFFLINE, and
+    a pushed stream cannot report the absence of its own events. A 5s interval is the
+    spec's cadence and is also gentle — this is a loopback HTTP GET against a local
+    server that already serves every inference request.
+  */
+  app.get("/api/engine/health", requireDashboardAuth, async (_req: Request, res: Response) => {
+    const reading = await ollamaManager.probeHealth();
+    publishHealth(reading);
+    res.json({ success: true, ...reading });
+  });
+
+  /*
+    POST /api/engine/exec — runs one line from the terminal's `$` prompt.
+
+    THE ROUTE IS DELIBERATELY THIN. All of the parsing, validation and the padlock
+    live in `engineCli.ts` so the allow-list is unit-testable without an HTTP server,
+    and so this handler cannot accidentally grow its own parsing. It reads `command`
+    as a string and hands it over; there is no code path here that interprets it.
+
+    Dashboard-authenticated like every mutating route, and the padlock check happens
+    inside the CLI for `ollama pull` / `ollama restart` (see the note there).
+  */
+  app.post("/api/engine/exec", requireDashboardAuth, async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const command = typeof body["command"] === "string" ? String(body["command"]) : "";
+    if (!command.trim()) {
+      res.status(400).json({ success: false, message: "No command supplied." });
+      return;
+    }
+    // A 200 even for a refused command: the refusal is reported IN the terminal,
+    // which is the surface the operator is using. The HTTP status only distinguishes
+    // "the node could not run your command" from "your command failed".
+    const result = await runEngineCommand(command, {
+      origin: `http://127.0.0.1:${ollamaManager.getPort()}`,
+      isUnlocked: () => ollamaManager.isUnlocked(),
+      restart: () => ollamaManager.restart(),
+      pull: (model: string) => ollamaManager.pullModelStreaming(model),
+    });
+    res.json({ success: result.ok, message: result.message });
   });
 
   // GET /api/scraper/status — status panel for the Playwright Scraper feature.

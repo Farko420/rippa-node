@@ -10,6 +10,8 @@
  * (health probes, log scrapers, the OTA updater itself).
  */
 
+import { isVersionNewer as isNewer } from "./version-compare";
+
 declare global {
   /** Version of the running build, sourced from package.json. */
   // eslint-disable-next-line no-var
@@ -51,11 +53,7 @@ export const APP_VERSION_RESOLVED: boolean = APP_VERSION !== UNKNOWN_VERSION;
 globalThis.APP_VERSION = APP_VERSION;
 
 /** Extracts `[major, minor, patch]` from "v1.2.3" / "1.2.3-beta.1", or null. */
-function parseVersion(value: string): [number, number, number] | null {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(value.trim());
-  if (!match) return null;
-  return [Number(match[1]), Number(match[2]), Number(match[3])];
-}
+export { parseVersion } from "./version-compare";
 
 /**
  * True when `candidate` is strictly newer than `current`.
@@ -63,16 +61,14 @@ function parseVersion(value: string): [number, number, number] | null {
  * Unparseable input on either side returns `false` (never update), which keeps
  * an unresolvable local version or a malformed Mothership response from
  * triggering an endless restart loop.
+ *
+ * THE COMPARISON ITSELF LIVES IN `./version-compare`, because it is pure string
+ * work that the Android WebView also needs (mobile/src/worker.ts runs the same
+ * check against the Mothership to drive the in-app APK updater) and this file
+ * cannot be imported there — it reads package.json with `require()` at module
+ * load. `current` keeps its APP_VERSION default here so every Node call site
+ * keeps working exactly as it did.
  */
 export function isVersionNewer(candidate: string, current: string = APP_VERSION): boolean {
-  const next = parseVersion(candidate);
-  const mine = parseVersion(current);
-  if (!next || !mine) return false;
-
-  for (let index = 0; index < 3; index += 1) {
-    if (next[index] !== mine[index]) {
-      return next[index] > mine[index];
-    }
-  }
-  return false; // same core version — prerelease tags do not force an update
+  return isNewer(candidate, current);
 }

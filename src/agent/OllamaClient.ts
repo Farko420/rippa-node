@@ -2,6 +2,11 @@ import os from "node:os";
 import axios, { type AxiosInstance } from "axios";
 import { z } from "zod";
 import { env } from "../config";
+import {
+  clearEngineActivity,
+  noteEngineActivity,
+  publishLine,
+} from "../services/engineTelemetry";
 
 /**
  * HARDWARE AUTO-PROFILING — picks the generation model a satellite should
@@ -152,30 +157,44 @@ export class OllamaClient {
 
   /** The actual `/api/chat` call, shared by the primary and fallback attempts. */
   private async extractFactsWithModel(input: string, model: string): Promise<VerifiedFact | null> {
-    const { data } = await this.client.post<ChatResponse>("/api/chat", {
-      model,
-      stream: false,
-      format: "json", // force JSON-only output from the model
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: `TEXT:\n${input}` },
-      ],
-      options: {
-        temperature: 0.1, // deterministic extraction
-        num_ctx: 8192,
-      },
-      // AGGRESSIVE VRAM UNLOADING — flush this model out of VRAM almost
-      // immediately after replying, so Playwright/GPU work is never starved.
-      keep_alive: KEEP_ALIVE,
-    });
+    /*
+      THE BADGE IS MARKED BUSY FOR THE DURATION OF THE REQUEST.
 
-    const content = data?.message?.content;
-    if (!content) {
-      console.warn(`[Ollama] Empty response from model "${model}".`);
-      return null;
+      A status dot that only ever says "ready" is decoration; the whole point of
+      this panel is that an operator can see the engine working. The mark is set
+      before the request and cleared in a `finally`, and it carries its own TTL as a
+      second line of defence, so a request that never returns cannot leave the badge
+      spinning forever (see engineTelemetry for why the expiry is load-bearing).
+    */
+    noteEngineActivity("busy", model);
+    try {
+      const { data } = await this.client.post<ChatResponse>("/api/chat", {
+        model,
+        stream: false,
+        format: "json", // force JSON-only output from the model
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: `TEXT:\n${input}` },
+        ],
+        options: {
+          temperature: 0.1, // deterministic extraction
+          num_ctx: 8192,
+        },
+        // AGGRESSIVE VRAM UNLOADING — flush this model out of VRAM almost
+        // immediately after replying, so Playwright/GPU work is never starved.
+        keep_alive: KEEP_ALIVE,
+      });
+
+      const content = data?.message?.content;
+      if (!content) {
+        console.warn(`[Ollama] Empty response from model "${model}".`);
+        return null;
+      }
+
+      return parseFactPayload(content, model);
+    } finally {
+      clearEngineActivity();
     }
-
-    return parseFactPayload(content, model);
   }
 
   /**
@@ -265,13 +284,21 @@ export class OllamaClient {
   async pullModel(model: string): Promise<void> {
     const name = model.trim();
     if (!name) throw new Error("pullModel: empty model name");
-    await this.client.post(
-      "/api/pull",
-      { model: name, stream: false },
-      { timeout: 15 * 60_000 }, // a fresh pull can be a large download
-    );
-    this.resolvedModel = name;
-    console.log(`[Ollama] Pulled and pinned fallback model "${name}".`);
+    // Same reason as inference: a multi-gigabyte download with no amber badge on it
+    // looks identical to a hung engine.
+    noteEngineActivity("pulling", name, 30 * 60_000);
+    try {
+      await this.client.post(
+        "/api/pull",
+        { model: name, stream: false },
+        { timeout: 15 * 60_000 }, // a fresh pull can be a large download
+      );
+      this.resolvedModel = name;
+      console.log(`[Ollama] Pulled and pinned fallback model "${name}".`);
+      publishLine("out", `pulled ${name} (background)`);
+    } finally {
+      clearEngineActivity();
+    }
   }
 
   /**
