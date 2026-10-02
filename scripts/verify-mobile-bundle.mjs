@@ -108,6 +108,57 @@ sandbox.self = sandbox;
 sandbox.globalThis = sandbox;
 
 const context = vm.createContext(sandbox);
+
+/*
+  A FRESH EVALUATION OF THE SAME BUNDLE with a swappable `fetch`.
+
+  Re-running the IIFE gives the module its own state — the bundle is a closed scope,
+  so a second `vm.runInContext` builds a second worker with a second connection
+  state. That is what lets one file drive a CONNECTED node, a REFUSED node and an
+  UNCONFIGURED node in sequence without state from the first leaking into the second
+  and making the later assertions meaningless.
+
+  `store` is deliberately SHARED: the point of these tests is that a credential
+  survives as persisted state, and a fresh private store would test nothing.
+*/
+const fetchCalls = [];
+const blankFetchCalls = [];
+
+/**
+ * Evaluates the bundle in its own WebView-shaped context.
+ *
+ * `overrides.fetch` replaces the offline stub so a test can observe — or simulate —
+ * the Mothership's answer. Everything else the worker touches at boot (timers,
+ * localStorage, console) is present exactly as it is on a device.
+ */
+async function loadIn(tag, overrides = {}) {
+  const scope = {
+    window: undefined,
+    localStorage: {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => void store.set(k, String(v)),
+      removeItem: (k) => void store.delete(k),
+    },
+    setInterval: () => 0,
+    clearInterval: () => {},
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    fetch: async () => {
+      throw new Error("offline in the smoke test");
+    },
+    console,
+    ...overrides,
+  };
+  scope.window = scope;
+  scope.self = scope;
+  scope.globalThis = scope;
+  vm.runInContext(code, vm.createContext(scope), {
+    filename: `worker.js#${tag}`,
+    timeout: 10_000,
+  });
+  return scope.RippaMobileWorker;
+}
+
 let loaded = true;
 let loadError = "";
 try {
@@ -199,6 +250,102 @@ check(
 );
 api.stopWorker?.();
 check("stopWorker() clears the loops", api.workerStatus?.()?.running === false);
+
+console.log("\n[WEBVIEW] 6. Pairing: the credentials the UI saves actually drive the pollers");
+
+check("exports configureNode()", typeof api.configureNode === "function");
+
+/*
+  THE REGRESSION THIS FILE NOW GUARDS. The reported bug was an APK with a worker
+  that could authenticate and no UI to give it a key, so it sat at "0 heartbeats"
+  forever. These checks drive `configureNode()` exactly as the setup card does and
+  assert the two things that were broken: the credential is persisted, and it is
+  actually sent as a bearer token.
+*/
+const fresh = await loadIn("pairing", {
+  fetch: async (url, init) => {
+    fetchCalls.push({ url: String(url), init });
+    return { ok: true, status: 200, json: async () => ({}) };
+  },
+});
+
+const saved = await fresh.configureNode({
+  mothershipUrl: "https://rippaadventures.com/",
+  nodeKey: "rippa-d2n6-6vzv",
+  nodeName: "Galaxy S26 Ultra",
+});
+check("configureNode() resolves to a connection status", typeof saved === "object");
+check("a valid key produces Connected (200 OK)", saved.state === "connected", saved.label);
+check("the badge label is the connected one", saved.label === "Connected (200 OK)", saved.label);
+
+const stored = JSON.parse(store.get("rippa_node_mobile_config"));
+check("the key is persisted to localStorage", stored.apiKey === "rippa-d2n6-6vzv");
+check("the device name is persisted", stored.nodeName === "Galaxy S26 Ultra");
+check("the trailing slash is stripped from the Mothership URL", stored.mothershipUrl === "https://rippaadventures.com");
+check(
+  "a pasted lowercase node code is normalised",
+  stored.nodeCode === "RIPPA-D2N6-6VZV",
+  stored.nodeCode,
+);
+
+/*
+  THE AUTHORIZATION PROOF. A key stored in localStorage that never reaches the
+  wire is the exact failure behind "0 heartbeats": the app looks configured, the
+  Mothership sees anonymous requests, and nothing says why. The heartbeat URL and
+  header are asserted directly.
+*/
+const beat = fetchCalls.find((c) => c.url.includes("/api/swarm/heartbeat"));
+check("a heartbeat was actually sent", Boolean(beat), fetchCalls.map((c) => c.url).join(", "));
+check(
+  "the heartbeat carries Authorization: Bearer <key>",
+  beat?.init?.headers?.Authorization === "Bearer rippa-d2n6-6vzv",
+  String(beat?.init?.headers?.Authorization),
+);
+check(
+  "the heartbeat targets the configured Mothership",
+  beat?.url === "https://rippaadventures.com/api/swarm/heartbeat",
+  String(beat?.url),
+);
+check(
+  "workerStatus() reports the node as configured",
+  fresh.workerStatus?.()?.connection?.configured === true,
+);
+check("workerStatus() reports the connected state", fresh.workerStatus?.()?.connection?.state === "connected");
+
+/* 401 MUST SURFACE AS UNAUTHORIZED, never as a generic offline state. */
+const refused = await loadIn("unauthorized", {
+  fetch: async () => ({ ok: false, status: 401, json: async () => ({}) }),
+});
+const refusedResult = await refused.configureNode({
+  mothershipUrl: "https://rippaadventures.com",
+  nodeKey: "RIPPA-BAD0-CODE",
+});
+check("a refused key reports Unauthorized (401)", refusedResult.state === "unauthorized", refusedResult.label);
+check("the badge label carries the 401", refusedResult.label === "Unauthorized (401)", refusedResult.label);
+check("a 401 does not increment the heartbeat counter", refused.workerStatus?.()?.heartbeats === 0);
+
+/*
+  AND THE REPORTED SYMPTOM ITSELF: with no key, the node must NOT poll. Before
+  this, an unconfigured APK kept hammering the Mothership with unauthenticated
+  requests that could only be refused.
+*/
+const blank = await loadIn("blank", {
+  fetch: async (url) => {
+    blankFetchCalls.push(String(url));
+    return { ok: true, status: 200, json: async () => ({}) };
+  },
+});
+const blankResult = await blank.configureNode({
+  mothershipUrl: "https://rippaadventures.com",
+  nodeKey: "   ",
+});
+check("an empty key leaves the node Awaiting Setup", blankResult.state === "awaiting-setup", blankResult.label);
+check("an unconfigured node reports configured=false", blankResult.configured === false);
+
+await blank.startWorker();
+check("no unauthenticated poll is attempted without a key", blankFetchCalls.length === 0, blankFetchCalls.join(", "));
+check("the worker still runs while awaiting setup", blank.workerStatus?.()?.running === true);
+blank.stopWorker();
 
 console.log(`\n[WEBVIEW] ${passed}/${passed + failed} checks passed.`);
 process.exit(failed ? 1 : 0);

@@ -125,12 +125,88 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
          color:#0d1117; background:var(--ok); border:0; border-radius:9px;
          cursor:pointer; }
   .btn:active { opacity:.85; }
+  /* ---- NODE PAIRING SETUP ----------------------------------------------------
+     THE CARD THAT WAS MISSING. Without it the APK opened straight onto telemetry
+     showing "Heartbeats sent 0" and there was no control anywhere in the app that
+     could change that, because nothing had ever written a key into localStorage.
+     It sits ABOVE the telemetry on purpose: it is setup, not a statistic, and an
+     operator should never have to scroll past a wall of zeroes to reach it. */
+  .pair { margin-bottom:20px; padding:18px; border-radius:14px;
+          border:1px solid var(--line); background:var(--bg); }
+  .pair-head { display:flex; align-items:center; justify-content:space-between;
+               gap:10px; margin-bottom:4px; }
+  .pair-head h2 { margin:0; font-size:15px; }
+  /* The badge is the whole point of the card: the operator needs to know, without
+     scrolling, whether this phone is actually registered. */
+  .badge { font-size:11px; font-weight:600; padding:4px 10px; border-radius:999px;
+           border:1px solid var(--line); color:var(--mut); white-space:nowrap; }
+  .badge.awaiting-setup { color:var(--mut); }
+  .badge.connecting     { color:var(--warn); border-color:var(--warn); }
+  .badge.connected      { color:var(--ok); border-color:var(--ok); }
+  .badge.unauthorized   { color:var(--bad); border-color:var(--bad); }
+  .badge.disconnected   { color:var(--warn); border-color:var(--warn); }
+  .field { display:block; margin-top:12px; }
+  .field span { display:block; font-size:12px; color:var(--mut); margin-bottom:5px; }
+  /* 16px is not styling: anything smaller makes Android's WebView auto-ZOOM the
+     page on focus, which then breaks the layout for every field after it. */
+  .field input { width:100%; padding:10px 12px; font-size:16px;
+                 background:var(--card); color:var(--txt); border:1px solid var(--line);
+                 border-radius:9px; font-family:inherit; }
+  .field input:focus { outline:none; border-color:var(--ok); }
+  .pair .btn { width:100%; margin-top:16px; }
+  .pair .saved { margin-top:10px; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>Rippa Node &mdash; Android Satellite</h1>
   <p class="sub">Background worker. The screen may be turned off.</p>
+
+  <!--
+    NODE PAIRING SETUP.
+
+    This card is what makes the node a member of the swarm rather than a dark
+    screen. Everything below it is telemetry about a connection that had no way to
+    be configured: the worker reads a Mothership URL and a node key from
+    localStorage, and until this card existed nothing ever WROTE either of them.
+    The result was a tablet that looked alive and had sent zero heartbeats.
+
+    The values are persisted by the worker's configureNode(), not by inline
+    script here, so there is exactly one writer for the config the pollers read.
+    NOTE: this whole block is inside a JS template literal, so it must not contain
+    a backtick — one there silently truncates the page at build time.
+  -->
+  <div class="pair">
+    <div class="pair-head">
+      <h2>Node Connection Setup</h2>
+      <span class="badge awaiting-setup" id="connBadge">Awaiting Setup</span>
+    </div>
+    <p class="hint">Enter the Mothership address and the node key issued by your
+      Master. The key is stored on this device only and is sent as a bearer token.</p>
+
+    <label class="field" for="pUrl">
+      <span>Mothership URL</span>
+      <input id="pUrl" type="text" inputmode="url" autocomplete="off"
+             autocapitalize="none" spellcheck="false"
+             value="https://rippaadventures.com" />
+    </label>
+
+    <label class="field" for="pKey">
+      <span>Master Node / Satellite Key</span>
+      <input id="pKey" type="text" autocomplete="off" autocapitalize="characters"
+             spellcheck="false" placeholder="RIPPA-XXXX-XXXX" />
+    </label>
+
+    <label class="field" for="pName">
+      <span>Device Name</span>
+      <input id="pName" type="text" autocomplete="off"
+             placeholder="Galaxy S26 Ultra" />
+    </label>
+
+    <button class="btn" id="pairSave" type="button">Save &amp; Connect</button>
+    <div class="saved" id="pairSaved"></div>
+  </div>
+
   <div id="rows"></div>
 
   <!--
@@ -186,14 +262,86 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   var powerBanner = document.getElementById('powerBanner');
   var powerReadout = document.getElementById('powerReadout');
   var savedEl = document.getElementById('pSaved');
+  var connBadge = document.getElementById('connBadge');
+  var pairSavedEl = document.getElementById('pairSaved');
   /** Guards the one-time form fill, so a 2s re-render never clobbers typing. */
   var powerFormReady = false;
+  /** Same guard for the pairing fields: re-seeding mid-typing would erase a key. */
+  var pairFormReady = false;
   function line(text) {
     logEl.textContent = (text + '\\n' + logEl.textContent).slice(0, 4000);
   }
+
+  /**
+   * Paints the connection badge and seeds the pairing form.
+   *
+   * Both are driven from workerStatus(), which is the single source of truth for
+   * whether this device is paired. The badge text is the worker's own label, so the
+   * status shown here and the status the pollers are actually in cannot disagree.
+   *
+   * The form is seeded exactly once. It is filled from the STORED config rather
+   * than from what was typed, and re-seeding it on every 2s tick would wipe out a
+   * half-entered key between two characters.
+   */
+  function renderPairing(status) {
+    var conn = status.connection || {};
+    connBadge.textContent = conn.label || 'Disconnected';
+    connBadge.className = 'badge ' + (conn.state || 'disconnected');
+
+    if (pairFormReady || !status.config) return;
+    document.getElementById('pUrl').value = status.config.mothershipUrl || '';
+    document.getElementById('pKey').value = status.config.apiKey || '';
+    document.getElementById('pName').value = status.config.nodeName || '';
+    pairFormReady = true;
+  }
+
+  /**
+   * Persists the credentials and proves them against the Mothership.
+   *
+   * The button is disabled for the duration and the badge is left to the worker,
+   * so the operator sees "Connecting..." and then the real outcome rather than an
+   * optimistic "Saved!" that a 401 would contradict a second later.
+   */
+  document.getElementById('pairSave').addEventListener('click', function () {
+    if (!W || !W.configureNode) return;
+    var button = this;
+    button.disabled = true;
+    pairSavedEl.textContent = 'Connecting to the Mothership\\u2026';
+    pairSavedEl.style.color = '';
+    W.configureNode({
+      mothershipUrl: document.getElementById('pUrl').value,
+      nodeKey: document.getElementById('pKey').value,
+      nodeName: document.getElementById('pName').value
+    }).then(function (conn) {
+      renderPairing({ connection: conn, config: W.workerStatus().config });
+      // A 401 or a dead network is reported as its own outcome, not as a failure
+      // to save: the key IS stored either way, so the operator is not told to
+      // retype something that was correctly written.
+      if (conn.state === 'connected') {
+        pairSavedEl.style.color = 'var(--ok)';
+        pairSavedEl.textContent = 'Connected. This device is now in the swarm.';
+      } else if (conn.state === 'unauthorized') {
+        pairSavedEl.style.color = 'var(--bad)';
+        pairSavedEl.textContent = 'The Mothership rejected that key (401). Check it and try again.';
+      } else {
+        pairSavedEl.style.color = 'var(--warn)';
+        pairSavedEl.textContent = 'Saved, but the Mothership could not be reached. '
+          + 'The node will retry on its own.';
+      }
+    }).catch(function (error) {
+      pairSavedEl.style.color = 'var(--bad)';
+      pairSavedEl.textContent = 'Could not save: ' + (error && error.message ? error.message : error);
+    }).then(function () {
+      button.disabled = false;
+    });
+  });
   function render(status) {
     var caps = status.capabilities || {};
+    var conn = status.connection || {};
     var rows = [
+      ['Connection', conn.label || 'Disconnected',
+       conn.state === 'connected' ? 'ok' :
+       (conn.state === 'awaiting-setup' || conn.state === 'unauthorized') ? 'bad' : 'warn'],
       ['Worker', status.running ? 'running' : 'stopped', status.running ? 'ok' : 'warn'],
       ['Runtime', caps.description || '-', ''],
       ['Scraping', caps.browserScraping ? 'headless Chromium' : 'lightweight fetch',
@@ -212,6 +360,7 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
              r[1] + '</span></div>';
     }).join('');
     renderPower(status.power);
+    renderPairing(status);
   }
 
   /**

@@ -84,6 +84,106 @@ const counters = {
   lastRunAt: "",
 };
 
+// --- PAIRING / CONNECTION STATE -----------------------------------------------
+
+/**
+ * The node's pairing state, as the setup card's badge renders it.
+ *
+ * `awaiting-setup` is a FIRST-CLASS state, not an error and not "disconnected".
+ * It is what a freshly-installed APK shows before anyone has typed a key, and it
+ * is the state the worker holds indefinitely rather than hammering the Mothership
+ * with unauthenticated polls that can only ever be refused.
+ */
+export type ConnectionState =
+  | "awaiting-setup"
+  | "disconnected"
+  | "connecting"
+  | "connected"
+  | "unauthorized";
+
+interface ConnectionStatus {
+  state: ConnectionState;
+  /** The exact string the status badge prints. */
+  label: string;
+  /** Last HTTP status the Mothership returned; 0 when nothing was attempted. */
+  httpStatus: number;
+  /** Mothership currently being talked to, with no trailing slash. */
+  mothershipUrl: string;
+  /** True when a key is stored — i.e. the pollers will actually authenticate. */
+  configured: boolean;
+  /** ISO timestamp of the last state change attempt. */
+  lastCheckedAt: string;
+}
+
+/** Live connection state. Rendered by the UI via `workerStatus().connection`. */
+let connection: {
+  state: ConnectionState;
+  label: string;
+  httpStatus: number;
+  lastCheckedAt: string;
+} = { state: "awaiting-setup", label: "Awaiting Setup", httpStatus: 0, lastCheckedAt: "" };
+
+/** The connection block for the UI. Rebuilt per call so it cannot be mutated. */
+function connectionStatus(): ConnectionStatus {
+  return {
+    ...connection,
+    mothershipUrl: base(config.mothershipUrl),
+    configured: Boolean(base(config.mothershipUrl) && config.apiKey),
+  };
+}
+
+/**
+ * Records a new connection state, publishing only on an actual change.
+ *
+ * Publishing on every tick would make the 2s UI poll redundant and would spam the
+ * log; publishing only on change is what lets the badge settle on one state.
+ */
+function setConnection(state: ConnectionState, label: string, httpStatus = 0): void {
+  const changed = connection.state !== state || connection.label !== label;
+  connection = { state, label, httpStatus, lastCheckedAt: new Date().toISOString() };
+  if (changed) publish({ type: "connection", connection: connectionStatus() });
+}
+
+/**
+ * Canonicalises user-typed node code input to `RIPPA-XXXX-XXXX`.
+ *
+ * DELIBERATELY DUPLICATED from `src/config/nodeCode.ts` rather than imported. That
+ * module pulls in `node:crypto` for `generateNodeCode()`, and `scripts/build-mobile-worker.mjs`
+ * hard-fails the build on any `node:*` specifier in the bundle — because there is no
+ * `node:crypto` inside an Android WebView. Copying the twelve lines of pattern logic
+ * is the price of a bundle that actually loads on a tablet; the two must be changed
+ * together.
+ */
+const NODE_CODE_PREFIX = "RIPPA";
+/** Code body alphabet: digits 2-9 and letters minus the ambiguous I and O. */
+const NODE_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+
+function normaliseNodeCode(value: unknown): string {
+  const raw = String(value ?? "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  const body = raw.startsWith(NODE_CODE_PREFIX) ? raw.slice(NODE_CODE_PREFIX.length) : raw;
+  const match = new RegExp(`^([${NODE_CODE_ALPHABET}]{4})([${NODE_CODE_ALPHABET}]{4})$`).exec(body);
+  return match ? `${NODE_CODE_PREFIX}-${match[1]}-${match[2]}` : "";
+}
+
+/**
+ * THE GATE EVERY POLLER GOES THROUGH.
+ *
+ * With no key stored, this parks the node in `Awaiting Setup` and returns false so
+ * the heartbeat, task poll and mesh poll all skip. This is the fix for the reported
+ * "0 heartbeats" symptom: an unauthenticated poll is not a degraded heartbeat, it
+ * is a guaranteed refusal, and retrying it every ten seconds just drains battery
+ * while the Mothership correctly learns nothing about the phone.
+ */
+function pairingReady(): boolean {
+  if (base(config.mothershipUrl) && config.apiKey) return true;
+  if (connection.state !== "awaiting-setup") {
+    setConnection("awaiting-setup", "Awaiting Setup", 0);
+  }
+  return false;
+}
+
 /*
   POWER STATE — the live battery reading and whether the limits currently hold
   the swarm dispatcher off.
@@ -183,6 +283,67 @@ export function setPowerLimits(next: unknown): PowerLimits {
   return limits;
 }
 
+/**
+ * Saves the pairing credentials the operator typed into the setup card and
+ * immediately proves them with a real heartbeat.
+ *
+ * THIS IS THE FUNCTION THE MISSING UI CALLED OUT FOR. Until this existed the APK
+ * had a worker that could authenticate and no way at all to TELL it a key: the
+ * node sat at "0 heartbeats" forever because `apiKey` was never written to
+ * localStorage by anything.
+ *
+ * The Mothership URL is normalised to a bare origin (trailing slashes stripped) so
+ * the endpoint built from it can never contain `//api/swarm/heartbeat`.
+ *
+ * Resolution order — credential first, then reachability:
+ *   1. `Unauthorized (401)` — the Mothership ANSWERED and refused the key. Nothing
+ *      else can be concluded, and it is the one error an operator must see.
+ *   2. `Connected (200 OK)` — registered and authenticated.
+ *   3. `Disconnected (offline)` — the heartbeat threw. The credentials may well be
+ *      valid; the network is simply not there, which on a tablet in a dead spot is
+ *      a completely ordinary state that must NOT be reported as a bad key.
+ *
+ * An empty key is not an error: it parks the node in `Awaiting Setup` so the card
+ * reads truthfully instead of the worker silently polling with no credentials.
+ */
+export async function configureNode(input: {
+  nodeKey?: unknown;
+  nodeName?: unknown;
+  mothershipUrl?: unknown;
+}): Promise<ConnectionStatus> {
+  const typedKey = String(input?.nodeKey ?? "").trim();
+  const url = base(String(input?.mothershipUrl ?? "").trim()) || DEFAULT_CONFIG.mothershipUrl;
+  const name = String(input?.nodeName ?? "").trim() || DEFAULT_CONFIG.nodeName;
+
+  /*
+    The typed credential is stored BOTH as the API key and — when it is a
+    well-formed node code — as the node code. Operators paste one string that
+    serves as identity and credential, and the Mothership wants them as distinct
+    fields. Anything that is not a valid `RIPPA-XXXX-XXXX` code is still kept as
+    the API key (mesh keys are opaque strings, not codes), it just contributes no
+    node code.
+  */
+  const nodeCode = normaliseNodeCode(typedKey);
+  saveConfig({
+    mothershipUrl: url,
+    nodeName: name,
+    apiKey: typedKey,
+    nodeCode: nodeCode || (typedKey ? config.nodeCode : ""),
+  });
+
+  if (!typedKey) {
+    setConnection("awaiting-setup", "Awaiting Setup", 0);
+    log("No node key entered — the node will hold at Awaiting Setup until one is saved.");
+    return connectionStatus();
+  }
+
+  setConnection("connecting", "Connecting...", 0);
+  // Prove the credential rather than declaring success: `connected` must mean the
+  // Mothership actually accepted this key, never merely that it was typed in.
+  await sendHeartbeat();
+  return connectionStatus();
+}
+
 // --- NATIVE BRIDGE ----------------------------------------------------------
 
 interface NativePlugin {
@@ -240,11 +401,18 @@ function base(url: string): string {
   return String(url || "").replace(/\/+$/, "");
 }
 
-/** Sends the Mothership heartbeat, carrying this node's live status. */
+/**
+ * Sends the Mothership heartbeat, carrying this node's live status.
+ *
+ * The response is the ONLY authority on whether this node is actually paired, so
+ * this is also where the connection badge's state is decided. A heartbeat that is
+ * not inspected is exactly how a node ends up reporting "running" while the
+ * Mothership has been refusing it all night.
+ */
 async function sendHeartbeat(): Promise<void> {
-  if (!base(config.mothershipUrl) || !config.apiKey) return;
+  if (!pairingReady()) return;
   try {
-    await fetch(`${base(config.mothershipUrl)}/api/swarm/heartbeat`, {
+    const response = await fetch(`${base(config.mothershipUrl)}/api/swarm/heartbeat`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({
@@ -260,9 +428,30 @@ async function sendHeartbeat(): Promise<void> {
         connected_satellites: connectedSatellites,
       }),
     });
+
+    // 401 is checked BEFORE `ok`, because a refusal is the one answer that must
+    // never be mistaken for a transient network blip: the key is wrong and the
+    // operator has to retype it.
+    if (response.status === 401) {
+      setConnection("unauthorized", "Unauthorized (401)", 401);
+      counters.lastError = "Mothership refused the node key (401)";
+      return;
+    }
+    if (!response.ok) {
+      setConnection("disconnected", `Disconnected (HTTP ${response.status})`, response.status);
+      return;
+    }
+
     counters.heartbeats += 1;
+    setConnection("connected", `Connected (${response.status} OK)`, response.status);
+    // A successful heartbeat clears a previous auth failure, so the telemetry
+    // panel stops showing a red "Last error" for a problem that is now fixed.
+    if (counters.lastError.startsWith("Mothership refused")) counters.lastError = "";
   } catch (error) {
+    // Reachable, not broken: a tablet with no signal must read "offline", never
+    // "unauthorized", or an operator will retype a perfectly good key.
     counters.lastError = describe(error);
+    setConnection("disconnected", "Disconnected (offline)", 0);
   }
 }
 /** Claims a task with the Mothership, tolerating a cloud with no claim route. */
@@ -376,7 +565,7 @@ async function executeTask(
 
 /** One poll of the Mothership queue: claim, run, report. */
 async function pollForTasks(): Promise<void> {
-  if (!base(config.mothershipUrl) || !config.apiKey) return;
+  if (!pairingReady()) return;
   try {
     const response = await fetch(`${base(config.mothershipUrl)}/api/swarm/tasks`, {
       method: "GET",
@@ -423,6 +612,9 @@ function meshHeaders(): Record<string, string> {
 
 /** Polls the Master mesh so this node appears in its Swarm Grid. */
 async function pollMaster(): Promise<void> {
+  // A Master URL is optional and independent of the Mothership pairing: a node with
+  // no key can still be a mesh member. So this checks the Master URL only, and
+  // `pairingReady()` is deliberately NOT applied here.
   if (!base(config.masterUrl)) return;
   try {
     const response = await fetch(`${base(config.masterUrl)}/api/mesh/heartbeat`, {
@@ -631,7 +823,8 @@ export async function startWorker(): Promise<void> {
     `Worker started. runtime=${describeRuntime()} ` +
       `scraping=${supportsBrowserScraping() ? "chromium" : "fetch"} ` +
       `concurrency=${MAX_CONCURRENT_TASKS} ` +
-      `power=${powerSuspended ? "suspended" : "allowed"}`,
+      `power=${powerSuspended ? "suspended" : "allowed"} ` +
+      `connection=${connection.state}`,
   );
   publish({ type: "started", capabilities: runtimeCapabilities(), power: powerStatus() });
 }
@@ -652,6 +845,9 @@ export function workerStatus(): Record<string, unknown> {
     running: timers.length > 0,
     maxConcurrentTasks: MAX_CONCURRENT_TASKS,
     power: powerStatus(),
+    // The setup card's badge, the telemetry row and the tests all read it from
+    // here, so there is exactly one definition of "is this node paired".
+    connection: connectionStatus(),
   };
 }
 
