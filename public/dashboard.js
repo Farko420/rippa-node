@@ -959,6 +959,174 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeSatellite();
 });
 
+// --- RESPONSIVE NAV + VIEW SWITCHING -----------------------------------------
+
+function setText(id, value) {
+  const el = $(id);
+  if (el) el.textContent = value;
+}
+
+function showView(viewId) {
+  ["viewFleet", "viewOllama"].forEach((id) => {
+    const el = $(id);
+    if (el) el.hidden = id !== viewId;
+  });
+  document.querySelectorAll(".cc-nav-item").forEach((btn) => {
+    btn.classList.toggle("active", btn.getAttribute("data-view") === viewId);
+  });
+  if (viewId === "viewOllama") void refreshOllama();
+}
+
+document.querySelectorAll(".cc-nav-item").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    showView(btn.getAttribute("data-view"));
+    const nav = $("ccNav");
+    if (nav) nav.classList.remove("open");
+  });
+});
+
+const navToggle = $("ccNavToggle");
+if (navToggle) {
+  navToggle.addEventListener("click", () => {
+    const nav = $("ccNav");
+    if (!nav) return;
+    const open = nav.classList.toggle("open");
+    navToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+}
+
+// --- OLLAMA CONTROL PANEL -----------------------------------------------------
+//
+// Padlock defaults LOCKED: the node and Rippa AI keep full autonomic control
+// over the server and model selection. Unlocking is a local, dashboard-PIN
+// gated toggle (same auth as every other mutating route here) that reveals
+// manual overrides — it does not itself change anything on the server.
+
+let ollamaUnlocked = false;
+let ollamaManagedState = false;
+
+function renderOllamaStatus(status) {
+  if (!status) return;
+  ollamaManagedState = Boolean(status.managed);
+  setText("ollamaRunning", status.running ? "Active" : status.managed ? "Starting..." : "Unmanaged");
+  setText("ollamaManaged", status.managed ? "Self-managed" : "External / manual");
+  setText("ollamaModel", status.model || "-");
+  setText("ollamaPort", String(status.port || "-"));
+  setText("ollamaTask", status.task || "Idle");
+  setText("ollamaRestarts", String(status.restartCount || 0));
+
+  const errBox = $("ollamaError");
+  if (errBox) {
+    if (status.lastError) {
+      errBox.textContent = "Last error: " + status.lastError;
+      errBox.hidden = false;
+    } else {
+      errBox.hidden = true;
+    }
+  }
+
+  ollamaUnlocked = Boolean(status.unlocked);
+  const padlock = $("ollamaPadlock");
+  const icon = $("ollamaPadlockIcon");
+  const label = $("ollamaPadlockLabel");
+  const override = $("ollamaOverride");
+  if (padlock) padlock.classList.toggle("unlocked", ollamaUnlocked);
+  if (icon) icon.textContent = ollamaUnlocked ? "🔓" : "🔒";
+  if (label) {
+    label.textContent = ollamaUnlocked
+      ? "Unlocked — Manual Override"
+      : "Locked — Autonomic Control";
+  }
+  if (override) override.hidden = !ollamaUnlocked;
+}
+
+async function refreshOllama() {
+  try {
+    const { response, data } = await api("/api/ollama/status");
+    if (!response.ok || !data.success) return;
+    renderOllamaStatus(data);
+  } catch (err) {
+    /* panel simply stays on its last known state */
+  }
+}
+
+const ollamaPadlockBtn = $("ollamaPadlock");
+if (ollamaPadlockBtn) {
+  ollamaPadlockBtn.addEventListener("click", async () => {
+    try {
+      const { response, data } = await api("/api/ollama/unlock", {
+        method: "POST",
+        body: JSON.stringify({ unlocked: !ollamaUnlocked }),
+      });
+      if (response.ok && data.success) {
+        void refreshOllama();
+      }
+    } catch (err) {
+      showAlert("Could not toggle the padlock.", "err");
+    }
+  });
+}
+
+const ollamaApplyBtn = $("ollamaApply");
+if (ollamaApplyBtn) {
+  ollamaApplyBtn.addEventListener("click", async () => {
+    const model = ($("ollamaModelInput") || {}).value || "";
+    const port = Number(($("ollamaPortInput") || {}).value || 0);
+    try {
+      const { response, data } = await api("/api/ollama/override", {
+        method: "POST",
+        body: JSON.stringify({ model, port: port || undefined }),
+      });
+      if (response.ok && data.success) {
+        showAlert(data.message || "Override applied.", "ok");
+        void refreshOllama();
+      } else {
+        showAlert(data.message || "Could not apply override.", "err");
+      }
+    } catch (err) {
+      showAlert("Could not apply override.", "err");
+    }
+  });
+}
+
+const ollamaManagedBtn = $("ollamaManagedToggle");
+if (ollamaManagedBtn) {
+  ollamaManagedBtn.addEventListener("click", async () => {
+    try {
+      const { response, data } = await api("/api/ollama/managed", {
+        method: "POST",
+        body: JSON.stringify({ managed: !ollamaManagedState }),
+      });
+      if (response.ok && data.success) void refreshOllama();
+    } catch (err) {
+      showAlert("Could not toggle self-managed mode.", "err");
+    }
+  });
+}
+
+const ollamaRestartBtn = $("ollamaRestartBtn");
+if (ollamaRestartBtn) {
+  ollamaRestartBtn.addEventListener("click", async () => {
+    ollamaRestartBtn.disabled = true;
+    try {
+      const { response, data } = await api("/api/ollama/restart", { method: "POST", body: "{}" });
+      showAlert(
+        data.message || (response.ok ? "Restart requested." : "Restart failed."),
+        response.ok ? "ok" : "err",
+      );
+      setTimeout(() => void refreshOllama(), 2000);
+    } finally {
+      ollamaRestartBtn.disabled = false;
+    }
+  });
+}
+
+// Keep the panel live while it is the open view (independent, slower cadence —
+// matches the OTA strip's own poll so this is not just piggy-backing on it).
+setInterval(() => {
+  if ($("viewOllama") && !$("viewOllama").hidden) void refreshOllama();
+}, 5000);
+
 const lockBtn = $("ccLock");
 if (lockBtn) {
   lockBtn.addEventListener("click", async () => {

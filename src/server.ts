@@ -22,6 +22,7 @@ import { SwarmDispatcher, type LoadClass, type TaskOutcome } from "./services/sw
 import { getBrainCounts, getSyncCursor, ingestBrainBundle } from "./services/brainIngest";
 import { latestNodeEvent, publishNodeEvent, subscribeNodeEvents } from "./services/nodeEvents";
 import { getDeepBrain } from "./db/database";
+import { ollamaManager } from "./services/ollamaManager";
 import {
   SwarmUpdater,
   handleUpdateTrigger,
@@ -1195,6 +1196,88 @@ export function createApp(): Express {
       message: outcome.message,
     });
   });
+
+  /*
+    OLLAMA CONTROL PANEL API.
+
+    Locked by default — the node and Rippa AI retain 100% autonomic control
+    over the server and model selection. Unlocking the padlock (dashboard-PIN
+    gated, same as every other mutating route here) permits a manual override:
+    switching model, changing the port, or restarting the server by hand.
+  */
+  app.get("/api/ollama/status", requireDashboardAuth, (_req: Request, res: Response) => {
+    const activeTask = require("./services/heartbeat").getCurrentProcess() as
+      | { task: string }
+      | null;
+    res.json({ success: true, ...ollamaManager.getStatus(activeTask?.task ?? null) });
+  });
+
+  app.post("/api/ollama/unlock", requireDashboardAuth, (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const unlocked = body["unlocked"] !== false; // default: unlock
+    ollamaManager.setUnlocked(Boolean(unlocked));
+    res.json({
+      success: true,
+      unlocked: ollamaManager.isUnlocked(),
+      message: ollamaManager.isUnlocked()
+        ? "Unlocked — manual overrides are now permitted."
+        : "Locked — the node and Rippa AI have full autonomic control again.",
+    });
+  });
+
+  app.post("/api/ollama/managed", requireDashboardAuth, (req: Request, res: Response) => {
+    if (!ollamaManager.isUnlocked()) {
+      res.status(403).json({ success: false, message: "Unlock the padlock before changing this." });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    ollamaManager.setManaged(Boolean(body["managed"]));
+    res.json({ success: true, managed: ollamaManager.isManaged() });
+  });
+
+  app.post("/api/ollama/override", requireDashboardAuth, (req: Request, res: Response) => {
+    if (!ollamaManager.isUnlocked()) {
+      res.status(403).json({
+        success: false,
+        message: "Unlock the padlock before overriding the model or port.",
+      });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const model = typeof body["model"] === "string" ? body["model"].trim() : "";
+    const port = Number(body["port"]);
+    if (model) ollamaManager.setModel(model);
+    if (Number.isFinite(port) && port > 0 && port <= 65535) {
+      const current = readConfigLenient() ?? normalizeConfig({});
+      const validated = validateConfigInput({
+        ...current,
+        OLLAMA_URL: `http://127.0.0.1:${port}`,
+      });
+      if (validated.ok) {
+        writeConfig(resolveAppRoot(), validated.config);
+        applyConfigToEnv(validated.config, true);
+        reloadEnv();
+      }
+    }
+    res.json({
+      success: true,
+      model: ollamaManager.getModel(),
+      message: "Override applied. Restart the server for a port change to take effect.",
+    });
+  });
+
+  app.post("/api/ollama/restart", requireDashboardAuth, async (_req: Request, res: Response) => {
+    try {
+      await ollamaManager.restart();
+      res.json({ success: true, message: "Ollama server restart requested." });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
 
 // GET /api/mesh/updater — OTA status for the dashboard.
   app.get("/api/mesh/updater", requireDashboardAuth, (_req: Request, res: Response) => {

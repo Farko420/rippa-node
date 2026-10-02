@@ -8,6 +8,7 @@ import {
   parsePendingCommands,
   type CommandHandlers,
   type EfficiencyInput,
+  type OllamaTelemetry,
 } from "../services/heartbeat";
 import { parseMeshKeySync, type MeshKeySyncDirective } from "../services/meshKeySync";
 
@@ -53,6 +54,8 @@ export interface HeartbeatPayload {
   efficiency_score: number;
   /** Node codes currently linked peer-to-peer. */
   connected_satellites: string[];
+  /** Embedded Ollama AI status — server state, model, port, active task. */
+  ollama: OllamaTelemetry;
 }
 
 export interface SwarmTask {

@@ -188,6 +188,28 @@
 /* Node IP, shown under the code so a moved machine is easy to spot. */
 .node-ip { font-size:10px; color:var(--mut); margin-top:2px; font-variant-numeric:tabular-nums; }
 
+/* ---- RESPONSIVE NAVIGATION --------------------------------------------------
+   Permanent left-aligned row on desktop; collapses behind a hamburger toggle
+   on narrow viewports. One document, two panels (`cc-view`) shown exclusively. */
+.cc-nav { display:flex; gap:8px; margin-bottom:18px; flex-wrap:wrap; }
+.cc-nav-item { background:var(--card); border:1px solid var(--line); color:var(--txt);
+  border-radius:10px; padding:10px 16px; font-size:13px; cursor:pointer; }
+.cc-nav-item.active { border-color:var(--acc); color:var(--acc); }
+.cc-nav-toggle { display:none; }
+.cc-view[hidden] { display:none !important; }
+@media (max-width:720px) {
+  .cc-nav-toggle { display:inline-flex; align-items:center; justify-content:center; }
+  .cc-nav { flex-direction:column; display:none; }
+  .cc-nav.open { display:flex; }
+}
+
+/* ---- OLLAMA CONTROL PANEL --------------------------------------------------- */
+.ollama-head { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+.ollama-padlock { display:flex; align-items:center; gap:8px; font-size:13px; }
+.ollama-padlock.unlocked { border-color:var(--warn); color:var(--warn); }
+.ollama-stats { margin-top:14px; }
+.ollama-override { margin-top:16px; border-top:1px solid var(--line); padding-top:16px; }
+
 /* ---- SETUP / DASHBOARD CONTAINERS ------------------------------------------
    index.html is now a single page holding both surfaces, so the setup form is
    centred while the dashboard uses the full-width Control Center layout. */

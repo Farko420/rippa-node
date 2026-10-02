@@ -83,9 +83,34 @@ export class OllamaClient {
    * valid JSON matching the schema — callers decide what to do then.
    */
   async extractFacts(rawText: string): Promise<VerifiedFact | null> {
-    const model = await this.resolveModel();
     const input = rawText.slice(0, MAX_INPUT_CHARS);
+    try {
+      return await this.extractFactsWithModel(input, await this.resolveModel());
+    } catch (error) {
+      // AUTO-FAILOVER: the primary model failed to load or generate — pull and
+      // switch to FALLBACK_MODEL, then retry exactly once. A second failure is
+      // reported to the caller rather than looping forever.
+      console.warn(
+        `[Ollama] Primary model request failed (${
+          error instanceof Error ? error.message : String(error)
+        }) — attempting fallback.`,
+      );
+      try {
+        await this.pullModel(FALLBACK_MODEL);
+        return await this.extractFactsWithModel(input, FALLBACK_MODEL);
+      } catch (fallbackError) {
+        console.warn(
+          `[Ollama] Fallback model also failed — ${
+            fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+          }`,
+        );
+        return null;
+      }
+    }
+  }
 
+  /** The actual `/api/chat` call, shared by the primary and fallback attempts. */
+  private async extractFactsWithModel(input: string, model: string): Promise<VerifiedFact | null> {
     const { data } = await this.client.post<ChatResponse>("/api/chat", {
       model,
       stream: false,
@@ -180,6 +205,37 @@ export class OllamaClient {
       );
       return "";
     }
+  }
+
+  /**
+   * AUTO-FAILOVER SUPPORT — pulls `model` via `POST /api/pull` and, on
+   * success, pins it as the resolved model for subsequent calls.
+   *
+   * Used by `ollamaManager.failoverToFallback()` when the primary model
+   * fails to load or generate, so the node can recover a usable local model
+   * without operator intervention. Streaming is disabled so this resolves
+   * once the pull genuinely completes rather than mid-download.
+   */
+  async pullModel(model: string): Promise<void> {
+    const name = model.trim();
+    if (!name) throw new Error("pullModel: empty model name");
+    await this.client.post(
+      "/api/pull",
+      { model: name, stream: false },
+      { timeout: 15 * 60_000 }, // a fresh pull can be a large download
+    );
+    this.resolvedModel = name;
+    console.log(`[Ollama] Pulled and pinned fallback model "${name}".`);
+  }
+
+  /** Clears the cached model resolution, forcing a fresh `/api/tags` check. */
+  resetResolvedModel(): void {
+    this.resolvedModel = null;
+  }
+
+  /** The model currently pinned/resolved, or "" before the first resolution. */
+  get currentModel(): string {
+    return this.resolvedModel ?? "";
   }
 }
 

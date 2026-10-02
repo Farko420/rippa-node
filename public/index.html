@@ -294,10 +294,22 @@
       -->
       <button id="ccRegenCode" type="button" class="ghost" title="Generate a new node code">&#127922;</button>
     </div>
+    <button id="ccNavToggle" type="button" class="ghost cc-nav-toggle" title="Menu" aria-label="Menu" aria-expanded="false">&#9776;</button>
     <button id="ccSetupBtn" type="button" class="ghost" title="Node settings">&#9881; Setup</button>
     <button id="ccLock" type="button" class="ghost">&#128274; Lock</button>
   </header>
 
+  <!--
+    RESPONSIVE NAVIGATION — permanent on desktop, collapsible (hamburger) on
+    mobile. Two destinations: the existing Fleet view, and the new Ollama
+    Control Panel. Pure show/hide, no routing — this is a single document.
+  -->
+  <nav id="ccNav" class="cc-nav">
+    <button type="button" class="cc-nav-item active" data-view="viewFleet">&#9673; Fleet Command</button>
+    <button type="button" class="cc-nav-item" data-view="viewOllama">&#9881; Ollama Control Panel</button>
+  </nav>
+
+  <div id="viewFleet" class="cc-view">
   <!-- SUMMARY TILES -->
   <section class="cc-stats">
     <div class="tile"><span class="tile-label">Satellites</span><strong id="statTotal">0</strong></div>
@@ -407,6 +419,58 @@
       <p id="processesEmpty" class="cc-empty">No shared tasks running.</p>
     </section>
   </main>
+  </div>
+
+  <!--
+    OLLAMA CONTROL PANEL — hidden by default (Fleet Command is the landing
+    view). The padlock defaults LOCKED: the node and Rippa AI retain 100%
+    autonomic control over the server and model selection. Unlocking reveals
+    manual override controls (model, port, restart).
+  -->
+  <div id="viewOllama" class="cc-view" hidden>
+    <section class="cc-panel">
+      <div class="ollama-head">
+        <h2>Embedded Ollama AI Engine</h2>
+        <button id="ollamaPadlock" type="button" class="ghost ollama-padlock" title="Click to unlock manual overrides">
+          <span id="ollamaPadlockIcon">&#128274;</span>
+          <span id="ollamaPadlockLabel">Locked &mdash; Autonomic Control</span>
+        </button>
+      </div>
+      <p class="hint">
+        By default this node and Rippa AI have full autonomic control over the local
+        server and model selection: auto-start, auto-restart on crash, and automatic
+        fallback to another model if the active one fails. Unlock the padlock to
+        override the model, port, or restart the server manually.
+      </p>
+
+      <div class="cc-stats ollama-stats">
+        <div class="tile"><span class="tile-label">Server</span><strong id="ollamaRunning">&mdash;</strong></div>
+        <div class="tile"><span class="tile-label">Managed</span><strong id="ollamaManaged">&mdash;</strong></div>
+        <div class="tile"><span class="tile-label">Model</span><strong id="ollamaModel">&mdash;</strong></div>
+        <div class="tile"><span class="tile-label">Port</span><strong id="ollamaPort">&mdash;</strong></div>
+        <div class="tile"><span class="tile-label">Task</span><strong id="ollamaTask">Idle</strong></div>
+        <div class="tile"><span class="tile-label">Restarts</span><strong id="ollamaRestarts">0</strong></div>
+      </div>
+      <p id="ollamaError" class="hint" hidden></p>
+
+      <!-- MANUAL OVERRIDE CONTROLS — rendered only while unlocked. -->
+      <div id="ollamaOverride" class="ollama-override" hidden>
+        <div class="field">
+          <label for="ollamaModelInput">Override model</label>
+          <input id="ollamaModelInput" type="text" placeholder="e.g. qwen2.5-coder:7b" />
+        </div>
+        <div class="field">
+          <label for="ollamaPortInput">Override port</label>
+          <input id="ollamaPortInput" type="number" min="1" max="65535" placeholder="11434" />
+        </div>
+        <div class="row2">
+          <button id="ollamaApply" type="button" class="save" style="width:auto;padding:11px 20px;">Apply Override</button>
+          <button id="ollamaManagedToggle" type="button" class="ghost">Toggle Self-Managed</button>
+          <button id="ollamaRestartBtn" type="button" class="ghost">Restart Server</button>
+        </div>
+      </div>
+    </section>
+  </div>
 
 </div>
 </div>

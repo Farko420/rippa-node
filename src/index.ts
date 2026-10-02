@@ -3,6 +3,7 @@ import { ensureDataDir, migrateLegacyData } from "./utils/paths";
 import { APP_VERSION } from "./version";
 import { startVitalsSampler } from "./services/telemetry";
 import { describeRuntime, supportsBrowserScraping } from "./platform";
+import { ollamaManager } from "./services/ollamaManager";
 
 // Deeper fatal-error stacks (the default of 10 frames hides the caller module).
 (Error as { stackTraceLimit?: number }).stackTraceLimit = 60;
@@ -118,6 +119,19 @@ async function main(): Promise<void> {
     // CPU load needs two samples separated by an interval, so the sampler
     // must be running before the first heartbeat to report a real figure.
     startVitalsSampler();
+
+    /*
+      SEAMLESS OLLAMA STARTUP — opt-in, zero-touch supervision.
+
+      Disabled by default: most operators already run their own Ollama server
+      and `OLLAMA_URL` simply points at it (see localAi.ts discovery). Setting
+      RIPPA_OLLAMA_MANAGED=true (or unlocking + starting it from the Control
+      Panel) hands this node the responsibility of spawning, verifying and
+      auto-restarting `ollama serve` itself — see services/ollamaManager.ts.
+    */
+    if (process.env.RIPPA_OLLAMA_MANAGED === "true") {
+      ollamaManager.setManaged(true);
+    }
 
     // Wire the rich heartbeat telemetry + remote command execution. The swarm
     // dispatcher owns the registry, so it supplies the P2P link list and the
@@ -336,6 +350,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     console.log(`\n[Boot] ${signal} received — shutting down...`);
     await stopNodeServices();
+    await ollamaManager.stop();
     if (deepBrainOpen) {
       closeDeepBrain();
       deepBrainOpen = false;

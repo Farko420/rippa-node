@@ -1,5 +1,6 @@
 import { getSystemVitals, type SystemVitals } from "./telemetry";
 import { publishNodeEvent } from "./nodeEvents";
+import { ollamaManager } from "./ollamaManager";
 
 /**
  * HEARTBEAT TELEMETRY & REMOTE COMMAND EXECUTION.
@@ -107,11 +108,30 @@ export interface CurrentProcessInfo {
   elapsedSeconds: number;
 }
 
+/**
+ * Embedded Ollama AI status reported on every heartbeat, so Fleet Command can
+ * show — per node — whether the local server is active, what model is
+ * loaded, and what task it is currently processing.
+ */
+export interface OllamaTelemetry {
+  /** True when this node is supervising its own `ollama serve` process. */
+  managed: boolean;
+  /** True when the server is confirmed up and answering. */
+  running: boolean;
+  /** Model currently selected/loaded. */
+  model: string;
+  /** Port the local server is configured to serve on. */
+  port: number;
+  /** The task this node is actively processing, or null when idle. */
+  task: string | null;
+}
+
 /** Rich telemetry broadcast with every heartbeat. */
 export interface HeartbeatTelemetry extends SystemVitals {
   current_process: CurrentProcessInfo | null;
   efficiency_score: number;
   connected_satellites: string[];
+  ollama: OllamaTelemetry;
 }
 
 /**
@@ -233,6 +253,20 @@ export function buildHeartbeatTelemetry(
     connected_satellites: Array.isArray(connectedSatellites)
       ? connectedSatellites.map(String).filter(Boolean)
       : [],
+    ollama: buildOllamaTelemetry(),
+  };
+}
+
+/** Assembles the embedded-AI telemetry block from `ollamaManager`'s state. */
+function buildOllamaTelemetry(): OllamaTelemetry {
+  const activeTask = getCurrentProcess();
+  const status = ollamaManager.getStatus(activeTask?.task ?? null);
+  return {
+    managed: status.managed,
+    running: status.state === "running",
+    model: status.model,
+    port: status.port,
+    task: status.task,
   };
 }
 
