@@ -1,6 +1,6 @@
 {
   "name": "rippa-node",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "description": "Rippa Node â€” Deep Brain worker for Rippa Adventures: headless scraping, local LLM extraction (Ollama), and autonomous feature research.",
   "main": "dist/index.js",
   "scripts": {
