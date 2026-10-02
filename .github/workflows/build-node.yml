@@ -9,9 +9,37 @@ on:
     # workflow still fires if the default is ever renamed. Without both, a push
     # produces no build and OTA has nothing to publish.
     branches: [main, master]
+    # TAGS MATTER AS MUCH AS BRANCHES, and omitting them is what made "OTA aborts"
+    # a mystery rather than a bug report.
+    #
+    # `git push origin v1.0.11` is how a release is cut, and with `branches:` only
+    # it matched NO trigger at all: no build, no release, no OTA, and a green
+    # Actions page because nothing ran. The fleet then sat on its old binary with
+    # the updater logging a version it had already seen and nothing to fetch.
+    #
+    # The tag build publishes to the SAME rolling "latest" release as a branch
+    # build (see the Publish step) rather than minting a versioned release, and
+    # that is deliberate: GitHub's `/releases/latest` returns the newest release
+    # by CREATED_AT, so a permanent `v1.0.11` release would permanently outrank
+    # the rolling tag and become the answer every node polls — freezing OTA on
+    # whatever shipped that day. The tag is still recorded in the release body as
+    # `build-tag:` for provenance.
+    #
+    # `v*` only, and `v[0-9]+.*` would be stricter still; `v*` is chosen so a
+    # typo'd tag fails the build loudly rather than silently matching nothing.
+    tags: ["v*"]
   # Allows a manual re-run (e.g. after fixing a failed build) from the UI.
   workflow_dispatch:
-  # Also run when a version is manually edited in package.json.
+  # Also run when a release is published from the GitHub UI.
+  #
+  # GUARDED, and the guard is load-bearing. This workflow publishes a release, and
+  # publishing a release fires this trigger again. It only settles after the first
+  # run because `softprops/action-gh-release` UPDATES the existing "latest" release
+  # rather than creating a second one — an update emits `edited`, not `published` —
+  # but that is a property of the action's behaviour, not of GitHub's, and a
+  # day when it creates rather than updates would ship an infinite release loop
+  # that republishes the same binary forever. The `if:` below makes the loop
+  # impossible by construction, so it does not depend on that behaviour holding.
   release:
     types: [published]
 
@@ -33,9 +61,29 @@ jobs:
     name: Build rippa-node.exe and publish release
     runs-on: windows-latest
 
+    # THE RELEASE LOOP GUARD, and it is an `if:` on the JOB rather than on the
+    # publish step for one reason: the version-bump step COMMITS BACK to the
+    # branch, and that push is itself a trigger. Guarding only the publish step
+    # would still let a re-triggered run bump and commit a version again, so the
+    # repo would gain an endless series of "chore: bump version" commits.
+    #
+    # This workflow's own releases are all tagged "latest" (see the Publish step),
+    # so a `release` event for that tag is this workflow talking to itself. A
+    # human publishing some OTHER tag still runs, which is the case worth keeping.
+    if: >-
+      github.event_name != 'release' ||
+      github.event.release.tag_name != 'latest'
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Depth 0 is REQUIRED, not an optimisation. The Bump-version step commits
+          # a new package.json back to the branch, and `stefanzweifel/git-auto-commit-action`
+          # refuses to push without a usable ref to push onto — with the default
+          # shallow fetch (depth 1) that ref is missing and the step fails with a
+          # checkout error that reads nothing like its cause.
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -54,16 +102,37 @@ jobs:
       # Bump the patch version so the fleet's isVersionNewer() comparison sees a
       # genuinely newer release on every push. The bumped version is committed
       # back so package.json stays the single source of truth for the app.
+      #
+      # A TAG PUSH DOES NOT BUMP, and that is the load-bearing branch here. The tag
+      # is the operator's statement of what this build IS (`v1.0.11`), so bumping on
+      # top of it would publish a release whose body claims a version the tag
+      # contradicts. The node's updater reads the version out of the release body
+      # (see `extractVersion` in src/services/updater.ts), so the two would disagree
+      # and a fleet could install a binary it believes is a version it already has
+      # and skip it — the exact "OTA aborts" symptom this workflow exists to fix.
+      #
+      # So: on a tag, the tag's own version wins; on a branch, it is bumped.
       - name: Bump version
         id: version
         shell: pwsh
         run: |
           $pkg = Get-Content package.json -Raw | ConvertFrom-Json
-          $parts = $pkg.version.Split('.')
-          $major = [int]$parts[0]
-          $minor = [int]$parts[1]
-          $patch = [int]$parts[2] + 1
-          $newVersion = "$major.$minor.$patch"
+          if ("${{ github.ref_type }}" -eq "tag") {
+            # Take the version from the tag, and fail loudly if the tag is not a
+            # version at all rather than silently falling back to a stale one.
+            $m = [regex]::Match("${{ github.ref_name }}", '^v?(\d+\.\d+\.\d+)')
+            if (-not $m.Success) {
+              Write-Error "Tag '${{ github.ref_name }}' is not a vMAJOR.MINOR.PATCH tag"
+              exit 1
+            }
+            $newVersion = $m.Groups[1].Value
+          } else {
+            $parts = $pkg.version.Split('.')
+            $major = [int]$parts[0]
+            $minor = [int]$parts[1]
+            $patch = [int]$parts[2] + 1
+            $newVersion = "$major.$minor.$patch"
+          }
           npm version $newVersion --no-git-tag-version --allow-same-version
           $pkg.version = $newVersion
           $pkg | ConvertTo-Json -Depth 10 | Set-Content package.json
@@ -115,7 +184,17 @@ jobs:
           Write-Host "SHA256: $hash"
           "sha256=$hash" >> $env:GITHUB_OUTPUT
 
+      # SKIPPED ON A TAG PUSH, deliberately.
+      #
+      # On a tag, actions/checkout leaves the workspace on a DETACHED HEAD at the
+      # tag, so there is no branch to push to — the action fails with a checkout
+      # error that gives no hint about its real cause, and because this step sits
+      # BEFORE the release, it would abort the run and take the OTA release down
+      # with it. A tag build also has nothing to commit back to: the tag itself is
+      # the immutable record of the version, and writing package.json afterwards
+      # would only re-trigger this workflow.
       - name: Commit the version bump
+        if: github.ref_type != 'tag'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: bump version to ${{ steps.version.outputs.version }}"
@@ -190,6 +269,85 @@ jobs:
           # implicit value depends on the repository's default token permissions,
           # so state it to make the 403-on-release impossible to misdiagnose.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -------------------------------------------------------------------------
+      # POST-PUBLISH VERIFICATION.
+      #
+      # WHY THIS EXISTS. Every setting above is individually permissive enough to
+      # let a release silently fail to publish:
+      #
+      #   * `fail_on_unmatched_files: false` means a renamed binary publishes a
+      #     release with NO .exe asset and still reports success — and the node's
+      #     `parseLatestRelease` REJECTS an assetless release ("has no .exe asset —
+      #     ignoring"), so the fleet sees nothing and the run is green.
+      #   * A `contents: write` that is denied at the org level makes the action
+      #     403, which this job cannot distinguish from a no-op unless it asks.
+      #
+      # Both failures present identically from the outside: a green Actions run,
+      # a release page, and an OTA update that aborts for no visible reason. So
+      # the only honest check is to ASK GITHUB what it actually published and to
+      # fail the job when the answer is not what the updater needs.
+      #
+      # It reads the SAME endpoint the fleet polls (`/releases/latest`) and the
+      # same asset fields `parseLatestRelease` requires, so this asserts the
+      # updater's contract rather than a proxy for it. A green run here means the
+      # next node to poll will find something it can actually install.
+      - name: Verify the published release is what the updater needs
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = "${{ github.repository }}"
+          $expectedVersion = "${{ steps.version.outputs.version }}"
+          $expectedSha = "${{ steps.checksum.outputs.sha256 }}"
+
+          # `$ErrorActionPreference` covers PowerShell's own errors; a non-2xx HTTP
+          # response is not one, so the status is checked explicitly below.
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/$repo/releases/latest" `
+            -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+
+          if ($release.tag_name -ne "latest") {
+            Write-Error "::error::/releases/latest returned tag '$($release.tag_name)', expected 'latest'. A stale release is shadowing the rolling tag, and the fleet will keep polling it forever."
+            exit 1
+          }
+
+          # The updater extracts the version from the tag, the NAME or the body —
+          # in that order — and 'latest' is not a version, so the name is what
+          # actually carries it. Assert it rather than trusting that it does.
+          if ($release.name -notmatch [regex]::Escape($expectedVersion)) {
+            Write-Error "::error::Release name '$($release.name)' does not carry the built version $expectedVersion; the updater will extract a different version and skip the fleet."
+            exit 1
+          }
+
+          $asset = $release.assets | Where-Object { $_.name -like "*.exe" } | Select-Object -First 1
+          if (-not $asset) {
+            Write-Error "::error::Release '$($release.tag_name)' has no .exe asset. parseLatestRelease ignores such a release, so every node would silently skip this update."
+            exit 1
+          }
+
+          # `parseLatestRelease` takes the FIRST .exe it finds, so an ambiguous
+          # pair means the fleet's choice is arbitrary.
+          $exeAssets = @($release.assets | Where-Object { $_.name -like "*.exe" })
+          if ($exeAssets.Count -gt 1) {
+            Write-Error "::error::Release has $($exeAssets.Count) .exe assets; parseLatestRelease takes the first, so which binary ships is arbitrary."
+            exit 1
+          }
+
+          # A zero-byte or placeholder asset passes every check above and still
+          # leaves the fleet with a binary it cannot run.
+          if ($asset.size -lt 1MB) {
+            Write-Error "::error::Published asset $($asset.name) is only $($asset.size) bytes. The Locate step refuses to publish under 1MB, so this is a truncated upload rather than a real binary."
+            exit 1
+          }
+
+          if ($release.body -notmatch [regex]::Escape($expectedSha)) {
+            Write-Error "::error::Release body does not carry the built SHA-256, so the updater cannot verify what it downloads."
+            exit 1
+          }
+
+          Write-Host "Verified: latest -> $($release.name), asset $($asset.name) ($([math]::Round($asset.size/1MB,1)) MB), SHA recorded."
 
       # DIAGNOSTIC. `npm run package` writes dist/rippa-node.exe (see
       # scripts/package.mjs), but when packaging fails upstream the upload step
