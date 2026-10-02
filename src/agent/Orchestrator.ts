@@ -157,6 +157,11 @@ export class Orchestrator {
     return this.running;
   }
 
+  /** The scraper service — exposed for the dashboard's self-heal action. */
+  getScraper(): ScraperService {
+    return this.scraper;
+  }
+
   /** The tier the node is in right now — "priority" or "idle". */
   currentTier(): "priority" | "idle" {
     return this.engine.currentTier();

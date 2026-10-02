@@ -1,7 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import axios from "axios";
 import { env } from "../config";
-import { OllamaClient, PRIMARY_MODEL, FALLBACK_MODEL } from "../agent/OllamaClient";
+import {
+  OllamaClient,
+  PRIMARY_MODEL,
+  FALLBACK_MODEL,
+  EMBEDDING_MODEL,
+  recommendedPrimaryModel,
+  systemRamGb,
+} from "../agent/OllamaClient";
 import { publishNodeEvent } from "./nodeEvents";
 
 /**
@@ -48,6 +55,12 @@ export interface OllamaStatus {
   lastError: string | null;
   /** Number of restarts since boot. */
   restartCount: number;
+  /** Total system RAM in GB, used by the hardware auto-profiler. */
+  ramGb: number;
+  /** True once the embedding model has been pulled on this node. */
+  embeddingModelReady: boolean;
+  /** Name of the embedding model this node auto-pulls. */
+  embeddingModel: string;
 }
 
 function extractPort(url: string): number {
@@ -68,6 +81,7 @@ class OllamaManager {
   private model = PRIMARY_MODEL;
   private lastError: string | null = null;
   private restartCount = 0;
+  private embeddingModelReady = false;
   private crashTimestamps: number[] = [];
   private restartTimer: NodeJS.Timeout | null = null;
   private stopping = false;
@@ -116,6 +130,9 @@ class OllamaManager {
       task,
       lastError: this.lastError,
       restartCount: this.restartCount,
+      ramGb: systemRamGb(),
+      embeddingModelReady: this.embeddingModelReady,
+      embeddingModel: EMBEDDING_MODEL,
     };
   }
 
@@ -125,6 +142,10 @@ class OllamaManager {
     this.stopping = false;
     this.state = "starting";
     const port = extractPort(env.OLLAMA_URL ?? "http://127.0.0.1:11434");
+    // HARDWARE AUTO-PROFILING — a weak satellite laptop must never be handed
+    // the 7B coder model; pick the model BEFORE spawning so the first pull
+    // (below, once the server answers) requests the right one.
+    this.model = recommendedPrimaryModel();
     try {
       const child = spawn("ollama", ["serve"], {
         env: { ...process.env, OLLAMA_HOST: `127.0.0.1:${port}` },
@@ -158,7 +179,13 @@ class OllamaManager {
       await new Promise((resolve) => setTimeout(resolve, 1_500));
       const alive = await this.probe(port);
       this.state = alive ? "running" : "starting";
-      if (alive) console.log(`[OllamaManager] ollama serve is up on port ${port}.`);
+      if (alive) {
+        console.log(`[OllamaManager] ollama serve is up on port ${port}.`);
+        // HARDWARE AUTO-PROFILING + LOCAL EMBEDDING — pull the RAM-appropriate
+        // generation model and the embedding model in the background. Never
+        // blocks `start()` — a slow first pull must not look like a hang.
+        void this.ensureModelsPulled();
+      }
     } catch (error) {
       this.state = "crashed";
       this.lastError = error instanceof Error ? error.message : String(error);
@@ -189,6 +216,63 @@ class OllamaManager {
     await this.stop();
     this.stopping = false;
     await this.start();
+  }
+
+  /**
+   * DYNAMIC MODEL SIZING + LOCAL EMBEDDING — pulls the hardware-appropriate
+   * generation model and the embedding model so the node is ready to serve
+   * both chat/generation and embeddings with no operator action.
+   */
+  private async ensureModelsPulled(): Promise<void> {
+    const client = new OllamaClient();
+    try {
+      await client.pullModel(this.model);
+      publishNodeEvent({
+        kind: "info",
+        title: "Ollama model ready",
+        detail: `Pulled "${this.model}" (${systemRamGb()}GB RAM detected).`,
+      });
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error);
+      console.warn(`[OllamaManager] Failed to pull "${this.model}" — ${this.lastError}`);
+    }
+    try {
+      await client.pullModel(EMBEDDING_MODEL);
+      this.embeddingModelReady = true;
+      publishNodeEvent({
+        kind: "info",
+        title: "Embedding model ready",
+        detail: `Pulled "${EMBEDDING_MODEL}" — local embeddings are now available.`,
+      });
+    } catch (error) {
+      console.warn(
+        `[OllamaManager] Failed to pull embedding model "${EMBEDDING_MODEL}" — ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * SELF-HEAL — the Embedded AI panel's repair routine. Kills a stuck
+   * managed child, clears the last-error diagnostic, and relaunches the
+   * server, re-pulling both models on the way back up.
+   */
+  async selfHeal(): Promise<{ healed: boolean; message: string }> {
+    this.lastError = null;
+    this.crashTimestamps = [];
+    this.restartCount = 0;
+    try {
+      await this.stop();
+      this.stopping = false;
+      if (!this.managed) this.managed = true;
+      await this.start();
+      return { healed: true, message: "Ollama self-heal complete — server restarted and models re-verified." };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.lastError = message;
+      return { healed: false, message: `Self-heal failed — ${message}` };
+    }
   }
 
   private scheduleRestart(): void {

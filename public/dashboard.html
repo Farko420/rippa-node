@@ -40,7 +40,9 @@
 
   <nav id="ccNav" class="cc-nav">
     <button type="button" class="cc-nav-item active" data-view="viewFleet">◉ Fleet Command</button>
-    <button type="button" class="cc-nav-item" data-view="viewOllama">⚙ Ollama Control Panel</button>
+    <button type="button" class="cc-nav-item" data-view="viewOllama">⚙ Embedded AI</button>
+    <button type="button" class="cc-nav-item" data-view="viewScraper">🕷 Playwright Scraper</button>
+    <button type="button" class="cc-nav-item" data-view="viewMesh">🛰 Mesh Network</button>
   </nav>
 
   <div id="viewFleet" class="cc-view">
@@ -125,10 +127,12 @@
     <section class="cc-panel">
       <div class="ollama-head">
         <h2>Embedded Ollama AI Engine</h2>
+        <span id="ollamaStatusBadge" class="status-badge status-idle">Idle</span>
         <button id="ollamaPadlock" type="button" class="ghost ollama-padlock" title="Click to unlock manual overrides">
           <span id="ollamaPadlockIcon">🔒</span>
           <span id="ollamaPadlockLabel">Locked — Autonomic Control</span>
         </button>
+        <button id="ollamaSelfHeal" type="button" class="ghost self-heal-btn" title="Repair this feature">🩹 Self-Heal</button>
       </div>
       <p class="hint">
         By default this node and Rippa AI have full autonomic control over the local
@@ -143,6 +147,8 @@
         <div class="tile"><span class="tile-label">Port</span><strong id="ollamaPort">—</strong></div>
         <div class="tile"><span class="tile-label">Task</span><strong id="ollamaTask">Idle</strong></div>
         <div class="tile"><span class="tile-label">Restarts</span><strong id="ollamaRestarts">0</strong></div>
+        <div class="tile"><span class="tile-label">System RAM</span><strong id="ollamaRam">—</strong></div>
+        <div class="tile"><span class="tile-label">Embedding Model</span><strong id="ollamaEmbed">—</strong></div>
       </div>
       <p id="ollamaError" class="hint" hidden></p>
       <div id="ollamaOverride" class="ollama-override" hidden>
@@ -160,6 +166,44 @@
           <button id="ollamaRestartBtn" type="button" class="ghost">Restart Server</button>
         </div>
       </div>
+    </section>
+  </div>
+
+  <div id="viewScraper" class="cc-view" hidden>
+    <section class="cc-panel">
+      <div class="ollama-head">
+        <h2>Playwright Scraper</h2>
+        <span id="scraperStatusBadge" class="status-badge status-idle">Idle</span>
+        <button id="scraperSelfHeal" type="button" class="ghost self-heal-btn" title="Repair this feature">🩹 Self-Heal</button>
+      </div>
+      <p class="hint">
+        Headless Chromium (or the lightweight fetch fallback on mobile) powers autonomous foraging.
+        Self-Heal kills a stuck browser instance, clears any corrupt install state, and relaunches it.
+      </p>
+      <div class="cc-stats ollama-stats">
+        <div class="tile"><span class="tile-label">Engine</span><strong id="scraperEngine">—</strong></div>
+        <div class="tile"><span class="tile-label">Runtime</span><strong id="scraperRuntime">—</strong></div>
+      </div>
+      <p id="scraperMessage" class="hint" hidden></p>
+    </section>
+  </div>
+
+  <div id="viewMesh" class="cc-view" hidden>
+    <section class="cc-panel">
+      <div class="ollama-head">
+        <h2>Mesh Network</h2>
+        <span id="meshStatusBadge" class="status-badge status-idle">Idle</span>
+        <button id="meshSelfHeal" type="button" class="ghost self-heal-btn" title="Repair this feature">🩹 Self-Heal</button>
+      </div>
+      <p class="hint">
+        Zero-config satellite pairing and fleet routing. Self-Heal clears stale registry entries
+        (no contact for 6+ hours) and re-verifies this node's pairing with its Master.
+      </p>
+      <div class="cc-stats ollama-stats">
+        <div class="tile"><span class="tile-label">Satellites</span><strong id="meshSatellites">—</strong></div>
+        <div class="tile"><span class="tile-label">Online</span><strong id="meshOnline">—</strong></div>
+      </div>
+      <p id="meshMessage" class="hint" hidden></p>
     </section>
   </div>
 

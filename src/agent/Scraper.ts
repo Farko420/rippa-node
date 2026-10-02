@@ -478,6 +478,35 @@ export class ScraperService {
       console.log("[Scraper] Headless Chromium closed.");
     }
   }
+
+  /**
+   * SELF-HEAL — the Playwright Scraper panel's repair routine. Kills the
+   * current browser instance (clearing any stuck/zombie Chromium process),
+   * resets the Chromium-unavailable verdict so a resolved network issue is
+   * retried, and re-launches a fresh instance.
+   */
+  async selfHeal(): Promise<{ healed: boolean; message: string }> {
+    try {
+      await this.close();
+      chromiumUnavailable = false;
+      chromiumBootstrap = null;
+      this.canUseBrowser = supportsBrowserScraping();
+      if (this.canUseBrowser) {
+        await ensureChromiumInstalled();
+        await this.getBrowser();
+      }
+      return {
+        healed: true,
+        message: this.canUseBrowser
+          ? "Scraper self-heal complete — Chromium relaunched."
+          : "Scraper self-heal complete — this runtime uses the lightweight fetch scraper.",
+      };
+    } catch (error) {
+      this.canUseBrowser = false;
+      const message = error instanceof Error ? error.message : String(error);
+      return { healed: false, message: `Self-heal failed — ${message}` };
+    }
+  }
 }
 
 /**

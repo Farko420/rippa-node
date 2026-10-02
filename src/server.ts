@@ -4,10 +4,11 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import os from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
+import axios from "axios";
 import { z } from "zod";
 import { env, reloadEnv } from "./config";
 import { APP_VERSION } from "./version";
-import { runtimeCapabilities } from "./platform";
+import { describeRuntime, runtimeCapabilities } from "./platform";
 import { scanForMasters } from "./network/discovery";
 import {
   ensureNodeIdentity,
@@ -95,6 +96,25 @@ const dispatcher = new SwarmDispatcher();
 /** The shared dispatcher used by the mesh API routes. */
 export function getDispatcher(): SwarmDispatcher {
   return dispatcher;
+}
+
+/**
+ * The live Orchestrator instance, registered by index.ts once built. Nullable
+ * because the orchestrator only exists once the node is fully configured —
+ * the self-heal route below degrades gracefully when it is absent.
+ */
+interface OrchestratorScraperRef {
+  getScraper: () => {
+    selfHeal: () => Promise<{ healed: boolean; message: string }>;
+    isBrowserBacked: () => boolean;
+  };
+}
+
+let orchestratorRef: OrchestratorScraperRef | null = null;
+
+/** Registers the live Orchestrator so API routes can reach its scraper. */
+export function setOrchestratorRef(orchestrator: OrchestratorScraperRef | null): void {
+  orchestratorRef = orchestrator;
 }
 
 /**
@@ -1278,6 +1298,140 @@ export function createApp(): Express {
     }
   });
 
+  /*
+    SELF-HEAL ROUTES — one per sub-feature panel. Each runs a programmatic
+    repair routine (kill stuck processes, clear caches, restart local
+    servers) and reports whether the feature is back to 100% functionality.
+  */
+  app.post("/api/ollama/self-heal", requireDashboardAuth, async (_req: Request, res: Response) => {
+    const result = await ollamaManager.selfHeal();
+    res.status(result.healed ? 200 : 500).json({ success: result.healed, message: result.message });
+  });
+
+  app.post("/api/scraper/self-heal", requireDashboardAuth, async (_req: Request, res: Response) => {
+    if (!orchestratorRef) {
+      res.status(409).json({
+        success: false,
+        message: "Scraper is not running yet — the node is still starting up.",
+      });
+      return;
+    }
+    try {
+      const result = await orchestratorRef.getScraper().selfHeal();
+      res.status(result.healed ? 200 : 500).json({ success: result.healed, message: result.message });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // GET /api/scraper/status — status panel for the Playwright Scraper feature.
+  app.get("/api/scraper/status", requireDashboardAuth, (_req: Request, res: Response) => {
+    const browserBacked = orchestratorRef ? orchestratorRef.getScraper().isBrowserBacked() : false;
+    res.json({
+      success: true,
+      state: orchestratorRef ? (browserBacked ? "active" : "idle") : "stopped",
+      browserBacked,
+      runtime: describeRuntime(),
+    });
+  });
+
+  // POST /api/mesh/self-heal — the Mesh Network panel's repair routine.
+  app.post("/api/mesh/self-heal", requireDashboardAuth, async (_req: Request, res: Response) => {
+    try {
+      const purged = dispatcher.pruneForgottenNodes();
+      await dispatcher.ensurePairedWithMaster();
+      res.json({
+        success: true,
+        message:
+          purged.length > 0
+            ? `Mesh self-heal complete — cleared ${purged.length} stale node(s) and re-paired.`
+            : "Mesh self-heal complete — re-verified pairing.",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  /*
+    NATIVE OPENAI API PROXY ROUTES.
+
+    Lets the Mothership (or any OpenAI-SDK client) talk to this node's local
+    Ollama instance with zero knowledge of Ollama's own API shape. Every
+    outbound request has `keep_alive` injected so VRAM is released promptly —
+    this node also runs Playwright scrapers and cannot hog the GPU.
+  */
+  app.post("/v1/chat/completions", async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const model = typeof body["model"] === "string" && body["model"] ? body["model"] : ollamaManager.getModel();
+      const messages = Array.isArray(body["messages"]) ? body["messages"] : [];
+      const stream = Boolean(body["stream"]);
+      const base = (env.OLLAMA_URL ?? "http://127.0.0.1:11434").replace(/\/+$/, "");
+      const upstream = await axios.post(
+        `${base}/api/chat`,
+        {
+          model,
+          messages,
+          stream: false,
+          keep_alive: "60s",
+          options: {
+            temperature: typeof body["temperature"] === "number" ? body["temperature"] : undefined,
+          },
+        },
+        { timeout: 180_000, proxy: false },
+      );
+      const content = String(upstream.data?.message?.content ?? "");
+      const created = Math.floor(Date.now() / 1000);
+      res.json({
+        id: `chatcmpl-${created}`,
+        object: stream ? "chat.completion.chunk" : "chat.completion",
+        created,
+        model,
+        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      });
+    } catch (error) {
+      res.status(502).json({
+        success: false,
+        message: `Upstream Ollama error — ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  });
+
+  app.post("/v1/embeddings", async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const model =
+        typeof body["model"] === "string" && body["model"]
+          ? body["model"]
+          : (require("./agent/OllamaClient") as typeof import("./agent/OllamaClient")).EMBEDDING_MODEL;
+      const rawInput = body["input"];
+      const inputs = Array.isArray(rawInput) ? rawInput.map(String) : [String(rawInput ?? "")];
+      const base = (env.OLLAMA_URL ?? "http://127.0.0.1:11434").replace(/\/+$/, "");
+      const data = await Promise.all(
+        inputs.map(async (text, index) => {
+          const upstream = await axios.post(
+            `${base}/api/embeddings`,
+            { model, prompt: text, keep_alive: "60s" },
+            { timeout: 60_000, proxy: false },
+          );
+          return { object: "embedding", index, embedding: upstream.data?.embedding ?? [] };
+        }),
+      );
+      res.json({ object: "list", data, model, usage: { prompt_tokens: 0, total_tokens: 0 } });
+    } catch (error) {
+      res.status(502).json({
+        success: false,
+        message: `Upstream Ollama error — ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  });
 
 // GET /api/mesh/updater — OTA status for the dashboard.
   app.get("/api/mesh/updater", requireDashboardAuth, (_req: Request, res: Response) => {

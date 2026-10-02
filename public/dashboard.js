@@ -967,7 +967,7 @@ function setText(id, value) {
 }
 
 function showView(viewId) {
-  ["viewFleet", "viewOllama"].forEach((id) => {
+  ["viewFleet", "viewOllama", "viewScraper", "viewMesh"].forEach((id) => {
     const el = $(id);
     if (el) el.hidden = id !== viewId;
   });
@@ -975,6 +975,8 @@ function showView(viewId) {
     btn.classList.toggle("active", btn.getAttribute("data-view") === viewId);
   });
   if (viewId === "viewOllama") void refreshOllama();
+  if (viewId === "viewScraper") void refreshScraper();
+  if (viewId === "viewMesh") void refreshMesh();
 }
 
 document.querySelectorAll(".cc-nav-item").forEach((btn) => {
@@ -1005,6 +1007,15 @@ if (navToggle) {
 let ollamaUnlocked = false;
 let ollamaManagedState = false;
 
+/** Paints a shared status badge (Active / Error / Downloading / Idle). */
+function setStatusBadge(id, state) {
+  const badge = $(id);
+  if (!badge) return;
+  const labels = { active: "Active", error: "Error", downloading: "Downloading", idle: "Idle" };
+  badge.textContent = labels[state] || "Idle";
+  badge.className = "status-badge status-" + (labels[state] ? state : "idle");
+}
+
 function renderOllamaStatus(status) {
   if (!status) return;
   ollamaManagedState = Boolean(status.managed);
@@ -1014,6 +1025,12 @@ function renderOllamaStatus(status) {
   setText("ollamaPort", String(status.port || "-"));
   setText("ollamaTask", status.task || "Idle");
   setText("ollamaRestarts", String(status.restartCount || 0));
+  setText("ollamaRam", status.ramGb ? status.ramGb + " GB" : "—");
+  setText("ollamaEmbed", status.embeddingModelReady ? (status.embeddingModel || "ready") : "pulling…");
+  setStatusBadge(
+    "ollamaStatusBadge",
+    status.lastError ? "error" : status.running ? "active" : status.managed ? "downloading" : "idle",
+  );
 
   const errBox = $("ollamaError");
   if (errBox) {
@@ -1121,10 +1138,68 @@ if (ollamaRestartBtn) {
   });
 }
 
-// Keep the panel live while it is the open view (independent, slower cadence —
-// matches the OTA strip's own poll so this is not just piggy-backing on it).
+/** Wires a generic Self-Heal button: POSTs to `path`, shows the result, refreshes `after`. */
+function wireSelfHeal(btnId, path, after) {
+  const btn = $(btnId);
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = "🩹 Healing…";
+    try {
+      const { response, data } = await api(path, { method: "POST", body: "{}" });
+      showAlert(data.message || (response.ok ? "Self-heal complete." : "Self-heal failed."), response.ok ? "ok" : "err");
+    } catch (err) {
+      showAlert("Self-heal request failed.", "err");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = original;
+      if (after) void after();
+    }
+  });
+}
+
+wireSelfHeal("ollamaSelfHeal", "/api/ollama/self-heal", refreshOllama);
+wireSelfHeal("scraperSelfHeal", "/api/scraper/self-heal", () => refreshScraper());
+wireSelfHeal("meshSelfHeal", "/api/mesh/self-heal", () => refreshMesh());
+
+// --- PLAYWRIGHT SCRAPER PANEL -------------------------------------------------
+
+async function refreshScraper() {
+  try {
+    const { response, data } = await api("/api/scraper/status");
+    if (!response.ok || !data.success) return;
+    setText("scraperEngine", data.browserBacked ? "Headless Chromium" : "Lightweight fetch");
+    setText("scraperRuntime", data.runtime || "—");
+    setStatusBadge("scraperStatusBadge", data.state === "active" ? "active" : data.state === "stopped" ? "idle" : "idle");
+  } catch (err) {
+    /* panel stays on its last known state */
+  }
+}
+
+// --- MESH NETWORK PANEL -------------------------------------------------------
+
+async function refreshMesh() {
+  try {
+    const { response, data } = await api("/api/mesh/snapshot");
+    if (!response.ok || !data.success) return;
+    const satellites = Array.isArray(data.satellites) ? data.satellites : [];
+    const online = satellites.filter((s) => s && s.online).length;
+    setText("meshSatellites", String(satellites.length));
+    setText("meshOnline", String(online));
+    setStatusBadge("meshStatusBadge", satellites.length === 0 ? "idle" : online > 0 ? "active" : "error");
+  } catch (err) {
+    /* panel stays on its last known state */
+  }
+}
+
+// Keep the panels live while they are the open view (independent, slower
+// cadence — matches the OTA strip's own poll so this is not just
+// piggy-backing on it).
 setInterval(() => {
   if ($("viewOllama") && !$("viewOllama").hidden) void refreshOllama();
+  if ($("viewScraper") && !$("viewScraper").hidden) void refreshScraper();
+  if ($("viewMesh") && !$("viewMesh").hidden) void refreshMesh();
 }, 5000);
 
 const lockBtn = $("ccLock");

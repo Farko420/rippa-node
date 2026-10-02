@@ -210,6 +210,16 @@
 .ollama-stats { margin-top:14px; }
 .ollama-override { margin-top:16px; border-top:1px solid var(--line); padding-top:16px; }
 
+/* ---- STATUS BADGES + SELF-HEAL (shared across every feature panel) --------- */
+.status-badge { font-size:11px; letter-spacing:.06em; text-transform:uppercase; padding:4px 10px;
+  border-radius:999px; border:1px solid var(--line); color:var(--mut); }
+.status-badge.status-active  { border-color:var(--ok); color:var(--ok); }
+.status-badge.status-idle    { border-color:var(--line); color:var(--mut); }
+.status-badge.status-error   { border-color:var(--bad, #f85149); color:var(--bad, #f85149); }
+.status-badge.status-downloading { border-color:var(--warn); color:var(--warn); }
+.self-heal-btn { font-size:13px; }
+.self-heal-btn:disabled { opacity:.6; cursor:wait; }
+
 /* ---- SETUP / DASHBOARD CONTAINERS ------------------------------------------
    index.html is now a single page holding both surfaces, so the setup form is
    centred while the dashboard uses the full-width Control Center layout. */

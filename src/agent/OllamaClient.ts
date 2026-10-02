@@ -1,6 +1,24 @@
+import os from "node:os";
 import axios, { type AxiosInstance } from "axios";
 import { z } from "zod";
 import { env } from "../config";
+
+/**
+ * HARDWARE AUTO-PROFILING — picks the generation model a satellite should
+ * auto-pull based on physical RAM, using Node's native `os` module.
+ *
+ * >= 8GB: the primary code model (qwen2.5-coder:7b).
+ * < 8GB: a small, fast fallback (qwen2.5:1.5b) that will not freeze the host.
+ */
+export function recommendedPrimaryModel(): string {
+  const totalGb = os.totalmem() / (1024 * 1024 * 1024);
+  return totalGb >= LOW_RAM_THRESHOLD_GB ? PRIMARY_MODEL : LOW_RAM_MODEL;
+}
+
+/** Total system RAM in whole GB — surfaced to the dashboard/status panels. */
+export function systemRamGb(): number {
+  return Math.round((os.totalmem() / (1024 * 1024 * 1024)) * 10) / 10;
+}
 
 /**
  * THE BRAIN — local Ollama extraction client.
@@ -13,6 +31,29 @@ import { env } from "../config";
 /** Preferred model; falls back to `llama3` when it is not pulled locally. */
 export const PRIMARY_MODEL = "qwen2.5-coder:7b";
 export const FALLBACK_MODEL = "llama3";
+
+/**
+ * HARDWARE AUTO-PROFILING — lightweight satellite nodes must never be handed
+ * the 7B coder model: on an 8GB laptop that freezes the host OS. This is the
+ * model selected when `os.totalmem()` reports less than `LOW_RAM_THRESHOLD_GB`.
+ */
+export const LOW_RAM_MODEL = "qwen2.5:1.5b";
+/** RAM (GB) at/above which the full PRIMARY_MODEL is safe to auto-pull. */
+export const LOW_RAM_THRESHOLD_GB = 8;
+
+/**
+ * LOCAL EMBEDDING MODEL — pulled alongside the chat model so the node can
+ * generate vector embeddings for the Rippa AI knowledge base without relying
+ * on a paid external API.
+ */
+export const EMBEDDING_MODEL = "nomic-embed-text";
+
+/**
+ * AGGRESSIVE VRAM UNLOADING — Ollama's default `keep_alive` is 5 minutes.
+ * This node also runs Playwright scrapers, so inference requests are forced
+ * to flush the model from VRAM almost immediately after replying.
+ */
+export const KEEP_ALIVE = "60s";
 
 /** Ollama's default port when OLLAMA_URL is not set. */
 export const DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434";
@@ -123,6 +164,9 @@ export class OllamaClient {
         temperature: 0.1, // deterministic extraction
         num_ctx: 8192,
       },
+      // AGGRESSIVE VRAM UNLOADING — flush this model out of VRAM almost
+      // immediately after replying, so Playwright/GPU work is never starved.
+      keep_alive: KEEP_ALIVE,
     });
 
     const content = data?.message?.content;
@@ -194,6 +238,8 @@ export class OllamaClient {
             // improvise a redesign.
             temperature: 0.1,
           },
+          // AGGRESSIVE VRAM UNLOADING — see extractFactsWithModel.
+          keep_alive: KEEP_ALIVE,
         },
         { timeout: options.timeoutMs ?? REQUEST_TIMEOUT_MS },
       );
@@ -226,6 +272,20 @@ export class OllamaClient {
     );
     this.resolvedModel = name;
     console.log(`[Ollama] Pulled and pinned fallback model "${name}".`);
+  }
+
+  /**
+   * LOCAL EMBEDDING CAPABILITY — generates vector embeddings via Ollama's
+   * `/api/embeddings` endpoint so the Mothership's knowledge base does not
+   * have to pay for an external embedding API when a node can do it locally.
+   */
+  async embed(input: string, model: string = EMBEDDING_MODEL): Promise<number[]> {
+    const { data } = await this.client.post<{ embedding?: number[] }>(
+      "/api/embeddings",
+      { model, prompt: input, keep_alive: KEEP_ALIVE },
+      { timeout: 60_000 },
+    );
+    return data?.embedding ?? [];
   }
 
   /** Clears the cached model resolution, forcing a fresh `/api/tags` check. */
