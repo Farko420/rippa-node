@@ -21,8 +21,9 @@ import {
 /**
  * OVER-THE-AIR SWARM AUTO-UPDATER.
  *
- * Keeps every running node on the newest published build without a human ever
- * touching the machine:
+ * The Mothership-driven half of the update loop, and the module that answers a
+ * `FORCE_UPDATE` command. Keeps every running node on the newest build without a
+ * human ever touching the machine:
  *
  *   1. CHECK    — on a 60-minute cron, or the moment the Mothership advertises
  *                 a version on the heartbeat reply, compare the remote version
@@ -36,10 +37,20 @@ import {
  *                 it fully detached, then `process.exit(0)` to release the file
  *                 lock so the script can overwrite and relaunch the executable.
  *
+ * WHY THERE IS NO GITHUB CALL HERE. The Mothership's `/api/node/latest-version`
+ * endpoint returns a FULLY RESOLVED `download_url`. Re-deriving that URL locally
+ * meant a second request to `api.github.com/repos/.../releases/latest`, which
+ * fails on a private repo or before the first release exists — and a 404 there
+ * is indistinguishable from "nothing published", so the node logged "no
+ * releases" and did nothing forever. The payload the Mothership already sent is
+ * the single source of truth; this module consumes it and nothing else.
+ *
  * SAFETY: steps 2-4 only run for a PACKAGED executable. Under `tsx` or
  * `node dist/index.js` the "current executable" is `node.exe` itself — deleting
- * and replacing that would destroy the Node installation. In that case the
- * updater reports the available version and idles.
+ * and replacing that would destroy the Node installation. Rather than aborting
+ * the whole pipeline there, {@link OtaUpdater.forceUpdate} reports the update as
+ * handled (a "dev mode mock") so the Mothership retires the command instead of
+ * waiting on a node that is physically incapable of swapping itself.
  */
 
 const DOWNLOAD_TIMEOUT_MS = 10 * 60_000; // a large exe over a slow link
@@ -48,10 +59,59 @@ const MIN_UPDATE_BYTES = 1024 * 1024;
 /** Sanity ceiling — rippa-node.exe is tens of MB, not gigabytes. */
 const MAX_UPDATE_BYTES = 1024 * 1024 * 1024;
 
+/**
+ * THE DEV-MODE LINE. Exact wording is load-bearing: operators and the support
+ * runbook grep for it, and it is the single line that explains why a
+ * `FORCE_UPDATE` "succeeded" without a restart.
+ */
+const DEV_MODE_BYPASS_LOG =
+  "[Updater] Development mode detected. Bypassing physical binary swap.";
+
+/**
+ * Validates a Mothership-supplied `download_url` before anything destructive is
+ * considered. Returns the reason it is unusable, or `null` when it is fine.
+ *
+ * The pipeline ends in the node replacing its own executable, so an empty or
+ * non-http(s) URL is refused here — before any download — rather than being
+ * handed to axios. An absent URL is the expected shape when the Mothership has
+ * a version recorded but no artifact attached yet, and it must abort cleanly
+ * with a failed acknowledgement instead of crashing the node.
+ */
+export function unusableDownloadUrl(raw: unknown): string | null {
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    return "the Mothership supplied no download_url";
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw.trim());
+  } catch {
+    return `the Mothership supplied a malformed download_url (${raw.trim()})`;
+  }
+  // Plain http(s) only — never file:, data: or another local-access scheme.
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    return `the Mothership supplied a non-http(s) download_url (${parsed.protocol}//…)`;
+  }
+  return null;
+}
+
 /** Where the running executable lives, and what it is called. */
 interface InstallTarget {
   dir: string;
   updateFileName: string;
+}
+
+/**
+ * How an update attempt should be judged.
+ *
+ * `force` exists for the operator's "Force OTA Update" button. The unattended
+ * hourly poll deliberately refuses to act on a version this node is already on,
+ * because reinstalling it every hour is pointless churn. A forced command is a
+ * REPAIR action: a node stuck on a corrupt or half-swapped build reports the
+ * right version number and still needs the good bytes put back down, so the
+ * version gate and the "already attempted" backoff are both bypassed.
+ */
+interface ApplyOptions {
+  force?: boolean;
 }
 
 export class OtaUpdater {
@@ -68,7 +128,9 @@ export class OtaUpdater {
    */
   onUpdateSignal(info: LatestVersionInfo): void {
     try {
-      void this.applyIfNewer(info);
+      void this.applyIfNewer(info).catch((error: unknown) => {
+        console.warn(`[OTA] Update signal failed — ${describeError(error)}`);
+      });
     } catch (error) {
       console.warn(`[OTA] Update signal failed — ${describeError(error)}`);
     }
@@ -103,30 +165,124 @@ export class OtaUpdater {
     if (!latest) {
       return; // unreachable or unusable payload — stay on the current build
     }
-    if (!isVersionNewer(latest.version)) {
-      console.log(`[OTA] Up to date (v${APP_VERSION}).`);
-      return;
+
+    // The version gate and the "already attempted" backoff both live in
+    // applyIfNewer now, so the unattended poll and the forced command cannot
+    // drift apart on what counts as "newer".
+    await this.applyIfNewer(latest);
+  }
+
+  /**
+   * Answers a `FORCE_UPDATE` command from the Mothership.
+   *
+   * WHY THIS DOES NOT ASK GITHUB. The Mothership's `/api/node/latest-version`
+   * endpoint now returns a fully resolved `download_url`. This method consumes
+   * that URL verbatim and makes no request to `api.github.com` at all — which is
+   * what made the command a no-op before: a private repo, or a repo with no
+   * published release yet, answers 404, the 404 was swallowed as "nothing to
+   * update", and the command sat in the queue indefinitely.
+   *
+   * @returns true when the command should be treated as APPLIED — either a swap
+   *          was committed (the process exits inside `applyIfNewer`, so this only
+   *          returns on the non-exiting paths) or the dev-mode mock stood in for
+   *          one. false means genuinely not applied: an unusable payload, a
+   *          refused handoff, or a failed download. Never throws — a throwing
+   *          updater would leave the Mothership waiting with no outcome at all.
+   */
+  async forceUpdate(): Promise<boolean> {
+    console.log("[Updater] FORCE_UPDATE received — resolving the Mothership payload.");
+
+    if (this.updating) {
+      console.log("[Updater] An update is already in flight — standing down.");
+      return false;
     }
-    if (latest.version === this.lastAttemptedVersion) {
+    if (process.env.OTA_ENABLED === "false") {
+      console.log("[Updater] FORCE_UPDATE refused — disabled via OTA_ENABLED=false.");
+      return false;
+    }
+
+    let latest: LatestVersionInfo | null = null;
+    try {
+      latest = await this.swarm.fetchLatestVersion();
+    } catch (error) {
+      console.warn(`[Updater] FORCE_UPDATE aborted — ${describeError(error)}`);
+      return false;
+    }
+
+    if (!latest) {
+      console.warn(
+        "[Updater] FORCE_UPDATE aborted — the Mothership returned no usable version payload.",
+      );
+      return false;
+    }
+
+    // Validated BEFORE any destructive step. A version with no artifact is the
+    // expected shape while a release is still being published, so it must fail
+    // cleanly and be reported as failed — never crash the node, never download
+    // an empty string.
+    const unusable = unusableDownloadUrl(latest.downloadUrl);
+    if (unusable) {
+      console.warn(
+        `[Updater] FORCE_UPDATE aborted — ${unusable} for v${latest.version}. ` +
+          "Staying on the current build.",
+      );
+      return false;
+    }
+
+    console.log(`[Updater] Mothership supplied v${latest.version} — ${latest.downloadUrl}`);
+    return this.applyIfNewer(latest, { force: true });
+  }
+
+  /** Downloads, verifies and hands off to the replacement script. */
+  private async applyIfNewer(
+    latest: LatestVersionInfo,
+    options: ApplyOptions = {},
+  ): Promise<boolean> {
+    const force = options.force === true;
+
+    if (this.updating) {
+      return false; // an update is already in flight
+    }
+
+    /*
+      A FORCED UPDATE IGNORES THE VERSION GATE. That is the whole point of the
+      button: a node reporting the correct version can still be running corrupt
+      bytes, and reinstalling the same build is the repair. The `lastAttempted`
+      backoff is bypassed for the same reason — it exists to stop a broken build
+      being retried every hour, but an operator explicitly asking again must not
+      be second-guessed by a backoff set on a previous, unrelated failure.
+    */
+    if (!force && !isVersionNewer(latest.version)) {
+      console.log(`[OTA] Up to date (v${APP_VERSION}).`);
+      return false;
+    }
+    if (!force && latest.version === this.lastAttemptedVersion) {
       console.warn(
         `[OTA] v${latest.version} was already attempted and did not complete — ` +
           "skipping until a newer build is published.",
       );
-      return;
+      return false;
     }
 
-    await this.applyIfNewer(latest);
-  }
+    /*
+      DEV MODE MOCK — THE CRITICAL PATH FOR A `FORCE_UPDATE`.
 
-  /** Downloads, verifies and hands off to the replacement script. */
-  private async applyIfNewer(latest: LatestVersionInfo): Promise<void> {
-    if (this.updating || !isVersionNewer(latest.version)) {
-      return;
-    }
+      Under `tsx src/index.ts` or `node dist/index.js` the running file is the
+      Node runtime itself, not rippa-node.exe. Physically swapping it would
+      destroy the Node installation, so the swap is correctly refused — but the
+      old behaviour then returned "not applied", which reported a FAILED ack and
+      left the command in the Mothership's queue forever, re-dispatched on every
+      heartbeat. The node was not ignoring the command; it simply cannot perform
+      this one.
 
+      So a dev run acknowledges SUCCESS. The command clears, the fleet stops
+      waiting, and the swap is skipped for the only reason it ever legitimately
+      is. A real packaged node never reaches this branch.
+    */
     const target = this.installTarget();
     if (!target) {
-      return; // not self-replaceable (dev mode) — already reported
+      console.log(DEV_MODE_BYPASS_LOG);
+      return true;
     }
 
     /*
@@ -139,7 +295,7 @@ export class OtaUpdater {
     const stampPath = path.join(stage, HANDOFF_STAMP);
     if (!claimHandoffSlot(stampPath)) {
       console.log("[OTA] Another updater already owns this handoff — standing down.");
-      return;
+      return false;
     }
 
     this.updating = true;
@@ -168,11 +324,16 @@ export class OtaUpdater {
       console.log("[OTA] Handoff complete. Restarting node for update...");
       // Release the .exe lock so the script's overwrite can succeed.
       process.exit(0);
+      return true; // unreachable: process.exit does not return
     } catch (error) {
       // Abort cleanly: no half-written update, no restart, node carries on.
+      // This is the "unreachable download_url" path — a dead link, an expired
+      // signed URL, a 5xx — reported honestly so the Mothership records a FAILED
+      // FORCE_UPDATE rather than leaving the node in limbo.
       console.warn(`[OTA] Update to v${latest.version} aborted — ${describeError(error)}`);
       console.warn("[OTA] Staying on the current build; normal node tasks resume.");
       this.cleanup(partialPath, updatePath, stampPath);
+      return false;
     } finally {
       this.updating = false;
     }
@@ -275,13 +436,14 @@ export class OtaUpdater {
   /**
    * Resolves the installed executable's directory and file name, or `null`
    * outside a packaged build — see the SAFETY note at the top of this file.
+   *
+   * Deliberately silent: the caller owns the dev-mode messaging, because only
+   * the caller knows whether this is a routine poll (worth a quiet note) or a
+   * `FORCE_UPDATE` that must still be acknowledged (worth the exact bypass line
+   * operators grep for).
    */
   private installTarget(): InstallTarget | null {
     if (!this.isPackagedExe()) {
-      console.log(
-        "[OTA] Dev mode detected — the running file is the Node runtime, not " +
-          "rippa-node.exe. An update is available but will not be self-applied.",
-      );
       return null;
     }
     return { dir: path.dirname(process.execPath), updateFileName: path.basename(process.execPath) };

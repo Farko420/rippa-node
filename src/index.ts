@@ -4,6 +4,7 @@ import { APP_VERSION } from "./version";
 import { startVitalsSampler } from "./services/telemetry";
 import { describeRuntime, supportsBrowserScraping } from "./platform";
 import { ollamaManager } from "./services/ollamaManager";
+import { OtaUpdater } from "./update/OtaUpdater";
 
 // Deeper fatal-error stacks (the default of 10 frames hides the caller module).
 (Error as { stackTraceLimit?: number }).stackTraceLimit = 60;
@@ -116,6 +117,18 @@ async function main(): Promise<void> {
     const client = new SwarmClient();
     swarm = client;
 
+    /*
+      ONE OtaUpdater INSTANCE, SHARED WITH THE ORCHESTRATOR.
+
+      It owns three things that must not be duplicated: the hourly poll, the
+      heartbeat update signal, and the `FORCE_UPDATE` command handler below.
+      Constructing a second one here would mean two independent `updating` flags
+      and two `lastAttemptedVersion` memories, so a poll and a command could
+      both decide to download the same release in the same window. The
+      orchestrator is handed this exact instance (see below).
+    */
+    const otaUpdater = new OtaUpdater(client);
+
     // CPU load needs two samples separated by an interval, so the sampler
     // must be running before the first heartbeat to report a real figure.
     startVitalsSampler();
@@ -176,14 +189,22 @@ async function main(): Promise<void> {
 
     const adminCommands = {
       restartNode: () => shutdown("REMOTE_COMMAND"),
-      // `forceUpdate`, NOT `checkNow`. checkNow() is the unattended poll and
-      // deliberately refuses to reinstall the running build, so a "Force OTA
-      // Update" that arrived on a node already at the latest version logged
-      // "up to date" and did nothing — received and ignored, which is exactly
-      // the reported symptom. forceUpdate() bypasses that check and returns
-      // whether a swap is actually committed, so a refused update is reported
-      // honestly instead of looking like a restart that never happened.
-      forceUpdate: (): Promise<boolean> => swarmUpdater.forceUpdate(),
+      /*
+        `FORCE_UPDATE` IS ANSWERED BY THE MOTHERSHIP-PAYLOAD UPDATER.
+
+        This handler used to call `swarmUpdater.forceUpdate()`, which resolved the
+        download URL from `api.github.com/repos/.../releases/latest`. That request
+        fails on a private repo and before the first release is published — it
+        404s, the 404 was swallowed as "no releases found", and the command was
+        acknowledged as "not applied", leaving it in the Mothership queue forever.
+
+        `otaUpdater.forceUpdate()` instead reads the `download_url` the
+        Mothership already resolved in `/api/node/latest-version`, and makes no
+        GitHub request at all. It returns whether the update was actually applied,
+        so a genuine failure is still reported honestly rather than looking like a
+        restart that never happened.
+      */
+      forceUpdate: (): Promise<boolean> => otaUpdater.forceUpdate(),
       setP2pEnabled: async (enabled: boolean) => {
         // Persisted through nodeAuth so the choice survives a restart.
         require("./config/nodeAuth").setP2pEnabled(enabled);
@@ -258,17 +279,28 @@ async function main(): Promise<void> {
       the same thing. Sharing one object means a fix applied to one path (say,
       forceUpdate bypassing the "already latest" check) applies to both.
     */
-    orchestrator = new Orchestrator(swarm, {
+    orchestrator = new Orchestrator(
+      swarm,
+      {
+        /*
+          THE SAME OBJECT THE HEARTBEAT PATH USES — see `adminCommands` above. Not
+          a lookalike: the same reference, so the two channels cannot drift again.
+        */
+        restartNode: adminCommands.restartNode,
+        forceUpdate: adminCommands.forceUpdate,
+        setP2pEnabled: adminCommands.setP2pEnabled,
+        isP2pEnabled: adminCommands.isP2pEnabled,
+        acknowledgeCommand: adminCommands.acknowledgeCommand,
+      },
       /*
-        THE SAME OBJECT THE HEARTBEAT PATH USES — see `adminCommands` above. Not
-        a lookalike: the same reference, so the two channels cannot drift again.
+        THE SAME OtaUpdater THE FORCE_UPDATE COMMAND USES. The orchestrator runs
+        the hourly poll and subscribes to the heartbeat update signal; the command
+        handler above drives a forced update. All three share one instance so the
+        in-flight guard and the "already attempted" memory are global to the node
+        rather than per-owner.
       */
-      restartNode: adminCommands.restartNode,
-      forceUpdate: adminCommands.forceUpdate,
-      setP2pEnabled: adminCommands.setP2pEnabled,
-      isP2pEnabled: adminCommands.isP2pEnabled,
-      acknowledgeCommand: adminCommands.acknowledgeCommand,
-    });
+      otaUpdater,
+    );
     orchestrator.start();
     setOrchestratorRef(orchestrator);
 

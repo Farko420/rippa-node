@@ -148,8 +148,10 @@ export interface CommandHandlers {
   /**
    * Run the OTA pipeline now (download + detached swap).
    *
-   * @returns true when a swap is committed and the process is exiting. Only
-   *          meaningful on paths that do NOT exit (refused, aborted, dev mode).
+   * @returns true when the command counts as APPLIED — a swap is committed (and
+   *          the process is exiting), or the node is in dev mode and physically
+   *          cannot swap itself. Only meaningful on paths that do NOT exit
+   *          (unusable payload, refused handoff, failed download).
    */
   forceUpdate: () => Promise<boolean> | boolean | void;
   /** Enable or disable satellite-to-satellite mesh routing. */
@@ -506,8 +508,15 @@ export async function executePendingCommands(
 
             The acknowledgement is therefore sent up front, describing the update
             as accepted-and-in-progress, and the returned boolean is only used to
-            correct the record on the paths that do NOT exit (refused, aborted or
-            dev mode) — where "accepted" would otherwise be a lie.
+            correct the record on the paths that do NOT exit (an unusable payload,
+            a refused handoff, a failed download) — where "accepted" would
+            otherwise be a lie.
+
+            DEV MODE IS NOT ONE OF THOSE PATHS. A node running under tsx/node
+            cannot swap its own binary, so the updater deliberately reports the
+            command as APPLIED anyway (see `OtaUpdater.forceUpdate`). Filing a
+            failed ack there left the command re-dispatched on every heartbeat
+            with nothing the node could ever do about it.
           */
           await acknowledge(handlers, "FORCE_UPDATE", "accepted — downloading the latest release", {
             ...ackContext,
@@ -519,7 +528,7 @@ export async function executePendingCommands(
             await acknowledge(
               handlers,
               "FORCE_UPDATE",
-              "not applied — no swap was committed (refused, aborted, or not a packaged exe)",
+              "not applied — no swap was committed (Mothership payload unusable, download failed, or another updater owns the handoff)",
               { ...ackContext, status: "failed" },
             );
             // The record is now correct, so the generic completion ack below

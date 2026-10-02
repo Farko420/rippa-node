@@ -89,8 +89,22 @@ export class Orchestrator {
   constructor(
     private readonly swarm: SwarmClient,
     private readonly admin: AdminCommandDeps,
+    /*
+      INJECTABLE, NOT ALWAYS CONSTRUCTED HERE.
+
+      The `FORCE_UPDATE` command handler is owned by the boot sequence (it also
+      has to reach the node event stream and the acknowledgement route), so it
+      needs an OtaUpdater of its own. If this class quietly built a second one,
+      the hourly poll and the forced command would each keep their own in-flight
+      flag and "already attempted" memory — so both could decide to download the
+      same release in the same window, and the shared handoff stamp would make
+      one of them fail for no visible reason. Passing the instance in keeps a
+      single source of truth; the fallback keeps this class constructible on its
+      own.
+    */
+    ota?: OtaUpdater,
   ) {
-    this.ota = new OtaUpdater(swarm);
+    this.ota = ota ?? new OtaUpdater(swarm);
 
     this.forager = new AutonomousForager({
       scraper: this.scraper,
