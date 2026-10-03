@@ -60,108 +60,40 @@ export { claimHandoffSlot, releaseHandoffClaim, isPackagedExe, installDir };
  */
 
 /**
- * GitHub repository publishing the fleet releases ("owner/name").
+ * GitHub repository publishing the fleet releases ("owner/name"), the canonical
+ * asset name, and the token/header helpers.
  *
- * THIS REPO ID IS WHY "Force OTA Update" DID NOTHING. The default pointed at
- * `rippaadventures/rippa-node`, which does not exist — `api.github.com` answers
- * 404 for it, the 404 is swallowed as "no releases published yet", and the node
- * sat there politely doing nothing forever. The real repository is
- * `Farko420/rippa-node`. Overridable so a fork can point at its own releases.
+ * WHY THESE ARE RE-EXPORTS RATHER THAN DEFINITIONS. `Farko420/rippa-node` is a
+ * PRIVATE repository, so the anonymous rules here are load-bearing rather than
+ * incidental: `api.github.com` answers 404 for it (deliberately — a private
+ * repo's existence is not disclosed), which is indistinguishable from "no
+ * releases published", and the node then does nothing forever. The real
+ * repository is `Farko420/rippa-node`; the default used to point at
+ * `rippaadventures/rippa-node`, which does not exist.
+ *
+ * The definitions live in `update/githubAsset` so the Mothership-driven
+ * `update/OtaUpdater` can authenticate a download without importing this
+ * module — which would be a cycle, since this module already imports from
+ * `update/`. Re-exported here so both updaters keep one implementation and the
+ * existing call sites and tests are unchanged.
  */
-const GITHUB_REPO = process.env.RIPPA_GITHUB_REPO || "Farko420/rippa-node";
+export {
+  GITHUB_REPO,
+  RELEASE_ASSET_NAME,
+  githubHeaders,
+  isGitHubUrl,
+  releaseDownloadUrl,
+  resolveGitHubToken,
+} from "../update/githubAsset";
 
-/**
- * THE RELEASE ASSET NAME, EXACTLY.
- *
- * THE 404 THIS FIXES. The updater is pointed at
- * `https://github.com/Farko420/rippa-node/releases/latest/download/rippa-node.exe`,
- * and that URL is a literal filename lookup — GitHub serves nothing but a 404
- * unless an asset with EXACTLY this name exists on the release. A release that
- * published `rippa-node 1.0.15.exe`, or `rippa-node_windows.exe`, or (once the
- * watchdog ships) a second `.exe` under a different name, produces that 404 even
- * though a perfectly good binary is sitting right there.
- *
- * So the asset is selected by exact name first, and only falls back to "first
- * `.exe`" if no asset matches. That fallback keeps a hand-renamed asset
- * installable, but the exact match is what makes the documented URL — and the
- * one the Mothership hands out — resolve.
- *
- * `RIPPA_GITHUB_ASSET` overrides it for a fork that publishes under its own
- * name; the workflow must publish a matching asset for that to work.
- */
-export const RELEASE_ASSET_NAME = process.env.RIPPA_GITHUB_ASSET || "rippa-node.exe";
-
-/**
- * Resolves a GitHub token from the environment.
- *
- * A PRIVATE repository 404s every unauthenticated request — deliberately, so the
- * existence of a private repo is not disclosed. That is why an anonymous poll of
- * a private repo looks exactly like "no release published yet" and why the node
- * never updates. Supplying a token is the only fix.
- *
- * Three names are accepted, in priority order:
- *   `RIPPA_GITHUB_TOKEN`  the node-specific name, preferred so a repo token is
- *                         not accidentally shadowed by something else
- *   `GITHUB_TOKEN`        the conventional CI/secret-injection name, so a
- *                         standard build-time secret works with no extra config
- *   `GH_TOKEN`            the GitHub CLI's name, honoured so a machine already
- *                         set up for `gh` needs nothing extra
- *
- * Never logged, and never sent to a non-GitHub host — see {@link githubHeaders}.
- */
-export function resolveGitHubToken(): string {
-  const candidates = [
-    process.env.RIPPA_GITHUB_TOKEN,
-    process.env.GITHUB_TOKEN,
-    process.env.GH_TOKEN,
-  ];
-  for (const candidate of candidates) {
-    const value = (candidate ?? "").trim();
-    if (value) return value;
-  }
-  return "";
-}
-
-/** True when `url` is served by GitHub (api or the release download hosts). */
-export function isGitHubUrl(url: string): boolean {
-  try {
-    const host = new URL(url).hostname.toLowerCase();
-    return (
-      host === "github.com" ||
-      host === "www.github.com" ||
-      host === "api.github.com" ||
-      host.endsWith(".githubusercontent.com")
-    );
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Builds the request headers for a GitHub call, attaching the token when one is
- * configured.
- *
- * The Authorization header is only ever attached to GitHub hosts. Sending a
- * repo token to a third-party download host — or, far worse, letting a
- * Mothership-supplied `download_url` point anywhere — would leak it, so the
- * guard is `isGitHubUrl` and not merely "a token exists".
- */
-export function githubHeaders(extra: Record<string, string> = {}): Record<string, string> {
-  const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "rippa-node-updater",
-    ...extra,
-  };
-  const token = resolveGitHubToken();
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  return headers;
-}
-
-/** The canonical direct-download URL for {@link RELEASE_ASSET_NAME}. */
-export function releaseDownloadUrl(repo = GITHUB_REPO, asset = RELEASE_ASSET_NAME): string {
-  return `https://github.com/${repo}/releases/latest/download/${asset}`;
-}
+import {
+  GITHUB_REPO,
+  RELEASE_ASSET_NAME,
+  githubHeaders,
+  isGitHubUrl,
+  releaseDownloadUrl,
+  resolveGitHubToken,
+} from "../update/githubAsset";
 
 /** How often the Master polls GitHub for a newer release. */
 const CHECK_INTERVAL_MS = 60 * 60_000; // hourly

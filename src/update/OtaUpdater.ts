@@ -5,6 +5,7 @@ import { pipeline } from "node:stream/promises";
 import axios from "axios";
 import { env } from "../config";
 import { APP_VERSION, APP_VERSION_RESOLVED, isVersionNewer, isVersionOlder } from "../version";
+import { RELEASE_ASSET_NAME, resolveGitHubAssetDownload } from "./githubAsset";
 import type { LatestVersionInfo, SwarmClient } from "../network/SwarmClient";
 import {
   HANDOFF_STAMP,
@@ -381,8 +382,17 @@ export class OtaUpdater {
   /**
    * Streams the new executable to `partialPath`.
    *
-   * The Mothership's Authorization header is only replayed for same-origin
-   * URLs, so a signed CDN link never receives this node's API key.
+   * The Mothership's Authorization header is only replayed for same-origin URLs,
+   * so a signed CDN link never receives this node's API key.
+   *
+   * A GitHub URL is handled by {@link resolveGitHubAssetDownload} instead. That is
+   * what fixes the private-repo 404: `.../releases/latest/download/rippa-node.exe`
+   * answers 404 to ANY anonymous request when the repository is private — which
+   * is indistinguishable from "the asset does not exist" — so the node fetched a
+   * correct URL, with a correct asset name, and could never succeed. When a token
+   * is configured the download is switched to GitHub's authenticated API asset
+   * endpoint with `Accept: application/octet-stream`; with no token the URL is
+   * used unchanged, which is exactly right for a public repository.
    */
   private async download(
     latest: LatestVersionInfo,
@@ -390,15 +400,41 @@ export class OtaUpdater {
     updateFileName: string,
   ): Promise<void> {
     const headers: Record<string, string> = { Accept: "application/octet-stream" };
-    if (this.isSameOrigin(latest.downloadUrl)) {
+    let downloadUrl = latest.downloadUrl;
+
+    const authenticated = await resolveGitHubAssetDownload(latest.downloadUrl);
+    if (authenticated) {
+      downloadUrl = authenticated.url;
+      Object.assign(headers, authenticated.headers);
+    } else if (this.isSameOrigin(latest.downloadUrl)) {
       headers["Authorization"] = `Bearer ${env.NODE_API_KEY}`;
     }
 
-    const response = await axios.get(latest.downloadUrl, {
-      responseType: "stream",
-      timeout: DOWNLOAD_TIMEOUT_MS,
-      headers,
-    });
+    let response;
+    try {
+      response = await axios.get(downloadUrl, {
+        responseType: "stream",
+        timeout: DOWNLOAD_TIMEOUT_MS,
+        headers,
+        validateStatus: (status) => status >= 200 && status < 300,
+      });
+    } catch (error) {
+      /*
+        A 404 here has THREE indistinguishable causes, and the operator can only
+        act on the real one, so name all of them rather than "download failed":
+        the asset was renamed, the repository is private and no token is
+        configured, or the Mothership is advertising a stale URL.
+      */
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        throw new Error(
+          `HTTP 404 downloading ${downloadUrl} — either no release asset named ` +
+            `"${RELEASE_ASSET_NAME}" exists on the latest release, or the repository ` +
+            "is PRIVATE and no GITHUB_TOKEN / RIPPA_GITHUB_TOKEN is configured (a " +
+            "private repo 404s every anonymous request)",
+        );
+      }
+      throw error;
+    }
 
     const hash = createHash("sha256");
     let bytes = 0;

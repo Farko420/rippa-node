@@ -699,6 +699,212 @@ check(
   triggerOf({}) !== null,
 );
 
+// --- 8e. THE PRIVATE-REPO 404 — authenticated GitHub asset downloads ----------
+// `Farko420/rippa-node` is PRIVATE, so `/releases/latest/download/rippa-node.exe`
+// answers 404 to every anonymous request — byte-for-byte identical to "no asset by
+// that name". These assertions pin the resolution that makes it fetchable: swap the
+// public shortcut for GitHub's authenticated asset API when a token is present, and
+// leave the URL untouched when it is not (a public repo needs no token).
+const ghAsset = await load("dist/update/githubAsset.js");
+
+check(
+  "the repo is identified from a releases download URL",
+  ghAsset.repoFromGitHubUrl(
+    "https://github.com/Farko420/rippa-node/releases/latest/download/rippa-node.exe",
+  ) === "Farko420/rippa-node",
+);
+check("a non-release GitHub URL has no repo", ghAsset.repoFromGitHubUrl("https://github.com/a/b") === null);
+check(
+  "the requested asset name is read off the URL",
+  ghAsset.assetNameFromDownloadUrl(
+    "https://github.com/Farko420/rippa-node/releases/latest/download/rippa-node.exe",
+  ) === "rippa-node.exe",
+);
+// A tag like "v1.0.16" also contains dots, so the filename heuristic alone cannot
+// separate it. What separates them is the PATH: a download lives under
+// `/download/<name>`, a tag lives under `/tag/<name>`.
+check(
+  "a tag URL yields no asset name (the path, not the dots, decides)",
+  ghAsset.assetNameFromDownloadUrl("https://github.com/a/b/releases/tag/v1.0.16") === null,
+  ghAsset.assetNameFromDownloadUrl("https://github.com/a/b/releases/tag/v1.0.16"),
+);
+
+// Asset selection must prefer the EXACT contract name — the watchdog also ships an
+// .exe, so "first .exe wins" would be a coin flip between worker and supervisor.
+const PRIVATE_ASSETS = [
+  { id: 7, name: "rippa-watchdog.exe", url: "https://api.github.com/repos/o/r/releases/assets/7" },
+  { id: 9, name: "rippa-node.exe", url: "https://api.github.com/repos/Farko420/rippa-node/releases/assets/9" },
+];
+check(
+  "the API asset endpoint for rippa-node.exe is chosen over the watchdog's",
+  ghAsset.selectAssetForDownload(PRIVATE_ASSETS, ["rippa-node.exe"])?.id === 9,
+);
+check(
+  "asset selection is case-insensitive",
+  ghAsset.selectAssetForDownload(
+    [{ id: 3, name: "RIPPA-NODE.EXE", url: "https://api.github.com/repos/o/r/releases/assets/3" }],
+    ["rippa-node.exe"],
+  )?.id === 3,
+);
+check(
+  "a renamed asset still resolves (OTA is not wedged over a rename)",
+  ghAsset.selectAssetForDownload(
+    [{ id: 4, name: "rippa-node-1.0.16.exe", url: "https://api.github.com/repos/o/r/releases/assets/4" }],
+    ["rippa-node.exe"],
+  )?.id === 4,
+);
+check("an assetless release resolves to nothing", ghAsset.selectAssetForDownload([], ["rippa-node.exe"]) === null);
+
+/*
+  THE 404 REGRESSION ITSELF. A private repo's anonymous answer and a missing asset
+  are the same 404, so the only thing assertable offline is the DECISION: with a
+  token the URL must become the API asset endpoint carrying octet-stream, and
+  without one it must be left exactly as advertised.
+*/
+{
+  const REAL_FETCH = globalThis.fetch;
+  const SHORTCUT = "https://github.com/Farko420/rippa-node/releases/latest/download/rippa-node.exe";
+  process.env.RIPPA_GITHUB_TOKEN = "ghp_private_repo";
+  try {
+    let askedFor = "";
+    let sentAuth = "";
+    globalThis.fetch = async (url, init) => {
+      askedFor = String(url);
+      sentAuth = init?.headers?.Authorization ?? "";
+      return {
+        ok: true,
+        json: async () => ({
+          tag_name: "latest",
+          name: "rippa-node 1.0.16",
+          assets: PRIVATE_ASSETS,
+        }),
+      };
+    };
+
+    const resolved = await ghAsset.resolveGitHubAssetDownload(SHORTCUT);
+    check(
+      "a private repo's URL is rewritten to the authenticated API asset endpoint",
+      resolved?.url === "https://api.github.com/repos/Farko420/rippa-node/releases/assets/9",
+      resolved?.url,
+    );
+    check(
+      "the asset download asks for octet-stream (bytes, not JSON metadata)",
+      resolved?.headers?.Accept === "application/octet-stream",
+      resolved?.headers?.Accept,
+    );
+    check("the metadata lookup carries the bearer token", sentAuth === "Bearer ghp_private_repo");
+    check(
+      "the metadata lookup goes to the releases API",
+      askedFor === "https://api.github.com/repos/Farko420/rippa-node/releases/latest",
+      askedFor,
+    );
+
+    // An already-resolved API asset URL must not trigger a pointless re-lookup.
+    let extraCalls = 0;
+    globalThis.fetch = async () => {
+      extraCalls += 1;
+      return { ok: true, json: async () => ({ assets: PRIVATE_ASSETS }) };
+    };
+    const already = await ghAsset.resolveGitHubAssetDownload(
+      "https://api.github.com/repos/Farko420/rippa-node/releases/assets/9",
+    );
+    check("an API asset URL is reused without re-resolving", extraCalls === 0 && already !== null);
+  } finally {
+    globalThis.fetch = REAL_FETCH;
+    delete process.env.RIPPA_GITHUB_TOKEN;
+  }
+}
+
+// No token: the URL is returned UNCHANGED (null means "fetch it as advertised"),
+// which is correct for a public repo and leaves the 404 to explain itself.
+check(
+  "without a token the URL is left untouched (public repos need no token)",
+  (await ghAsset.resolveGitHubAssetDownload(
+    "https://github.com/Farko420/rippa-node/releases/latest/download/rippa-node.exe",
+  )) === null,
+);
+check(
+  "a non-GitHub URL is never rewritten",
+  (await ghAsset.resolveGitHubAssetDownload("https://cdn.example.com/rippa-node.exe")) === null,
+);
+check("a malformed URL is never rewritten", (await ghAsset.resolveGitHubAssetDownload("not a url")) === null);
+
+// The token must reach GitHub and NOTHING else — `download_url` comes from the
+// Mothership, so a lookalike host must never receive a repo-scoped credential.
+check(
+  "a GitHub host is eligible for the token",
+  ghAsset.isGitHubUrl("https://api.github.com/repos/a/b/releases/assets/1") === true,
+);
+check(
+  "a lookalike host cannot receive the token",
+  ghAsset.isGitHubUrl("https://api.github.com.evil.example/repos/a/b") === false,
+);
+
+// --- 8f. THE MOTHERSHIP'S STALE FALLBACK VERSION -----------------------------
+// The Mothership broadcasts FALLBACK_VERSION whenever its GitHub lookup fails, and
+// it failed on EVERY poll because the repo is private. Left at 1.0.13 while the
+// fleet ran 1.0.16, that constant commanded the whole swarm to downgrade. The Node
+// cannot fix a wrong advertisement, but it can prove the two agree.
+const { readFileSync, existsSync } = await import("node:fs");
+const mothershipFeedPath = path.join(
+  ROOT,
+  "..",
+  "Rippa Adventures",
+  "src",
+  "lib",
+  "node-latest-version.server.ts",
+);
+// The Mothership is a SEPARATE repository. These assertions only apply when it is
+// checked out beside the Node, so a standalone Node clone skips them rather than
+// failing on a path it does not own.
+const mothershipPresent = existsSync(mothershipFeedPath);
+check(
+  "the Mothership's fallback version is no longer the stale 1.0.13",
+  !mothershipPresent ||
+    /const FALLBACK_VERSION = "([^"]+)"/.exec(readFileSync(mothershipFeedPath, "utf8"))?.[1] !==
+      "1.0.13",
+);
+if (mothershipPresent) {
+  const mothershipFeed = readFileSync(mothershipFeedPath, "utf8");
+  const nodeManifest = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8"));
+  const advertisedFallback = /const FALLBACK_VERSION = "([^"]+)"/.exec(mothershipFeed)?.[1];
+  check(
+    `the Mothership's fallback version (${advertisedFallback}) matches package.json (${nodeManifest.version})`,
+    advertisedFallback === nodeManifest.version,
+    `${advertisedFallback} vs ${nodeManifest.version}`,
+  );
+  // The advertised URL must name the asset the workflow actually publishes, because
+  // `/releases/latest/download/<asset>` is a literal filename lookup.
+  check(
+    "the Mothership advertises the exact published asset name",
+    /const ROLLING_DOWNLOAD_URL =[\s\S]*?releases\/latest\/download\/rippa-node\.exe/.test(mothershipFeed),
+  );
+}
+
+// --- 8g. DOWNGRADE REFUSAL HAPPENS BEFORE THE DOWNLOAD -----------------------
+// The node must reject a stale Mothership version BEFORE spending bandwidth on a
+// ~126 MB download. Both gates are asserted at the source, because a check placed
+// after `this.download(...)` would still look correct in a log.
+const otaSource = readFileSync(path.join(ROOT, "src", "update", "OtaUpdater.ts"), "utf8");
+const gateAt = otaSource.indexOf("isVersionOlder(latest.version");
+const downloadAt = otaSource.indexOf("await this.download(");
+check("OtaUpdater refuses a downgrade", gateAt !== -1);
+check(
+  "the downgrade gate is positioned BEFORE the download (no wasted bandwidth)",
+  gateAt !== -1 && downloadAt !== -1 && gateAt < downloadAt,
+  `gate@${gateAt} download@${downloadAt}`,
+);
+
+const swarmSource = readFileSync(path.join(ROOT, "src", "services", "updater.ts"), "utf8");
+const swarmGate = swarmSource.indexOf("isVersionOlder(release.version");
+const swarmDownload = swarmSource.indexOf("await this.download(");
+check("the SwarmUpdater poller refuses a downgrade", swarmGate !== -1);
+check(
+  "the poller's downgrade gate is also before its download",
+  swarmGate !== -1 && swarmDownload !== -1 && swarmGate < swarmDownload,
+  `gate@${swarmGate} download@${swarmDownload}`,
+);
+
 // --- 5. Autonomous task claiming -------------------------------------------
 const { TaskEngine } = await load("dist/services/taskEngine.js");
 const seen = [];
