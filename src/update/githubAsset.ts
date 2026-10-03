@@ -51,15 +51,24 @@ export const RELEASE_ASSET_NAME = process.env.RIPPA_GITHUB_ASSET || "rippa-node.
 /**
  * Resolves a GitHub token from the environment.
  *
- * Three names are accepted, in priority order:
+ * FOUR names are accepted, in priority order:
+ *   `GITHUB_OTA_TOKEN`    the OTA-specific name, and the one this fleet documents
  *   `RIPPA_GITHUB_TOKEN`  node-specific, so a repo token is not shadowed
  *   `GITHUB_TOKEN`        the conventional CI/secret-injection name
  *   `GH_TOKEN`            the GitHub CLI's name, honoured for existing setups
+ *
+ * `GITHUB_OTA_TOKEN` LEADS because it is the only one of the four that exists
+ * solely to authenticate release downloads. `GITHUB_TOKEN` and `GH_TOKEN` are
+ * routinely present on a build agent or developer machine for unrelated reasons
+ * (Actions checkout, `gh` CLI), so ranking it first would let a CI credential
+ * that has no access to a PRIVATE repository outrank the token the operator
+ * actually configured for OTA — and the download would 404 with no explanation.
  *
  * Never logged, and never sent to a non-GitHub host — see {@link githubHeaders}.
  */
 export function resolveGitHubToken(): string {
   const candidates = [
+    process.env.GITHUB_OTA_TOKEN,
     process.env.RIPPA_GITHUB_TOKEN,
     process.env.GITHUB_TOKEN,
     process.env.GH_TOKEN,
@@ -316,23 +325,44 @@ async function readBodySnippet(response: Response): Promise<string> {
 }
 
 /**
+ * THE ONE-LINE DIAGNOSIS for a 404/401 on the release download.
+ *
+ * Exported because it is an OPERATOR-FACING CONTRACT, not an implementation
+ * detail: it is the single sentence that separates the three indistinguishable
+ * causes — a bad token, an inaccessible repo, a release with no `.exe` — from
+ * the anonymous 404 they all produce. Kept byte-stable so the support runbook
+ * and `verify-units.mjs` can both match on it.
+ */
+export const OTA_404_HINT =
+  "404 Not Found. Ensure GITHUB_OTA_TOKEN is valid, the repo is accessible, " +
+  "and the release contains an .exe asset.";
+
+/**
  * Names the likely cause of a GitHub status, so the log says something an
  * operator can act on rather than just the number.
+ *
+ * 404 and 401 both append {@link OTA_404_HINT} verbatim. Those two statuses are
+ * the ones an operator can actually FIX, and the fix is spelled out by name in
+ * the hint rather than left to be inferred from a bare status code.
  */
 function explainStatus(status: number): string {
   if (status === 401) {
-    return "401 Unauthorized — the token is missing, expired, or malformed. " +
-      "Check RIPPA_GITHUB_TOKEN / GITHUB_TOKEN.";
+    return (
+      "401 Unauthorized — the token is missing, expired, or malformed. " +
+      `Check GITHUB_OTA_TOKEN first. ${OTA_404_HINT}`
+    );
   }
   if (status === 403) {
     return "403 Forbidden — the token lacks access to this repository, or the " +
       "GitHub API rate limit for it has been exhausted.";
   }
   if (status === 404) {
-    return "404 Not Found — GitHub returns this for a PRIVATE repository to " +
+    return (
+      "404 Not Found — GitHub returns this for a PRIVATE repository to " +
       "anonymous callers (deliberately, so its existence is not disclosed), for a " +
       "repo name that does not exist, AND for a repo with no published releases. " +
-      "They are indistinguishable from outside; a token is what separates them.";
+      `They are indistinguishable from outside; a token is what separates them. ${OTA_404_HINT}`
+    );
   }
   if (status === 422) {
     return "422 Unprocessable Entity — GitHub could not find a release for this " +
@@ -462,8 +492,9 @@ export async function resolveGitHubAssetDownload(
         "which will fail if the repo is private.",
     );
     emit(
-      `${prefix} To fix: set RIPPA_GITHUB_TOKEN or GITHUB_TOKEN in the node's .env, with ` +
-        "read access to the release repository (a fine-grained token with Contents: Read).",
+      `${prefix} To fix: set GITHUB_OTA_TOKEN (or RIPPA_GITHUB_TOKEN / GITHUB_TOKEN) ` +
+        "in the node's .env, with read access to the release repository " +
+        "(a fine-grained token with Contents: Read).",
     );
     return null;
   }

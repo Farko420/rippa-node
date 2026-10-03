@@ -79,6 +79,7 @@ export { claimHandoffSlot, releaseHandoffClaim, isPackagedExe, installDir };
  */
 export {
   GITHUB_REPO,
+  OTA_404_HINT,
   RELEASE_ASSET_NAME,
   currentReleaseAssetName,
   githubHeaders,
@@ -275,7 +276,7 @@ function logNoReleases(repo: string): void {
   const token = resolveGitHubToken();
   const privateRepoGuess = token
     ? ""
-    : " (no GITHUB_TOKEN / RIPPA_GITHUB_TOKEN is set — a PRIVATE repository 404s every anonymous request)";
+    : " (no GITHUB_OTA_TOKEN is set — a PRIVATE repository 404s every anonymous request)";
   console.log(
     `[Updater] No published releases found for ${repo}${privateRepoGuess}. ` +
       `Expected asset: ${RELEASE_ASSET_NAME} at ${releaseDownloadUrl(repo)}.`,

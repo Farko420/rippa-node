@@ -39,6 +39,17 @@ export interface RippaNodeConfig {
   OLLAMA_URL: string;
   /** LAN dashboard passkey (compared by POST /api/system/auth). */
   DASHBOARD_PIN: string;
+  /**
+   * GitHub token the OTA updater authenticates release downloads with.
+   *
+   * CARRIED THROUGH `normalizeConfig` FOR THE SAME REASON `MESH_KEY` IS:
+   * `writeConfig` writes whatever `normalizeConfig` returns — it is NOT a merge.
+   * Any field this function does not name is DELETED on the next GUI save, so an
+   * operator who pasted their token into the Setup form and then changed an
+   * unrelated setting would silently lose it, and OTA would go back to 404ing
+   * against the private repository on the very next hourly poll.
+   */
+  GITHUB_OTA_TOKEN?: string;
   /** Alias of NODE_ROLE used by the Web GUI (`master` | `satellite`). */
   node_role?: "master" | "satellite";
   /** Alias of MASTER_LOCAL_URL used by the Web GUI when role is satellite. */
@@ -217,6 +228,9 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
     OLLAMA_URL: pickString(record, "OLLAMA_URL", "ollama_url") || DEFAULT_OLLAMA_URL,
     PORT: port,
     DASHBOARD_PIN: pin,
+    // See the interface note: dropped by a GUI save if not carried through here,
+    // which would break OTA against the private release repository.
+    GITHUB_OTA_TOKEN: pickString(record, "GITHUB_OTA_TOKEN", "github_ota_token") || undefined,
     node_role: role,
     master_node_url: masterLocal,
     dashboard_pin: pin,
@@ -384,6 +398,17 @@ export function applyConfigToEnv(cfg: ConfigInput | RippaNodeConfig | null, forc
   put("node_role", config.NODE_ROLE);
   put("master_node_url", config.MASTER_LOCAL_URL);
   put("dashboard_pin", config.DASHBOARD_PIN);
+  /*
+    GITHUB_OTA_TOKEN IS PUSHED ONLY WHEN PRESENT, deliberately. `put` would
+    otherwise write an empty string on every boot for a node that keeps its token
+    in `.env` (or has none), and `resolveGitHubToken` skips blanks — so the two
+    readings are equivalent ONLY while blanks stay skipped. Writing "" here
+    would additionally shadow the documented `.env` route on any future change
+    that stopped treating blanks as absent, so the guard is kept explicit.
+  */
+  if (config.GITHUB_OTA_TOKEN) {
+    put("GITHUB_OTA_TOKEN", config.GITHUB_OTA_TOKEN);
+  }
   if (config.cloud_link_code) {
     put("CLOUD_LINK_CODE", config.cloud_link_code);
   }

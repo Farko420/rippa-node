@@ -607,10 +607,12 @@ check(
 // unauthenticated request, which is indistinguishable from "no release yet". The
 // accepted names are asserted so the CI secret name cannot silently stop working.
 const savedTokens = {
+  ota: process.env.GITHUB_OTA_TOKEN,
   rippa: process.env.RIPPA_GITHUB_TOKEN,
   gh: process.env.GITHUB_TOKEN,
   cli: process.env.GH_TOKEN,
 };
+delete process.env.GITHUB_OTA_TOKEN;
 delete process.env.RIPPA_GITHUB_TOKEN;
 delete process.env.GITHUB_TOKEN;
 delete process.env.GH_TOKEN;
@@ -618,6 +620,12 @@ delete process.env.GH_TOKEN;
 check("no token resolves to an empty string", updater.resolveGitHubToken() === "");
 // Deleted in turn, so each name is proven to work on its OWN rather than being
 // shadowed by one that outranks it.
+process.env.GITHUB_OTA_TOKEN = "ghp_ota_specific";
+check(
+  "GITHUB_OTA_TOKEN is accepted (the documented OTA name)",
+  updater.resolveGitHubToken() === "ghp_ota_specific",
+);
+delete process.env.GITHUB_OTA_TOKEN;
 process.env.GITHUB_TOKEN = "ghp_ci_secret";
 check(
   "GITHUB_TOKEN is accepted (the standard CI secret name)",
@@ -632,7 +640,25 @@ check(
 delete process.env.GH_TOKEN;
 process.env.RIPPA_GITHUB_TOKEN = "node_specific";
 check(
-  "RIPPA_GITHUB_TOKEN wins over the others",
+  "RIPPA_GITHUB_TOKEN is accepted",
+  updater.resolveGitHubToken() === "node_specific",
+);
+
+// THE PRIORITY ORDER IS LOAD-BEARING. `GITHUB_TOKEN`/`GH_TOKEN` are routinely set
+// on build agents and dev machines for reasons that have nothing to do with OTA,
+// so GITHUB_OTA_TOKEN — the one name that exists solely to authenticate release
+// downloads — must outrank them, or a CI credential without access to this
+// PRIVATE repository would win and the download would 404 with no explanation.
+process.env.GITHUB_OTA_TOKEN = "ghp_ota_wins";
+check(
+  "GITHUB_OTA_TOKEN wins over RIPPA_GITHUB_TOKEN / GITHUB_TOKEN / GH_TOKEN",
+  updater.resolveGitHubToken() === "ghp_ota_wins",
+);
+delete process.env.GITHUB_OTA_TOKEN;
+delete process.env.RIPPA_GITHUB_TOKEN;
+process.env.RIPPA_GITHUB_TOKEN = "node_specific";
+check(
+  "RIPPA_GITHUB_TOKEN wins over GITHUB_TOKEN / GH_TOKEN",
   updater.resolveGitHubToken() === "node_specific",
 );
 
@@ -663,6 +689,7 @@ check(
 check("a non-URL is not treated as GitHub", updater.isGitHubUrl("not a url") === false);
 
 for (const [key, value] of [
+  ["GITHUB_OTA_TOKEN", savedTokens.ota],
   ["RIPPA_GITHUB_TOKEN", savedTokens.rippa],
   ["GITHUB_TOKEN", savedTokens.gh],
   ["GH_TOKEN", savedTokens.cli],
@@ -784,6 +811,7 @@ check("an assetless release resolves to nothing", ghAsset.selectAssetForDownload
   });
 
   // 1. NO TOKEN — the documented warning, and it must not be swallowed.
+  delete process.env.GITHUB_OTA_TOKEN;
   delete process.env.RIPPA_GITHUB_TOKEN;
   delete process.env.GITHUB_TOKEN;
   delete process.env.GH_TOKEN;
@@ -805,7 +833,12 @@ check("an assetless release resolves to nothing", ghAsset.selectAssetForDownload
     );
     check(
       "the no-token warning names the env vars that fix it",
-      lines.some((l) => l.includes("RIPPA_GITHUB_TOKEN") && l.includes("GITHUB_TOKEN")),
+      lines.some(
+        (l) =>
+          l.includes("GITHUB_OTA_TOKEN") &&
+          l.includes("RIPPA_GITHUB_TOKEN") &&
+          l.includes("GITHUB_TOKEN"),
+      ),
       JSON.stringify(lines),
     );
   }
@@ -824,6 +857,13 @@ check("an assetless release resolves to nothing", ghAsset.selectAssetForDownload
       lines.some((l) => l.includes("401") && l.includes("Bad credentials")),
       JSON.stringify(lines),
     );
+    // The strict, named diagnosis. Without it a 401 is just a number, and the
+    // operator has to guess WHICH env var the node is actually reading.
+    check(
+      "a 401 emits the strict GITHUB_OTA_TOKEN hint",
+      lines.some((l) => l.includes(ghAsset.OTA_404_HINT)),
+      JSON.stringify(lines),
+    );
   }
 
   // 3. 404 — must say this is what a private repo answers, not just the number.
@@ -835,6 +875,11 @@ check("an assetless release resolves to nothing", ghAsset.selectAssetForDownload
     check(
       "a 404 explains that a private repo is indistinguishable from a missing one",
       lines.some((l) => l.includes("404") && /private/i.test(l)),
+      JSON.stringify(lines),
+    );
+    check(
+      "a 404 emits the strict GITHUB_OTA_TOKEN hint verbatim",
+      lines.some((l) => l.includes(ghAsset.OTA_404_HINT)),
       JSON.stringify(lines),
     );
   }
@@ -975,7 +1020,10 @@ check(
 {
   const REAL_FETCH = globalThis.fetch;
   const SHORTCUT = "https://github.com/Farko420/rippa-node/releases/latest/download/rippa-node.exe";
-  process.env.RIPPA_GITHUB_TOKEN = "ghp_private_repo";
+  // THE DOCUMENTED NAME, deliberately. This block is the end-to-end proof for the
+  // token operators are told to set, so using a secondary alias here would leave
+  // the documented name unproven precisely where the 404 was being reported.
+  process.env.GITHUB_OTA_TOKEN = "ghp_private_repo";
   try {
     let askedFor = "";
     let sentAuth = "";
@@ -1003,6 +1051,19 @@ check(
       resolved?.headers?.Accept === "application/octet-stream",
       resolved?.headers?.Accept,
     );
+    // The two headers GitHub requires on an asset-by-ID download. Omitting the
+    // API version is the quiet failure mode: GitHub answers 200 with JSON
+    // metadata instead of bytes, and the node rejects it as "not an executable".
+    check(
+      "the asset download pins the GitHub API version",
+      resolved?.headers?.["X-GitHub-Api-Version"] === "2022-11-28",
+      JSON.stringify(resolved?.headers),
+    );
+    check(
+      "the asset download carries the bearer token",
+      resolved?.headers?.["Authorization"] === "Bearer ghp_private_repo",
+      JSON.stringify(resolved?.headers),
+    );
     check("the metadata lookup carries the bearer token", sentAuth === "Bearer ghp_private_repo");
     check(
       "the metadata lookup goes to the releases API",
@@ -1022,8 +1083,24 @@ check(
     check("an API asset URL is reused without re-resolving", extraCalls === 0 && already !== null);
   } finally {
     globalThis.fetch = REAL_FETCH;
+    // RESTORED, not blindly deleted: the ambient token may be the operator's real
+    // one, and the "without a token" assertions immediately below only hold when
+    // all four names really are absent.
+    delete process.env.GITHUB_OTA_TOKEN;
     delete process.env.RIPPA_GITHUB_TOKEN;
+    if (savedTokens.ota !== undefined) process.env.GITHUB_OTA_TOKEN = savedTokens.ota;
+    if (savedTokens.rippa !== undefined) process.env.RIPPA_GITHUB_TOKEN = savedTokens.rippa;
   }
+}
+
+// The next assertions are about the NO-token branch, so every alias must be gone.
+for (const key of [
+  "GITHUB_OTA_TOKEN",
+  "RIPPA_GITHUB_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+]) {
+  delete process.env[key];
 }
 
 // No token: the URL is returned UNCHANGED (null means "fetch it as advertised"),
@@ -1065,6 +1142,55 @@ const mothershipFeedPath = path.join(
   "lib",
   "node-latest-version.server.ts",
 );
+/*
+  THE CONFIG-MANAGER HALF. `resolveGitHubToken` reading the environment is only
+  half the fix: a packaged node's token can live in `config.json` instead of
+  `.env`, and `writeConfig` normalises and writes whatever `normalizeConfig`
+  returns — it is NOT a merge. A field missing from that function is DELETED on
+  the next GUI save, so an operator who set the token and then changed an
+  unrelated setting would silently lose it and OTA would 404 again an hour later.
+*/
+{
+  const cfgMod = await load("dist/config/configManager.js");
+  const osMod = await import("node:os");
+  const nodeFs = await import("node:fs");
+  const dir = nodeFs.mkdtempSync(path.join(osMod.tmpdir(), "rippa-ota-token-"));
+  try {
+    cfgMod.writeConfig(dir, {
+      NODE_ROLE: "master",
+      NODE_NAME: "Token Master",
+      NODE_API_KEY: "verify-master-key-0001",
+      MOTHERSHIP_URL: "https://rippaadventures.com",
+      GITHUB_OTA_TOKEN: "ghp_survives_a_save",
+    });
+    check(
+      "GITHUB_OTA_TOKEN is persisted to config.json",
+      cfgMod.readConfig(dir)?.GITHUB_OTA_TOKEN === "ghp_survives_a_save",
+      cfgMod.readConfig(dir)?.GITHUB_OTA_TOKEN,
+    );
+    // The round trip that actually matters: rewrite what is on disk, exactly as a
+    // GUI save does, and confirm the token is still there afterwards.
+    cfgMod.writeConfig(dir, { ...cfgMod.readConfig(dir) });
+    check(
+      "GITHUB_OTA_TOKEN survives a full config rewrite (a GUI save cannot drop it)",
+      cfgMod.readConfig(dir)?.GITHUB_OTA_TOKEN === "ghp_survives_a_save",
+      cfgMod.readConfig(dir)?.GITHUB_OTA_TOKEN,
+    );
+    check(
+      "applyConfigToEnv publishes the token to process.env so the updater can read it",
+      (() => {
+        delete process.env.GITHUB_OTA_TOKEN;
+        cfgMod.applyConfigToEnv(cfgMod.readConfig(dir), true);
+        return process.env.GITHUB_OTA_TOKEN === "ghp_survives_a_save";
+      })(),
+      process.env.GITHUB_OTA_TOKEN,
+    );
+  } finally {
+    delete process.env.GITHUB_OTA_TOKEN;
+    nodeFs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // The Mothership is a SEPARATE repository. These assertions only apply when it is
 // checked out beside the Node, so a standalone Node clone skips them rather than
 // failing on a path it does not own.

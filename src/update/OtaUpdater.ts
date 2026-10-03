@@ -5,7 +5,11 @@ import { pipeline } from "node:stream/promises";
 import axios from "axios";
 import { env } from "../config";
 import { APP_VERSION, APP_VERSION_RESOLVED, isVersionNewer, isVersionOlder } from "../version";
-import { currentReleaseAssetName, resolveGitHubAssetDownload } from "./githubAsset";
+import {
+  OTA_404_HINT,
+  currentReleaseAssetName,
+  resolveGitHubAssetDownload,
+} from "./githubAsset";
 import type { LatestVersionInfo, SwarmClient } from "../network/SwarmClient";
 import {
   HANDOFF_STAMP,
@@ -444,8 +448,8 @@ export class OtaUpdater {
         throw new Error(
           `HTTP 404 downloading ${downloadUrl} — either no release asset named ` +
             `"${currentReleaseAssetName()}" exists on the latest release, or the repository ` +
-            "is PRIVATE and no GITHUB_TOKEN / RIPPA_GITHUB_TOKEN is configured (a " +
-            `private repo 404s every anonymous request).${cause()}`,
+            `is PRIVATE and no GITHUB_OTA_TOKEN is configured (a private repo 404s every ` +
+            `anonymous request). ${OTA_404_HINT}${cause()}`,
         );
       }
       // 401/403 from the ASSET endpoint are just as opaque as the 404 above, and
@@ -588,8 +592,8 @@ function formatMb(bytes: number): string {
  */
 function statusExplanation(status: number): string {
   if (status === 401) {
-    return "the token is missing, expired or malformed. Set RIPPA_GITHUB_TOKEN or " +
-      "GITHUB_TOKEN in the node's .env with read access to the release repository.";
+    return "the token is missing, expired or malformed. Set GITHUB_OTA_TOKEN in the " +
+      "node's .env with read access to the release repository. " + OTA_404_HINT;
   }
   if (status === 403) {
     return "the token lacks access to this repository, or the GitHub API rate limit " +
