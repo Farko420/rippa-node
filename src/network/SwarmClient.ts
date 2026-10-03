@@ -256,6 +256,156 @@ const TASK_FETCH_BACKOFF_BASE_MS = 60_000;
 /** Ceiling for the doubling backoff â€” beyond this it just stays put. */
 const TASK_FETCH_BACKOFF_MAX_MS = 15 * 60_000;
 
+/**
+ * The brain-delta routes, tried in order.
+ *
+ * WHY A CHAIN. This node originally called `/api/brain/delta`, which no
+ * deployment of the Mothership has ever served — the live route is
+ * `/api/swarm/brain-delta`, inside the authenticated swarm namespace. The result
+ * was a 404 the old code treated as "endpoint not shipped yet, stay quiet", so a
+ * node with a good key and a good cursor silently never synced, and the only
+ * symptom was a fact count drifting further behind the cloud's every day. A
+ * second spelling costs one request, once; being wrong about a path costs the
+ * feature entirely.
+ *
+ * The swarm route is tried FIRST because it is the one known to exist.
+ */
+const BRAIN_DELTA_ROUTES: readonly string[] = ["/api/swarm/brain-delta", "/api/brain/delta"];
+
+/**
+ * A normalised brain delta, exactly as the cloud means it.
+ *
+ * Every field is guaranteed to be an array and `cursor` a usable ISO string, so
+ * no caller has to defend against a missing collection or a bare envelope. This
+ * is the contract `BrainDeltaSync` consumes.
+ */
+export interface BrainDeltaPayload {
+  /** What to send as `since` next time. Never re-derive it locally. */
+  cursor: string;
+  /** Echo of the `since` this page was built from. */
+  since: string;
+  places: Record<string, unknown>[];
+  categories: Record<string, unknown>[];
+  tags: Record<string, unknown>[];
+  /** Learned facts. The cloud's own name for these; `knowledge` stays `knowledge`. */
+  knowledge: Record<string, unknown>[];
+  /** True when a ceiling was hit and more is waiting behind this page. */
+  truncated: boolean;
+}
+
+/**
+ * Unwraps and validates a raw delta response.
+ *
+ * THE ENVELOPE UNWRAP IS THE POINT. The Mothership answers
+ * `{ ok: true, delta: { … } }`. The caller used to receive that whole object and
+ * then look for `places` and `knowledge_chunks` at the TOP LEVEL, found neither
+ * (they are one level down, and the latter is called `knowledge`), and concluded
+ * "no cloud changes" — on every poll, forever. Both the nested and the bare
+ * shapes are accepted so a proxy that unwraps the envelope for us still works.
+ */
+function parseBrainDelta(raw: unknown): BrainDeltaPayload | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const root = raw as Record<string, unknown>;
+
+  // A `delta` sub-object wins when present; otherwise the payload is the body.
+  const source =
+    root["delta"] && typeof root["delta"] === "object" && !Array.isArray(root["delta"])
+      ? (root["delta"] as Record<string, unknown>)
+      : root;
+
+  const rows = (value: unknown): Record<string, unknown>[] =>
+    Array.isArray(value)
+      ? value.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
+      : [];
+
+  /*
+    THE CURSOR IS REQUIRED, and refusing to invent one is deliberate. The delta
+    window is half-open `(since, cursor]`; storing a locally-computed "now"
+    instead of the cloud's value would silently skip every row written between the
+    cloud's read and this write. A response without a usable cursor cannot be
+    applied safely, so it is rejected rather than half-applied.
+  */
+  const cursorRaw = source["cursor"];
+  if (typeof cursorRaw !== "string" || !Number.isFinite(Date.parse(cursorRaw))) {
+    return null;
+  }
+
+  return {
+    cursor: cursorRaw,
+    since: typeof source["since"] === "string" ? source["since"] : "",
+    places: rows(source["places"]),
+    categories: rows(source["categories"]),
+    tags: rows(source["tags"]),
+    // Accepts either spelling: the cloud sends `knowledge`, a normalised
+    // payload or a proxy might send the ingester's own `knowledge_chunks`.
+    knowledge: rows(source["knowledge"] ?? source["knowledge_chunks"]),
+    truncated: source["truncated"] === true,
+  };
+}
+
+/**
+ * THE FLEET RESEARCH TASK QUEUE — Epic 2.
+ *
+ * A SEPARATE NAMESPACE FROM `/api/swarm/tasks`, and that separation is the whole
+ * design. `/api/swarm/*` is the control plane: admin commands, OTA, fleet
+ * telemetry, and light `scrape`/`llm_query` work. This is the DATA plane — heavy,
+ * offline-friendly research (parse a 200-page PDF of park rules, work through a
+ * dense Wikipedia page on local flora) that is far too slow and expensive to run
+ * against a paid cloud API key, and that a node's idle CPU and local
+ * `qwen2.5-coder:7b` can do for free.
+ *
+ * Keeping them apart means a burst of heavy research can never delay a
+ * FORCE_UPDATE, and a stalled research task can never make the fleet look busy
+ * to the control plane.
+ */
+
+/**
+ * Where an idle node asks for research work. The `fleet` spelling is deliberate:
+ * it reads as "the fleet's shared backlog", and it is what the Mothership serves.
+ */
+export const FLEET_TASKS_PATH = "/api/fleet/tasks";
+
+/**
+ * Where learned facts are pushed back.
+ *
+ * A FALLBACK CHAIN, for the same reason as every other chain in this file: a node
+ * must not be bricked by a Mothership that has not shipped a route yet. The
+ * primary is the brain-ingestion route the swarm namespace already authenticates;
+ * the fallback is the quarantine intake every deployment already accepts, so
+ * facts learned on a newer node are still recorded — filed for review — against
+ * an older cloud, rather than dropped on the floor.
+ */
+export const BRAIN_INGEST_PATH = "/api/brain/ingest";
+export const BRAIN_INGEST_FALLBACK_PATH = FORAGE_QUARANTINE_PATH;
+
+/** The routes tried, in order, by {@link SwarmClient.ingestBrainFacts}. */
+const BRAIN_INGEST_ROUTES: readonly string[] = [BRAIN_INGEST_PATH, BRAIN_INGEST_FALLBACK_PATH];
+
+/** One unit of heavy research work handed to an idle node. */
+export interface FleetTask {
+  id: string;
+  /** `pdf_extract` | `deep_crawl` | `page_digest`. */
+  kind: string;
+  /** What to work on: a URL, plus kind-specific hints. */
+  url: string;
+  /** Optional focus, e.g. "QLD National Park rules, camping + fire bans". */
+  focus: string;
+  /** Ceiling on how many facts to return, so one document cannot flood the brain. */
+  maxFacts: number;
+  /** How many times this task has been handed out (1 on a first dispatch). */
+  attempts: number;
+}
+
+/** The outcome of one research task, as reported back to the Mothership. */
+export interface FleetTaskResult {
+  taskId: string;
+  ok: boolean;
+  facts: number;
+  /** Safe to log and store; never rendered as HTML. */
+  detail: string;
+  durationMs: number;
+}
+
 export class SwarmClient {
   private readonly client: AxiosInstance;
   private heartbeatTask: ScheduledTask | null = null;
@@ -887,31 +1037,257 @@ export class SwarmClient {
   }
 
   /**
-   * Asks the Mothership for brain records changed since `since`.
-   *
-   * Returns the delta payload unchanged, or `null` when the endpoint is absent,
-   * errors, or answers with something that is not an object. `null` is
-   * deliberately indistinguishable from "nothing changed" at the call site in
-   * most cases â€” a delta-sync service that has never run and one that just found
-   * no changes should both simply do nothing, and neither should ever be able to
-   * damage the local mirror. The cursor is only advanced by a successful apply.
+ * EXTRACTS ONE TASK FROM A `/api/fleet/tasks` RESPONSE.
+ *
+ * Returns `null` for "nothing queued" AND for "the response made no sense", which
+ * are treated alike on purpose: in both cases the correct action is to do nothing
+ * and try again, and neither is worth an operator's attention. Anything WITH a
+ * usable id and URL is real work, whatever else is missing — `focus` and
+ * `maxFacts` are conveniences with honest defaults, because a task dispatched
+ * without them is still worth doing.
+ *
+ * `maxFacts` is CLAMPED rather than trusted. It arrives over the network from a
+ * queue an admin fills in, and an unbounded value would let one document push
+ * thousands of facts into the central brain in a single push.
+ */
+function parseFleetTask(raw: unknown): FleetTask | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const root = raw as Record<string, unknown>;
+
+  // Accept a bare task, or an envelope under `task` / `data`.
+  const candidate =
+    root["task"] && typeof root["task"] === "object"
+      ? (root["task"] as Record<string, unknown>)
+      : Array.isArray(root["tasks"])
+        ? (root["tasks"] as unknown[])[0]
+        : root;
+  if (!candidate || typeof candidate !== "object") return null;
+
+  const record = candidate as Record<string, unknown>;
+  const id = firstString(record, ["id", "taskId", "task_id"]);
+  const url = firstString(record, ["url", "target", "source_url"]);
+  if (!id || !url) return null;
+
+  const requestedMax = Number(record["maxFacts"] ?? record["max_facts"]);
+  const maxFacts = Number.isFinite(requestedMax) && requestedMax > 0
+    ? Math.min(Math.floor(requestedMax), MAX_FACTS_PER_TASK)
+    : DEFAULT_MAX_FACTS_PER_TASK;
+
+  return {
+    id,
+    kind: firstString(record, ["kind", "type", "taskType", "task_type"]) ?? "page_digest",
+    url,
+    focus: firstString(record, ["focus", "instruction", "subject", "goal"]) ?? "",
+    maxFacts,
+    attempts: Number(record["attempts"]) > 0 ? Number(record["attempts"]) : 1,
+  };
+}
+
+/** Ceiling on facts per research task — see `parseFleetTask`. */
+const MAX_FACTS_PER_TASK = 25;
+/** Used when the queue does not say. Deliberately modest for a first run. */
+const DEFAULT_MAX_FACTS_PER_TASK = 8;
+
+/**
+ * Index into {@link BRAIN_DELTA_ROUTES} of the route that last worked, so a
+ * deployment lacking the preferred spelling is probed once rather than on every
+ * ten-minute cycle forever.
+ */
+  private brainDeltaRouteIndex = 0;
+
+  /**
+   * Set once the Mothership has answered 404 on the fleet task queue, after which
+   * the poll stops logging. See {@link SwarmClient.fetchFleetTask}.
    */
-  async fetchBrainDelta(since: string | null): Promise<Record<string, unknown> | null> {
+  private fleetTasksUnsupported = false;
+
+  /**
+   * Index into {@link BRAIN_INGEST_ROUTES} of the route that last worked, so a
+   * fallback is not re-probed on every ingest.
+   */
+  private brainIngestRouteIndex = 0;
+
+  /**
+   * ASKS THE MOTHERSHIP FOR THE NEXT PIECE OF HEAVY RESEARCH WORK.
+   *
+   * Returns `null` — not an error — when there is nothing queued, which is the
+   * normal state of an idle fleet and must never produce a log line. A transport
+   * failure is also `null`, but it is logged with its cause, so the two are
+   * distinguishable in the terminal even though both mean "do nothing now".
+   *
+   * NEVER THROWS. This is called from a background poll, and an escaping
+   * rejection there is an unhandled error that can end the process.
+   */
+  async fetchFleetTask(): Promise<FleetTask | null> {
     try {
-      const { data } = await this.client.get("/api/brain/delta", {
-        params: since ? { since } : {},
-      });
-      if (!data || typeof data !== "object" || Array.isArray(data)) {
-        console.warn("[Swarm] /api/brain/delta returned an unusable payload.");
+      const { data } = await this.client.get(FLEET_TASKS_PATH, { timeout: 20_000 });
+      return parseFleetTask(data);
+    } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      // 404 means this Mothership has not shipped the queue. That is a permanent
+      // property of the deployment, not a blip, so it is said once and
+      // remembered rather than repeated every poll for the life of the process.
+      if (status === 404 || status === 405 || status === 501) {
+        if (!this.fleetTasksUnsupported) {
+          this.fleetTasksUnsupported = true;
+          console.log(
+            "[Fleet] This Mothership serves no /api/fleet/tasks queue. " +
+              "Continuing with local foraging only (this notice is not repeated).",
+          );
+        }
         return null;
       }
-      return data as Record<string, unknown>;
-    } catch (error) {
-      // 404 is the normal state until the Mothership ships the endpoint; it
-      // must not spam the log every 12 hours as an error.
-      console.warn(`[Swarm] Brain delta fetch failed â€” ${describeError(error)}`);
+      console.warn(`[Fleet] Task poll failed — ${describeError(error)}`);
       return null;
     }
+  }
+
+  /**
+   * PUSHES FACTS LEARNED FROM A RESEARCH TASK BACK TO THE CENTRAL BRAIN.
+   *
+   * The facts travel in the local model's own `verified_knowledge` shape, which is
+   * the shape the cloud already understands, so nothing has to be re-described on
+   * the way in. Every fact carries the task id and the source URL it came from,
+   * which is what lets a human audit a claim back to the document it came from
+   * rather than taking the node's word for it.
+   */
+  async ingestBrainFacts(payload: {
+    taskId: string;
+    sourceUrl: string;
+    facts: Array<{
+      category: string;
+      fact_summary: string;
+      confidence_score: number;
+      coordinates: string | null;
+    }>;
+  }): Promise<boolean> {
+    const body = {
+      ...payload,
+      nodeCode: currentNodeIdentity()?.code ?? env.NODE_NAME,
+      nodeName: env.NODE_NAME,
+      discoveredAt: new Date().toISOString(),
+    };
+
+    for (let attempt = 0; attempt < BRAIN_INGEST_ROUTES.length; attempt += 1) {
+      const route = BRAIN_INGEST_ROUTES[attempt];
+      try {
+        await this.client.post(route, body, { timeout: 30_000 });
+        this.brainIngestRouteIndex = attempt;
+        console.log(`[Fleet] Ingested ${payload.facts.length} fact(s) to ${route}.`);
+        return true;
+      } catch (error) {
+        const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+        if (status === 404 || status === 405 || status === 501) {
+          console.log(`[Fleet] No ingest route at ${route}; trying the fallback.`);
+          continue;
+        }
+        console.warn(
+          `[Fleet] Fact ingest failed on ${route} — ${describeError(error)} ` +
+            `Mothership said: ${describeResponseBody(error) || "(no body)"}`,
+        );
+        return false;
+      }
+    }
+    console.warn("[Fleet] No brain-ingest route available; learned facts were NOT uploaded.");
+    return false;
+  }
+
+  /**
+   * REPORTS A RESEARCH TASK'S OUTCOME, so the queue can retire it or re-queue it.
+   *
+   * Reported for SUCCESS AND FAILURE ALIKE. A task that is never acknowledged sits
+   * claimed forever, and a node that silently drops work is indistinguishable
+   * from a node that is ignoring the queue — which is the exact ambiguity that
+   * made the original "nodes ignore tasks" bug so hard to diagnose.
+   */
+  async completeFleetTask(result: FleetTaskResult): Promise<boolean> {
+    try {
+      await this.client.post(
+        `${FLEET_TASKS_PATH}/${encodeURIComponent(result.taskId)}/complete`,
+        { ok: result.ok, facts: result.facts, detail: result.detail },
+        { timeout: 20_000 },
+      );
+      return true;
+    } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status === 404 || status === 405 || status === 501) {
+        return false; // no completion route — the facts are already ingested anyway
+      }
+      console.warn(`[Fleet] Task completion report failed — ${describeError(error)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Asks the Mothership for brain records changed since `since`.
+   *
+   * Returns a NORMALISED delta, or `null` when no route answered. The payload is
+   * unwrapped from its `{ ok, delta }` envelope and its collections are
+   * normalised here, at the network boundary, so no caller ever has to know that
+   * the cloud calls its knowledge array `knowledge` while the local ingester calls
+   * it `knowledge_chunks`. See `deltaToBundle` for the other half of that mapping.
+   *
+   * RETURNS `null` ONLY FOR A GENUINE FAILURE. "Nothing changed" is a successful
+   * empty delta, not a failure — the distinction is what lets the caller log a
+   * heartbeat either way, and conflating the two is what made this failure
+   * invisible in the first place.
+   */
+  async fetchBrainDelta(since: string | null): Promise<BrainDeltaPayload | null> {
+    let lastError: unknown = null;
+
+    for (let attempt = 0; attempt < BRAIN_DELTA_ROUTES.length; attempt += 1) {
+      const index = (this.brainDeltaRouteIndex + attempt) % BRAIN_DELTA_ROUTES.length;
+      const route = BRAIN_DELTA_ROUTES[index];
+      try {
+        const { data } = await this.client.get(route, {
+          params: since ? { since } : {},
+        });
+        const delta = parseBrainDelta(data);
+        if (!delta) {
+          console.warn(
+            `[Brain Sync] ${route} answered, but not with a usable delta — ` +
+              "leaving the mirror untouched and the cursor unchanged.",
+          );
+          return null;
+        }
+        this.brainDeltaRouteIndex = index; // remember the working route
+        return delta;
+      } catch (error) {
+        lastError = error;
+        const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+        if (status === 404 || status === 405 || status === 501) {
+          // Route genuinely absent on this deployment — try the next spelling.
+          console.log(`[Brain Sync] No delta route at ${route}; trying the fallback.`);
+          continue;
+        }
+        /*
+          EVERYTHING ELSE IS REPORTED WITH ITS CAUSE, and this is the Epic-1
+          logging fix. A 401/403 in particular is the one failure an operator can
+          act on immediately — the Fleet API Key is wrong or revoked — and the old
+          code collapsed it into the same "delta fetch failed" line as a DNS
+          error, so nobody knew the key was the problem. The body is included
+          because the Mothership's 401 carries an actionable hint.
+        */
+        if (status === 401 || status === 403) {
+          console.warn(
+            `[Brain Sync] AUTH FAILED (HTTP ${status}) on ${route} — the Fleet API Key was ` +
+              `rejected. Re-check NODE_API_KEY in the node's config. ` +
+              `Mothership said: ${describeResponseBody(error) || "(no body)"}`,
+          );
+          return null;
+        }
+        console.warn(`[Brain Sync] Delta fetch failed on ${route} — ${describeError(error)}`);
+        return null;
+      }
+    }
+
+    console.warn(
+      "[Brain Sync] No brain-delta route on this Mothership (tried " +
+        `${BRAIN_DELTA_ROUTES.join(", ")}` +
+        (lastError ? `; last error: ${describeError(lastError)}` : "") +
+        "). Brain parity is unavailable — the manual bundle upload still works.",
+    );
+    return null;
   }
 
   /**

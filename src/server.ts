@@ -127,6 +127,29 @@ export function setOrchestratorRef(orchestrator: OrchestratorScraperRef | null):
 }
 
 /**
+ * The narrow view of BrainDeltaSync that the status route needs. Declared as an
+ * interface rather than importing the class so the route can be exercised in
+ * isolation, exactly as `OrchestratorScraperRef` above does for the scraper.
+ */
+interface BrainSyncRef {
+  isRunning: () => boolean;
+  syncNow: () => Promise<{
+    ok: boolean;
+    facts: number;
+    places: number;
+    cursor: string | null;
+    message: string;
+  }>;
+}
+
+let brainSyncRef: BrainSyncRef | null = null;
+
+/** Registers the live trickle-sync so the Control Center can see and force it. */
+export function setBrainSyncRef(sync: BrainSyncRef | null): void {
+  brainSyncRef = sync;
+}
+
+/**
  * The GitHub OTA updater for this node.
  *
  * Owned by the server so the `/api/mesh/update-trigger` route and the boot
@@ -1073,6 +1096,12 @@ export function createApp(): Express {
         success: true,
         lastSync: getSyncCursor(),
         counts: getBrainCounts(),
+        // Whether the trickle loop is armed, so the dashboard can distinguish
+        // "synced and up to date" from "never ran" — the two looked identical
+        // before, which is the entire Epic 1 failure from an operator's view.
+        trickleSync: brainSyncRef
+          ? { running: brainSyncRef.isRunning() }
+          : { running: false, reason: "not registered (master-only, or setup incomplete)" },
       });
     } catch (error) {
       res.status(500).json({
@@ -1081,6 +1110,41 @@ export function createApp(): Express {
       });
     }
   });
+
+  /*
+    POST /api/brain/sync-now — force one trickle-sync cycle, on demand.
+
+    THE OPERATIONAL POINT OF EPIC 1. When the sync was broken there was no way to
+    ask the node "did you try, and what happened?" — the answer lived only in a
+    12-hourly log line nobody was watching, which is exactly how a node stayed
+    1,900 facts behind the cloud and reported itself healthy. This route runs one
+    cycle synchronously and returns what it did, so an operator can prove the
+    loop works without waiting for the timer or reading a terminal.
+
+    Fails soft: an unreachable Mothership is a normal condition here, and is
+    reported as `ok: false` with the reason rather than a 500.
+  */
+  app.post(
+    "/api/brain/sync-now",
+    requireDashboardAuth,
+    async (_req: Request, res: Response) => {
+      if (!brainSyncRef) {
+        res.status(503).json({
+          success: false,
+          message: "Brain trickle-sync is not running on this node (master-only, and requires setup).",
+        });
+        return;
+      }
+      try {
+        res.json({ success: true, ...(await brainSyncRef.syncNow()) });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: `Sync failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    },
+  );
 
   /*
     POST /api/brain/upload-backup — load a RIPPA_BRAIN_BUNDLE_V1 file.

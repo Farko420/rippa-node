@@ -215,6 +215,11 @@ export function getBrainCounts(): BrainIngestResult["counts"] {
   };
 }
 
+/** Row count of any bundle collection, tolerating a missing or wrong-typed one. */
+function countRows(value: unknown): number {
+  return Array.isArray(value) ? value.length : 0;
+}
+
 /**
  * LOADS A BUNDLE, ALL AT ONCE OR NOT AT ALL.
  *
@@ -242,10 +247,18 @@ export function getBrainCounts(): BrainIngestResult["counts"] {
  * block is untrusted input and is never used for the badge — a truncated or
  * hand-edited file claiming 5,000 places while carrying 400 must not produce a
  * "1:1 parity locked" message over 400 rows.
+ *
+ * `allowPlaceLess` RELAXES THE EMPTY-PLACES REFUSAL, and only for callers that
+ * know they are feeding an INCREMENT rather than a whole-brain bundle. The
+ * refusal below is right for an operator drag-and-drop — a full export with no
+ * places really does mean "erase everything" — but wrong for a trickle-sync
+ * delta, whose most common shape is "new facts about places you already have".
+ * Off by default, so the upload path keeps its protection; see the second guard
+ * for the condition that still applies even when the flag is on.
  */
 export async function ingestBrainBundle(
   raw: unknown,
-  options: { force?: boolean; onProgress?: BrainIngestProgressListener } = {},
+  options: { force?: boolean; allowPlaceLess?: boolean; onProgress?: BrainIngestProgressListener } = {},
 ): Promise<BrainIngestResult> {
   const onProgress = options.onProgress;
   /** Total rows the bundle claims to carry, for the progress denominator. */
@@ -327,11 +340,34 @@ export async function ingestBrainBundle(
   const placeRows = Array.isArray(bundle["places"])
     ? (bundle["places"] as Record<string, unknown>[])
     : [];
-  if (placeRows.length === 0) {
+  if (placeRows.length === 0 && !options.allowPlaceLess) {
     return fail(
       "That bundle contains no places. Refusing to load it, because it would erase what this node " +
         "already knows. Export from the Mothership once it has verified places.",
     );
+  }
+
+  /*
+    A PLACE-LESS PAYLOAD THAT IS ENTIRELY EMPTY IS STILL REFUSED, even with
+    `allowPlaceLess`. The flag exists for the knowledge-only INCREMENT (facts,
+    no places) and this guard is what stops it being used to smuggle a no-op
+    through: an empty payload would advance the cursor past changes the node
+    never actually stored, which is the exact silent-data-loss failure the cursor
+    design exists to prevent. `BrainDeltaSync` already short-circuits the empty
+    case before calling, so this only fires on a malformed delta.
+  */
+  if (placeRows.length === 0 && options.allowPlaceLess) {
+    const totalNonPlaceRows =
+      countRows(bundle["categories"]) +
+      countRows(bundle["tags"]) +
+      countRows(bundle["knowledge_chunks"]) +
+      countRows(bundle["road_features"]);
+    if (totalNonPlaceRows === 0) {
+      return fail(
+        "That payload contains neither places nor any other records, so applying it would advance " +
+          "the sync cursor without storing anything. Refusing.",
+      );
+    }
   }
 
   const db = getDeepBrain();
