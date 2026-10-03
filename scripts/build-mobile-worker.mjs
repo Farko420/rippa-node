@@ -59,6 +59,28 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const entry = path.join(root, "mobile", "src", "worker.ts");
 const browserStub = path.join(root, "src", "satellite", "storage-desktop.browser.ts");
 
+/*
+  THE BUILD VERSION IS INJECTED HERE, not hand-written into worker.ts.
+
+  `mobile/src/worker.ts` declares `__RIPPA_FALLBACK_APK_VERSION__` and uses it as
+  the reported version for runtimes with no native bridge. Reading it from the root
+  package.json and passing it to esbuild as a `define` makes package.json the single
+  source of truth, which is the only arrangement that survives CI: the workflow's
+  Bump-version step raises package.json on every push, so a literal in worker.ts was
+  stale the instant that step ran and failed the APK build on every single run.
+
+  `define` substitutes the identifier textually at bundle time, so the reference is
+  erased rather than resolved at runtime — the WebView never sees the global, and
+  the guard below cannot be tripped by it either.
+*/
+const pkgVersion = JSON.parse(
+  fs.readFileSync(path.join(root, "package.json"), "utf8"),
+).version;
+if (typeof pkgVersion !== "string" || !pkgVersion.trim()) {
+  console.error("[BUNDLE] package.json has no usable `version` to inject.");
+  process.exit(1);
+}
+
 const args = process.argv.slice(2);
 const outIndex = args.indexOf("--out");
 const outFile =
@@ -107,6 +129,9 @@ await build({
   platform: "browser",
   target: "es2020",
   plugins: [desktopStorageStub],
+  define: {
+    __RIPPA_FALLBACK_APK_VERSION__: JSON.stringify(pkgVersion),
+  },
   // Node builtins are NOT marked external. An external builtin would be left as
   // a dangling `require()` that survives into the APK and throws on a tablet;
   // failing the build here is the behaviour we want.

@@ -1253,19 +1253,50 @@ console.log(`[APK] Verified ${updaterChecks.length} in-app updater wiring check(
   have, and an operator learns to dismiss the banner. The APK build is where that
   is cheapest to catch.
 */
-const workerSource = fs.readFileSync(path.join(mobileDir, "src", "worker.ts"), "utf8");
-const fallbackVersion = /FALLBACK_APK_VERSION\s*=\s*"([^"]+)"/.exec(workerSource)?.[1];
-if (fallbackVersion !== appVersion) {
+/*
+  CHECKED IN THE EMITTED BUNDLE, NOT IN THE SOURCE. The assertion used to regex the
+  string literal out of mobile/src/worker.ts and require it to equal package.json.
+  That could only ever fail: the Bump-version step in build-node.yml raises
+  package.json on every single push while worker.ts's literal was edited by hand, so
+  on CI the two were guaranteed to disagree and the APK job died here — BEFORE
+  Gradle ran, with no APK and a "No files were found with the provided path" from the
+  upload step that then masked the real cause.
+
+  `scripts/build-mobile-worker.mjs` now injects the version into the bundle from
+  package.json, so the value that actually SHIPS is what is checked here. The guard
+  is kept — a browser preview must not report a stale version and nag forever — but
+  it now verifies the artefact rather than policing a copy-paste.
+
+  MATCHED ON THE ASSIGNMENT, NOT ON A LITERAL. esbuild does not fully constant-fold
+  the `typeof … === "string"` guard in worker.ts and emits
+  `var FALLBACK_APK_VERSION = true ? "1.0.16" : "0.0.0-dev";`, so a regex demanding a
+  bare `= "1.0.16"` silently matches nothing. The right-hand side is captured and
+  the real version is required to appear inside it, which is true whether or not the
+  ternary is folded — and a hard-coded stale literal in the source can no longer
+  reach this point, because the `define` always wins.
+*/
+const bundleSource = fs.readFileSync(path.join(wwwDir, "worker.js"), "utf8");
+const assignment = /FALLBACK_APK_VERSION\s*=\s*([^;]+);/.exec(bundleSource);
+if (!assignment) {
   console.error(
-    `[APK] mobile/src/worker.ts has FALLBACK_APK_VERSION = "${fallbackVersion}" but\n` +
-      `       package.json says ${appVersion}.\n` +
-      "       This constant is only used when there is no native bridge, but a\n" +
-      "       stale one makes a browser preview offer an update from\n" +
-      `       ${fallbackVersion} to ${appVersion} forever. Bump it, or take it from\n` +
-      "       package.json at build time.",
+    "[APK] The emitted worker bundle never assigns FALLBACK_APK_VERSION.\n" +
+      "       A browser preview with no bridge would report an unknown version.\n" +
+      "       Check that scripts/build-mobile-worker.mjs still defines it.",
   );
   process.exit(1);
 }
+if (!assignment[1].includes(`"${appVersion}"`)) {
+  console.error(
+    `[APK] The worker bundle reports a fallback version that is not ${appVersion}:\n` +
+      `         ${assignment[1].trim()}\n` +
+      "       package.json is the single source of truth for it, and\n" +
+      "       scripts/build-mobile-worker.mjs injects it at bundle time. A stale\n" +
+      "       value makes a browser preview offer an update the tablet already has,\n" +
+      "       forever — which is how operators learn to ignore update prompts.",
+  );
+  process.exit(1);
+}
+const fallbackVersion = appVersion;
 
 const dashboard = fs.readFileSync(path.join(wwwDir, "index.html"), "utf8");
 const promptChecks = [

@@ -863,13 +863,28 @@ export function workerStatus(): Record<string, unknown> {
  * matters when the same dashboard is opened in a plain desktop browser, where
  * `window.mobileBridge` does not exist.
  *
- * IT MUST MATCH package.json, AND THAT IS ENFORCED: scripts/package-apk.mjs reads
- * this literal out of the bundle source and fails the APK build if it has drifted.
- * A silently-stale constant would mean a browser preview nagging to "update" from
- * 1.0.14 to 1.0.14 forever, which is precisely the kind of self-inflicted noise
- * that trains operators to ignore update prompts.
+ * IT IS INJECTED AT BUILD TIME, NOT HARD-CODED. `scripts/build-mobile-worker.mjs`
+ * reads the root package.json and passes the version to esbuild as the
+ * `__RIPPA_FALLBACK_APK_VERSION__` define, so this value is replaced with the real
+ * version during bundling. It used to be a hand-maintained string literal that had
+ * to be edited by hand on every release, and that is precisely why the APK job
+ * failed in CI: the Bump-version step raises package.json on every push, so a
+ * literal was stale from the moment of the bump. Worse, the literal drifted
+ * silently until the next APK build failed on the version assertion below — a
+ * reminder that arrives as a red build rather than as the one-line fix.
+ *
+ * The fallback below is only for a `tsx`-style run of this file with no bundler
+ * (a browser preview straight from source); the APK build always substitutes the
+ * injected value. `scripts/package-apk.mjs` asserts the value baked into the
+ * emitted bundle matches package.json, so drift is still caught — but now at the
+ * point where it is actually fixable.
  */
-const FALLBACK_APK_VERSION = "1.0.14";
+declare const __RIPPA_FALLBACK_APK_VERSION__: string | undefined;
+
+const FALLBACK_APK_VERSION: string =
+  typeof __RIPPA_FALLBACK_APK_VERSION__ === "string"
+    ? __RIPPA_FALLBACK_APK_VERSION__
+    : "0.0.0-dev";
 
 /**
  * The Mothership routes this is tried against, in order.

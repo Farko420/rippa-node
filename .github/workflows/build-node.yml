@@ -165,12 +165,23 @@ jobs:
         shell: pwsh
         run: |
           $wanted = 'rippa-node.exe'
+          # Search the packager's output dirs. These ROOTS OVERLAP — '.' walked
+          # recursively re-descends into dist\ and build\ — so the same file is
+          # matched by more than one iteration and counted twice. That is not a
+          # packaging bug; it was an artefact of the search, and the "exactly one
+          # copy" assertion below then failed a perfectly good build with
+          # "Found 2 copies of rippa-node.exe" and exit code 1, before any
+          # checksum or upload could run. Sort-Object -Unique on the resolved
+          # path collapses the overlap, so the guard now fires only on genuinely
+          # distinct files in different directories, which is what it is for.
           $found = @()
           foreach ($dir in @('dist', 'build', '.')) {
             if (Test-Path $dir) {
               $found += Get-ChildItem -Path $dir -Filter $wanted -File -Recurse -ErrorAction SilentlyContinue
             }
           }
+          $found = @($found | Sort-Object -Property FullName -Unique)
+
           if ($found.Count -eq 0) {
             Write-Error "npm run package produced no $wanted in dist/, build/ or the repo root"
             exit 1
@@ -531,24 +542,59 @@ jobs:
       - name: Build the APK
         run: npm run build:apk
 
-      # Prefer the root copy the packager makes, and fall back to searching the
-      # Gradle output tree. `|| true` on the find keeps `set -e` from killing the
-      # step before the explicit "no APK" error below can explain what happened.
+      # NORMALISES THE APK ONTO ONE PATH, whichever variant produced it.
+      #
+      # scripts/package-apk.mjs copies Gradle's output to ./rippa-satellite.apk at
+      # the root, so the upload step below can use a static path. That contract was
+      # silently load-bearing: whenever the build failed BEFORE the copy — a
+      # version assertion, a Gradle error, a stale overlay — the run died and the
+      # `if: always()` upload then reported the misleading
+      # "No files were found with the provided path: rippa-satellite.apk", naming a
+      # file that was never really in question and hiding the step that actually
+      # failed.
+      #
+      # So the search is done here, explicitly, against Gradle's REAL output tree,
+      # and whatever is found is copied to the stable root name before upload. The
+      # upload then has exactly one thing to look for, and this step is the only
+      # place that decides whether an APK exists at all.
+      #
+      # The candidates are listed in preference order (release, then debug) rather
+      # than taken from `find | head -n 1`, because head on an arbitrary directory
+      # walk is not a decision: it can publish a `-unsigned` or a stale split APK.
+      # `|| true` keeps `set -e` from killing the step before the explicit error
+      # below can explain what happened.
       - name: Locate the APK
         id: apk
         run: |
           set -euo pipefail
-          if [ -f rippa-satellite.apk ]; then
-            APK=rippa-satellite.apk
-          else
-            APK=$(find mobile/android/app/build/outputs/apk -name '*.apk' 2>/dev/null | head -n 1 || true)
+          OUT=mobile/android/app/build/outputs/apk
+          APK=""
+          for CANDIDATE in \
+            "$OUT/release/app-release.apk" \
+            "$OUT/debug/app-debug.apk" \
+            rippa-satellite.apk
+          do
+            if [ -f "$CANDIDATE" ]; then
+              APK="$CANDIDATE"
+              break
+            fi
+          done
+          # Fall back to a sweep of the output tree for any variant not listed
+          # above (e.g. a per-flavor directory), ignoring the obvious non-shipping
+          # artefacts.
+          if [ -z "$APK" ]; then
+            APK=$(find "$OUT" -name '*.apk' ! -name '*unsigned*' 2>/dev/null | sort | head -n 1 || true)
           fi
-          if [ -z "${APK:-}" ]; then
-            echo "::error::Gradle produced no APK"
+          if [ -z "${APK:-}" ] || [ ! -f "$APK" ]; then
+            echo "::error::Gradle produced no APK. Looked in $OUT and the workspace root."
+            ls -laR "$OUT" 2>/dev/null || true
             exit 1
           fi
-          echo "Found $APK ($(du -h "$APK" | cut -f1))"
-          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          # Copy onto the stable name the upload step (and every operator's
+          # `adb install -r rippa-satellite.apk`) expects.
+          cp "$APK" rippa-satellite.apk
+          echo "Found $APK -> rippa-satellite.apk ($(du -h rippa-satellite.apk | cut -f1))"
+          echo "path=rippa-satellite.apk" >> "$GITHUB_OUTPUT"
 
       # Asserts the foreground-service configuration AND the in-app updater's
       # permissions really made it into the binary. A silently-missing WAKE_LOCK is
@@ -582,11 +628,18 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rippa-satellite-apk
-          # Static path, never a step output: the Locate step exits 1 when Gradle
+          # Static paths, never a step output: the Locate step exits 1 when Gradle
           # emits nothing, and `if: always()` would then pass an EMPTY output,
           # which upload-artifact@v4 rejects with "Input required and not
           # supplied: path" — masking the real Gradle failure.
-          path: rippa-satellite.apk
+          #
+          # The root copy the Locate step normalises onto is listed FIRST, and the
+          # Gradle output tree is included as a backstop so a rename or a variant
+          # that skipped normalisation still yields the artifact rather than a
+          # misleading "No files were found with the provided path".
+          path: |
+            rippa-satellite.apk
+            mobile/android/app/build/outputs/apk/**/*.apk
           # `error`, not `warn`: the APK is the entire purpose of this job, so a
           # missing artifact must surface as a red run rather than a green check
           # that produced nothing.
