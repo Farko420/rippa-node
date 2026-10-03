@@ -55,7 +55,34 @@ const RESTART_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 /** Restarts within this window count toward the backoff ladder. */
 const CRASH_WINDOW_MS = 10 * 60_000;
 
+/**
+ * EMBEDDING MODEL PULL — the bounds on a download nobody is watching.
+ *
+ * The tile used to sit on "pulling…" forever when `/api/pull` hung or died
+ * silently, so every path through `pullEmbeddingModel()` is now bounded: the
+ * fetch is aborted after EMBEDDING_PULL_TIMEOUT_MS, and the reconciler keeps
+ * asking `/api/tags` whether the model actually landed in the meantime.
+ */
+/** Hard ceiling on one embedding-model pull before its AbortController fires. */
+const EMBEDDING_PULL_TIMEOUT_MS = 10 * 60_000;
+/** `/api/tags` reconcile cadence while a pull is actively streaming. */
+const EMBEDDING_RECONCILE_FAST_MS = 15_000;
+/** Reconcile cadence while idle or after a failed pull — it keeps looking. */
+const EMBEDDING_RECONCILE_SLOW_MS = 60_000;
+
 export type OllamaRunState = "stopped" | "starting" | "running" | "crashed" | "unmanaged";
+
+/**
+ * WHAT THE EMBEDDING MODEL TILE IS ALLOWED TO SAY.
+ *
+ * `pulling` while the NDJSON stream downloads, `ready` once `/api/tags` (or the
+ * stream's own success frame) confirms the model is installed, `failed` after a
+ * timeout or error — with `idle` covering the moment before the first attempt.
+ * The point of the union is that "pulling…" is now a *claim with an end*: a pull
+ * that times out or dies transitions to `failed (click to retry)` instead of
+ * leaving a badge frozen on a state the work no longer holds.
+ */
+export type EmbeddingModelStatus = "idle" | "pulling" | "ready" | "failed";
 
 export interface OllamaStatus {
   /** True when this node is allowed to spawn/restart the process itself. */
@@ -75,8 +102,12 @@ export interface OllamaStatus {
   restartCount: number;
   /** Total system RAM in GB, used by the hardware auto-profiler. */
   ramGb: number;
-  /** True once the embedding model has been pulled on this node. */
+  /** True once the embedding model is installed on this node. */
   embeddingModelReady: boolean;
+  /** Machine state behind the Embedding Model tile — see {@link EmbeddingModelStatus}. */
+  embeddingModelStatus: EmbeddingModelStatus;
+  /** Why the last embedding pull failed; null unless the status is `failed`. */
+  embeddingModelError: string | null;
   /** Name of the embedding model this node auto-pulls. */
   embeddingModel: string;
   /** True when the runtime binary lives in the node's own directory. */
@@ -125,6 +156,25 @@ function readOllamaModels(body: unknown): string[] {
     .filter(Boolean);
 }
 
+/**
+ * True when an installed-model list contains `target`, tolerating the `:latest`
+ * suffix Ollama adds by default: target "nomic-embed-text" matches the installed
+ * "nomic-embed-text:latest", and vice versa. Same rule as OllamaClient's
+ * `matchesModel`, duplicated only because that copy is module-private.
+ */
+function installedModelMatches(installed: string[], target: string): boolean {
+  const bare = target.split(":")[0];
+  return installed.some((name) => name === target || name.split(":")[0] === bare);
+}
+
+/** One newline-delimited JSON progress frame from `POST /api/pull`. */
+interface PullFrame {
+  status?: string;
+  total?: number;
+  completed?: number;
+  error?: string;
+}
+
 class OllamaManager {
   private child: ChildProcess | null = null;
   private managed = false;
@@ -133,7 +183,14 @@ class OllamaManager {
   private model = PRIMARY_MODEL;
   private lastError: string | null = null;
   private restartCount = 0;
-  private embeddingModelReady = false;
+  /** Embedding tile state machine — see {@link EmbeddingModelStatus}. */
+  private embeddingStatus: EmbeddingModelStatus = "idle";
+  /** Populated only on failure; shown as the retry tile's tooltip. */
+  private embeddingError: string | null = null;
+  /** True while `pullEmbeddingModel()` is running — guards a second pull. */
+  private embeddingPulling = false;
+  /** Pending `/api/tags` reconcile timer; null when none is scheduled. */
+  private embeddingReconcileTimer: NodeJS.Timeout | null = null;
   private crashTimestamps: number[] = [];
   private restartTimer: NodeJS.Timeout | null = null;
   private stopping = false;
@@ -183,7 +240,9 @@ class OllamaManager {
       lastError: this.lastError,
       restartCount: this.restartCount,
       ramGb: systemRamGb(),
-      embeddingModelReady: this.embeddingModelReady,
+      embeddingModelReady: this.embeddingStatus === "ready",
+      embeddingModelStatus: this.embeddingStatus,
+      embeddingModelError: this.embeddingError,
       embeddingModel: EMBEDDING_MODEL,
       // Surfaces WHERE the runtime came from, so an operator can tell a node that
       // owns its own contained Ollama from one borrowing a host-wide install.
@@ -363,6 +422,16 @@ class OllamaManager {
       const latencyMs = Date.now() - started;
       const installedModels = readOllamaModels(tags?.data);
 
+      /*
+        FREE RECONCILIATION. This probe already asked `/api/tags`, so a model
+        installed by ANY path — the background pull finishing, a manual
+        `ollama pull`, a restored backup — flips the Embedding Model tile to
+        `ready` on the next health ping without issuing a second request. This
+        is also the only reconcile an UNMANAGED node gets (it never runs
+        `ensureModelsPulled`), which is exactly why it lives here.
+      */
+      this.absorbEmbeddingInstalled(installedModels);
+
       // `/api/ps` is newer than `/api/tags`; an older server 404s here, which is a
       // degraded probe and not a failed engine, so it must not read as offline.
       let loadedModels: string[] = [];
@@ -427,6 +496,9 @@ class OllamaManager {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
     }
+    // The reconcile chain has no reason to keep polling a server this method is
+    // about to take down; `start()` re-arms it when the child comes back.
+    this.stopEmbeddingReconcile();
     const child = this.child;
     this.child = null;
     if (child && child.exitCode === null) {
@@ -568,11 +640,286 @@ class OllamaManager {
   }
 
   /**
+   * THE EMBEDDING MODEL PROVISIONER — `POST /api/pull` with a real stream.
+   *
+   * WHY A STREAM AND NOT `stream: false`. The old background path handed the
+   * pull to `OllamaClient.pullModel()` and only learned the outcome at the very
+   * end, so a hung or silently-failed download left the dashboard tile on
+   * "pulling…" with nothing in the terminal to explain it. This reads Ollama's
+   * NDJSON progress frames (`status` / `completed` / `total`) and pushes every
+   * percentage into the Live Engine Terminal as it happens, so a stalled
+   * download looks different from a slow one at a glance.
+   *
+   * THE THREE GUARANTEES THE OLD PATH LACKED:
+   *   1. BOUNDED — an AbortController kills the fetch after
+   *      EMBEDDING_PULL_TIMEOUT_MS, and the timeout is flagged so the failure
+   *      line says "timed out after 10 minutes" rather than a bare abort.
+   *   2. HONEST — success, timeout and error all end in a status transition
+   *      (`ready` or `failed (click to retry)`), never a badge left spinning.
+   *   3. SELF-RECONCILING — `/api/tags` is checked before, during (on the
+   *      reconcile chain) and after the pull. The tag list is the source of
+   *      truth: a model that landed by any path wins over what the stream
+   *      claims, including on the failure path (a timeout that fires a beat
+   *      after the download actually finished still reads `ready`).
+   *
+   * Never throws — failures are reported through the returned message, the
+   * terminal and the status field, because every caller runs this
+   * fire-and-forget on an idle node that must not be able to crash.
+   */
+  async pullEmbeddingModel(): Promise<{ ok: boolean; message: string }> {
+    if (this.embeddingPulling) {
+      return {
+        ok: false,
+        message: `already pulling ${EMBEDDING_MODEL} — watch the terminal for progress.`,
+      };
+    }
+    // The tag list decides first: an installed model is an instant "ready"
+    // with no download at all.
+    if (await this.reconcileEmbedding()) {
+      return { ok: true, message: `${EMBEDDING_MODEL} is already installed.` };
+    }
+
+    this.embeddingPulling = true;
+    this.embeddingStatus = "pulling";
+    this.embeddingError = null;
+    publishLine("cmd", `pulling ${EMBEDDING_MODEL} …`);
+    console.log(`[OllamaManager] Pulling embedding model "${EMBEDDING_MODEL}".`);
+    noteEngineActivity("pulling", EMBEDDING_MODEL, EMBEDDING_PULL_TIMEOUT_MS);
+    // Re-arm the reconcile chain at the fast cadence even if a slow (boot-time)
+    // tick is already pending — a streaming pull deserves a 15s tag check.
+    this.stopEmbeddingReconcile();
+    this.scheduleEmbeddingReconcile(EMBEDDING_RECONCILE_FAST_MS);
+
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, EMBEDDING_PULL_TIMEOUT_MS);
+
+    try {
+      const origin = `http://127.0.0.1:${this.getPort()}`;
+      const response = await fetch(`${origin}/api/pull`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // `stream: true` is what makes the NDJSON progress frames below exist.
+        body: JSON.stringify({ model: EMBEDDING_MODEL, stream: true }),
+        signal: controller.signal,
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`HTTP ${response.status} from /api/pull`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = "";
+      let lastPercent = -1;
+      let sawSuccess = false;
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pending += decoder.decode(value, { stream: true });
+        const parts = pending.split(/\r?\n/);
+        // The final element is whatever came after the last newline: incomplete.
+        pending = parts.pop() ?? "";
+        for (const part of parts) {
+          if (!part.trim()) continue;
+          let frame: PullFrame;
+          try {
+            frame = JSON.parse(part) as PullFrame;
+          } catch {
+            continue; // not JSON — nothing actionable, and the stream must go on
+          }
+          if (frame.error) throw new Error(frame.error);
+          if (frame.status === "success") sawSuccess = true;
+          // Progress arrives per-layer; only a changed percentage is worth a
+          // line, and each one re-arms the badge so a slow-but-moving download
+          // never looks expired.
+          if (typeof frame.total === "number" && frame.total > 0) {
+            const percent = Math.floor(((frame.completed ?? 0) / frame.total) * 100);
+            if (percent !== lastPercent) {
+              lastPercent = percent;
+              publishLine("out", `${frame.status ?? "downloading"} ${percent}%`);
+              noteEngineActivity("pulling", EMBEDDING_MODEL, EMBEDDING_PULL_TIMEOUT_MS);
+            }
+          } else if (frame.status) {
+            publishLine("out", frame.status);
+          }
+        }
+      }
+      /*
+        THE STREAM ENDED. A stream that closed cleanly is not, by itself, proof
+        the model is on disk — `/api/tags` is, and its tag lands a beat after
+        the final frame, so give it a couple of seconds to agree before falling
+        back to trusting the stream's own success frame.
+      */
+      if (!(await this.reconcileEmbedding())) {
+        if (!sawSuccess) {
+          throw new Error("the pull stream ended before the model appeared in /api/tags");
+        }
+        for (let attempt = 0; attempt < 4 && !this.isEmbeddingReady(); attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          await this.reconcileEmbedding();
+        }
+        if (!this.isEmbeddingReady()) {
+          // The server said "success" and the tag list has not caught up —
+          // trust the success frame; the reconcile chain keeps checking anyway.
+          this.markEmbeddingReady("pull completed");
+        }
+      }
+      return { ok: true, message: `${EMBEDDING_MODEL} pulled successfully.` };
+    } catch (error) {
+      // THE TIMEOUT MAY HAVE FIRED A MOMENT AFTER THE PULL ACTUALLY LANDED —
+      // always ask the tag list before declaring failure.
+      if (await this.reconcileEmbedding()) {
+        return { ok: true, message: `${EMBEDDING_MODEL} is installed.` };
+      }
+      const message = timedOut
+        ? `timed out after ${Math.round(EMBEDDING_PULL_TIMEOUT_MS / 60_000)} minutes`
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      this.embeddingStatus = "failed";
+      this.embeddingError = message;
+      publishLine("err", `embedding model pull failed: ${message}`);
+      console.warn(`[OllamaManager] Embedding model pull failed — ${message}`);
+      publishNodeEvent({
+        kind: "info",
+        title: "Embedding model pull failed",
+        detail: `${EMBEDDING_MODEL}: ${message}. Click the Embedding Model tile to retry.`,
+      });
+      // Keep reconciling after a failure — a later successful pull (manual, or
+      // a retry the operator starts) still flips the tile to `ready` by itself.
+      this.scheduleEmbeddingReconcile(EMBEDDING_RECONCILE_SLOW_MS);
+      return { ok: false, message };
+    } finally {
+      clearTimeout(timer);
+      this.embeddingPulling = false;
+      clearEngineActivity();
+    }
+  }
+
+  /**
+   * ASKS `/api/tags` WHETHER THE EMBEDDING MODEL IS INSTALLED — AND BELIEVES IT.
+   *
+   * Every caller converges on this one answer (the pull's entry and exit, the
+   * reconcile chain, the health probe, the retry route), so a model that landed
+   * by ANY path flips the tile to `ready`. Never throws: an unreachable server
+   * is simply "not found yet", because a probe failure during a pull's own
+   * error handling must not mask the real error.
+   */
+  async reconcileEmbedding(): Promise<boolean> {
+    if (this.embeddingStatus === "ready") return true;
+    try {
+      const origin = `http://127.0.0.1:${this.getPort()}`;
+      const tags = await axios.get(`${origin}/api/tags`, { timeout: 3_000, proxy: false });
+      if (!installedModelMatches(readOllamaModels(tags?.data), EMBEDDING_MODEL)) return false;
+      this.markEmbeddingReady("found in /api/tags");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Folds a tag list this module already holds into the tile state. */
+  private absorbEmbeddingInstalled(installed: string[]): void {
+    if (this.embeddingStatus === "ready") return;
+    if (!installedModelMatches(installed, EMBEDDING_MODEL)) return;
+    this.markEmbeddingReady("found in /api/tags");
+  }
+
+  /**
+   * Read through a method rather than a direct field comparison inside
+   * `pullEmbeddingModel`, so the compiler cannot narrow `embeddingStatus` to
+   * its last-assigned literal across the awaits — `reconcileEmbedding()`
+   * mutates it, and the whole point of those checks is to see that mutation.
+   */
+  private isEmbeddingReady(): boolean {
+    return this.embeddingStatus === "ready";
+  }
+
+  /**
+   * THE SINGLE TRANSITION INTO `ready` — every path reports through here, so
+   * the terminal line, the console line and the overlay can never disagree
+   * about how the model became ready.
+   *
+   * The overlay fires only when the operator was previously told `pulling` or
+   * `failed`: a routine idle→ready at boot (model already installed) is not
+   * news, and an overlay claiming "Pulled …" for a download that never ran
+   * would be exactly the confident wrong answer this state machine exists to
+   * prevent.
+   */
+  private markEmbeddingReady(source: string): void {
+    const previous = this.embeddingStatus;
+    if (previous === "ready") return;
+    this.embeddingStatus = "ready";
+    this.embeddingError = null;
+    this.stopEmbeddingReconcile();
+    publishLine("out", `✓ ${EMBEDDING_MODEL} is installed (${source}).`);
+    console.log(`[OllamaManager] Embedding model "${EMBEDDING_MODEL}" ready — ${source}.`);
+    if (previous === "pulling" || previous === "failed") {
+      publishNodeEvent({
+        kind: "info",
+        title: "Embedding model ready",
+        detail: `Pulled "${EMBEDDING_MODEL}" — local embeddings are now available.`,
+      });
+    }
+  }
+
+  /**
+   * ORDERS ONE `/api/tags` RECONCILE — one pending timer at a time.
+   *
+   * The chain is self-perpetuating while the status is not `ready`: it
+   * reschedules at the fast cadence during a pull, the slow cadence otherwise
+   * (a failed pull keeps looking, because the model can still appear from
+   * another path), and reaching `ready` breaks the chain for good. Delay zero
+   * means "tick as soon as the loop is free", which is how `ensureModelsPulled`
+   * gets a boot-time answer without a blocking round-trip.
+   */
+  private scheduleEmbeddingReconcile(delayMs: number): void {
+    if (this.embeddingReconcileTimer || this.embeddingStatus === "ready") return;
+    this.embeddingReconcileTimer = setTimeout(() => {
+      this.embeddingReconcileTimer = null;
+      void this.reconcileEmbedding().then((found) => {
+        if (found || this.embeddingStatus === "ready") return;
+        this.scheduleEmbeddingReconcile(
+          this.embeddingStatus === "pulling" ? EMBEDDING_RECONCILE_FAST_MS : EMBEDDING_RECONCILE_SLOW_MS,
+        );
+      });
+    }, delayMs);
+    this.embeddingReconcileTimer.unref?.();
+  }
+
+  /** Cancels a pending reconcile. Safe when none is scheduled. */
+  private stopEmbeddingReconcile(): void {
+    if (this.embeddingReconcileTimer) {
+      clearTimeout(this.embeddingReconcileTimer);
+      this.embeddingReconcileTimer = null;
+    }
+  }
+
+  /**
    * DYNAMIC MODEL SIZING + LOCAL EMBEDDING — pulls the hardware-appropriate
    * generation model and the embedding model so the node is ready to serve
    * both chat/generation and embeddings with no operator action.
+   *
+   * EMBEDDING FIRST, AND WHY. The embedding model is a ~100 MB download while
+   * the generation model can be several GB; the old ordering put the big pull
+   * in front, so on a fresh node the embedding pull had not even been ATTEMPTED
+   * ten minutes in — while the tile already claimed "pulling…". Running the
+   * small one first (bounded at 10 minutes) means the tile reaches a truthful
+   * `ready`/`failed` long before the generation model finishes, and the
+   * reconcile chain is armed before either starts so an already-installed
+   * model reports `ready` on the very first tick with no download at all.
+   *
+   * Never throws — a failure here is reported through the embedding tile and
+   * the terminal, not by taking down the caller's background chain.
    */
   private async ensureModelsPulled(): Promise<void> {
+    this.scheduleEmbeddingReconcile(0);
+    await this.pullEmbeddingModel();
+
     const client = new OllamaClient();
     try {
       await client.pullModel(this.model);
@@ -584,21 +931,6 @@ class OllamaManager {
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
       console.warn(`[OllamaManager] Failed to pull "${this.model}" — ${this.lastError}`);
-    }
-    try {
-      await client.pullModel(EMBEDDING_MODEL);
-      this.embeddingModelReady = true;
-      publishNodeEvent({
-        kind: "info",
-        title: "Embedding model ready",
-        detail: `Pulled "${EMBEDDING_MODEL}" — local embeddings are now available.`,
-      });
-    } catch (error) {
-      console.warn(
-        `[OllamaManager] Failed to pull embedding model "${EMBEDDING_MODEL}" — ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
     }
   }
 

@@ -1343,6 +1343,33 @@ export function createApp(): Express {
     res.status(result.healed ? 200 : 500).json({ success: result.healed, message: result.message });
   });
 
+  /*
+    RETRY FOR THE EMBEDDING MODEL TILE — the action behind "failed (click to
+    retry)".
+
+    NO PADLOCK, DELIBERATELY. The pull is the same autonomic operation the node
+    already performs on its own at boot; the tile only offers a retry AFTER that
+    operation failed, so gating it behind the unlock would make the button
+    decorative on a node in full autonomic control (the same reasoning as the
+    self-heal route below).
+
+    The response returns immediately either way: an already-installed model is
+    reconciled against `/api/tags` synchronously (fast), while a real pull runs
+    in the background, streaming progress into the Live Engine Terminal — the
+    panel's own 5s poll then picks up the pulling → ready/failed transition.
+  */
+  app.post("/api/ollama/embedding-pull", requireDashboardAuth, async (_req: Request, res: Response) => {
+    if (await ollamaManager.reconcileEmbedding()) {
+      res.json({ success: true, message: "The embedding model is already installed — ready." });
+      return;
+    }
+    void ollamaManager.pullEmbeddingModel();
+    res.json({
+      success: true,
+      message: "Pulling the embedding model — progress streams into the Live Engine Terminal.",
+    });
+  });
+
   app.post("/api/scraper/self-heal", requireDashboardAuth, async (_req: Request, res: Response) => {
     if (!orchestratorRef) {
       res.status(409).json({

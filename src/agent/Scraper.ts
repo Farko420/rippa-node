@@ -620,18 +620,24 @@ async function extractSanitizedBody(page: Page): Promise<string> {
 
 /**
  * COUNTS THINGS WORTH SENDING TO THE LLM — a cheap "is this page worth anything?"
- * signal for the live crawl stream.
+ * signal for the live crawl stream, and the zero-yield detector behind the
+ * forager's 7-day crawl cooldown.
  *
  * THE HEURISTIC IS DELIBERATELY CRUDE AND DELIBERATELY NOT A CLAIM. It counts lines
  * that mention a named place-type or carry coordinates, because that is what the
  * extractor downstream actually wants. It is shown to an operator as "N place
- * candidates" — a glanceable hint about yield, not a verdict, and nothing in the
- * node's behaviour depends on the number being right.
+ * candidates" — a glanceable hint about yield, not a verdict.
+ *
+ * ONE BEHAVIOUR NOW DEPENDS ON IT READING ZERO: a page that reads cleanly (HTTP 200)
+ * but yields no candidate lines is treated as zero-yield — the forager marks it
+ * completed and cools the URL down for a week instead of re-crawling it on every
+ * pass forever. A false zero therefore delays ONE url's re-check by seven days,
+ * the cheapest possible failure mode for a deliberately crude counter.
  *
  * `countPlaceCandidates` rather than a general "score" so the terminal line reads as
  * what it is: a rough count, not a score the node trusts.
  */
-function countPlaceCandidates(text: string): number {
+export function countPlaceCandidates(text: string): number {
   const patterns =
     /\b(?:national park|state park|reservoir|campground|campsite|caravan park|lookout|waterfall|beach|track|trail|gorge|creek|river|mountain|lagoon|hot springs)\b/gi;
   const coords = /-?\d{1,3}\.\d{3,}\s*,\s*-?\d{1,3}\.\d{3,}/g;

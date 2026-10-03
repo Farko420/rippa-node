@@ -7,13 +7,15 @@ import {
   isDeepBrainReady,
   markKnowledgeSynced,
   markPlaceVerified,
+  recordCrawlCooldown,
+  selectActiveCrawlCooldowns,
   selectForageTargets,
   selectScrapedSourceUrls,
   setRawLoreStatus,
   type ForageTargetRow,
 } from "../db/database";
 import type { OllamaClient, VerifiedFact } from "../agent/OllamaClient";
-import type { ScraperService } from "../agent/Scraper";
+import { countPlaceCandidates, type ScraperService } from "../agent/Scraper";
 import type { SwarmClient } from "../network/SwarmClient";
 
 /**
@@ -62,6 +64,18 @@ const TARGET_BATCH_LIMIT = 9;
 const RECENTLY_VERIFIED_MS = 6 * 60 * 60_000;
 /** How long a target that just failed is left alone. Grows with each failure. */
 const FAILURE_BACKOFF_MS = [0, 5 * 60_000, 30 * 60_000, 6 * 60 * 60_000];
+/**
+ * HOW LONG A ZERO-YIELD URL STAYS OUT OF THE QUEUE.
+ *
+ * A page that returns HTTP 200, extracts cleanly, and yields ZERO place
+ * candidates was the reported spin: `last_verified` never advanced (no fact to
+ * stamp it for), so `selectForageTargets` handed the SAME URL back on every
+ * pass and the scraper re-crawled it forever while every other target starved.
+ * Seven days says "this was read recently and had nothing — believe it", and
+ * it is PERSISTED (see `crawl_cooldowns` in db/database.ts) so a restart at
+ * 3am does not resurrect the hammering.
+ */
+const ZERO_YIELD_COOLDOWN_MS = 7 * 24 * 60 * 60_000;
 /** Seed sources used only when the brain has nothing to forage yet. */
 const SEED_URLS: readonly string[] = [
   "https://parks.desi.qld.gov.au/parks/lamington",
@@ -120,6 +134,8 @@ interface ForageSession {
   fact: VerifiedFact | null;
   knowledgeId: number | null;
   promoted: boolean;
+  /** Place-candidate count of the acquired text — 0 arms the crawl cooldown. */
+  candidates: number;
 }
 
 export class AutonomousForager {
@@ -252,6 +268,7 @@ export class AutonomousForager {
       fact: null,
       knowledgeId: null,
       promoted: false,
+      candidates: 0,
     };
     return this.session;
   }
@@ -268,8 +285,15 @@ export class AutonomousForager {
    */
   private nextTarget(): ForageTargetRow | null {
     const now = Date.now();
+    // Read fresh on every pick, so a cooldown armed mid-pass takes effect on
+    // the NEXT selection — this is the explicit "queue advances past the
+    // zero-yield URL" step, not a side effect of anything else.
+    const cooled = this.cooledDownUrls();
     for (const candidate of selectForageTargets(TARGET_BATCH_LIMIT)) {
       const key = targetKey(candidate);
+      // A URL still under its zero-yield cooldown is skipped outright — it was
+      // read, it yielded nothing, and re-reading it sooner adds no knowledge.
+      if (candidate.url && cooled.has(candidate.url)) continue;
       // A target still cooling off after a failure is skipped, not re-attempted.
       if ((this.backoffUntil.get(key) ?? 0) > now) continue;
       // A place checked in the last few hours does not need re-reading. Without
@@ -282,6 +306,20 @@ export class AutonomousForager {
   }
 
   /**
+   * THE QUEUE'S "DO NOT RE-READ" SET — every URL currently under a zero-yield
+   * cooldown. Guarded because a database hiccup must never take down the idle
+   * loop: an empty set merely forgets the cooldown for one pass (recoverable),
+   * a crash here would be the exact class of bug this work is fixing.
+   */
+  private cooledDownUrls(): Set<string> {
+    try {
+      return new Set(selectActiveCrawlCooldowns());
+    } catch {
+      return new Set();
+    }
+  }
+
+  /**
    * THE COLD-START PATH. A brand-new node has an empty mirror, so the database
    * genuinely has nothing to offer and "never idle" would mean nothing at all.
    * Seeds fill that gap until the first bundle lands — and are skipped entirely
@@ -290,7 +328,10 @@ export class AutonomousForager {
    */
   private nextSeed(): ForageTargetRow | null {
     const scraped = new Set(selectScrapedSourceUrls());
-    const pending = SEED_URLS.filter((url) => !scraped.has(url));
+    const cooled = this.cooledDownUrls();
+    // Seeds obey the same cooldown as every other URL — a seed that yielded
+    // nothing is no more worth a second visit than a mirrored place is.
+    const pending = SEED_URLS.filter((url) => !scraped.has(url) && !cooled.has(url));
     if (pending.length === 0) return null;
     const url = pending[this.seedCursor % pending.length];
     this.seedCursor += 1;
@@ -345,6 +386,9 @@ export class AutonomousForager {
 
     if (target.raw_text && target.raw_text.trim()) {
       session.text = target.raw_text;
+      // Same yield accounting as the network path — a zero-candidate text is
+      // pointless to re-select whether or not it cost a crawl to obtain.
+      this.noteYield(session);
       return;
     }
     if (!target.url) {
@@ -373,6 +417,33 @@ export class AutonomousForager {
     if (!session.loreId) {
       session.loreId = insertRawLore("forage", interrupted, target.url);
     }
+    this.noteYield(session);
+  }
+
+  /**
+   * RECORDS WHAT THE ACQUIRED TEXT YIELDED — and arms the zero-yield cooldown.
+   *
+   * A successful read (HTTP 200 + extractable body) that produced ZERO place
+   * candidates is the reported spin case: the page is fine, it simply has
+   * nothing the extractor wants, and without this the same URL would be handed
+   * back by `selectForageTargets` on the next pass, and the one after that.
+   *
+   * Armed HERE — right after the crawl, before the extract stage runs — rather
+   * than in `persist`, so even a thrown model call (which never reaches
+   * `persist`) cannot leave the URL in the active queue. This is the cooldown
+   * half of the fix; the visited/completed stamping lives in `persist`, where
+   * the extraction result is known.
+   */
+  private noteYield(session: ForageSession): void {
+    session.candidates = countPlaceCandidates(session.text ?? "");
+    if (session.candidates > 0) return;
+    const url = session.target.url;
+    if (!url) return;
+    recordCrawlCooldown(url, ZERO_YIELD_COOLDOWN_MS, "0 place candidates");
+    console.log(
+      `[Swarm] 0 place candidates from "${session.target.label}" — ` +
+        `URL marked completed, cooled down for 7 days.`,
+    );
   }
 
   /**
@@ -390,18 +461,41 @@ export class AutonomousForager {
   /**
    * STAGE 3 — PERSIST LOCALLY. Synchronous, so a preempt can never tear it.
    *
-   * THE CURSOR IS ONLY MOVED ON SUCCESS, and this is the single most important
-   * line in the file. A place whose scrape 404s, times out, or fails extraction
-   * must keep its old `last_verified`, or the node silently retires a broken
-   * URL and never looks at it again — a placeholder that can never be filled.
+   * THE CURSOR MOVES WHEN THE CRAWL COMPLETED — INCLUDING A ZERO-YIELD CRAWL.
+   * This is a deliberate change from "only when a fact was learned". A page
+   * that returns 200 and yields 0 place candidates used to leave
+   * `last_verified` untouched, so `selectForageTargets` handed the SAME URL
+   * back on every pass: the scraper hammered one page (the reported
+   * Bluff-Knoll spin) while every other target starved. The crawl succeeded —
+   * recording it as visited is what advances the queue pointer.
+   *
+   * WHAT IS STILL PROTECTED. Failures — a 404, a timeout, a thrown extraction
+   * — never reach this method (they throw in `acquire`/`extract` and are backed
+   * off by `deferFailure`), so a genuinely broken URL still keeps its old
+   * `last_verified` and is retried later. And nothing is lost by stamping a
+   * completed crawl: the evidence stays in `raw_lore` and is re-extracted for
+   * free from the stored text, without spending another crawl slot.
+   *
+   * ZERO-YIELD ROWS ARE TERMINAL (`completed`, not `unverified`): text with no
+   * candidates has nothing worth re-extracting, so leaving the row in the
+   * retry queue would spin local model calls instead of crawls — the same bug,
+   * one layer down. The 7-day URL cooldown itself was already armed in
+   * `acquire` (see {@link noteYield}).
    */
   private persist(session: ForageSession): void {
     const { target, fact } = session;
+    const zeroYield = session.candidates === 0;
 
-    // No usable fact: the evidence is still kept, and the row stays eligible.
+    // No usable fact — but extraction COMPLETED, so the crawl succeeded.
     if (!fact) {
-      if (session.loreId) setRawLoreStatus(session.loreId, "unverified");
-      console.log(`[Swarm] No fact extracted from "${target.label}" — evidence kept for retry.`);
+      // COMPLETED/VISITED, even though 0 candidates were extracted.
+      if (target.place_id) markPlaceVerified(target.place_id);
+      if (session.loreId) setRawLoreStatus(session.loreId, zeroYield ? "completed" : "unverified");
+      console.log(
+        zeroYield
+          ? `[Swarm] 0 place candidates from "${target.label}" — marked completed; URL cools down for 7 days.`
+          : `[Swarm] No fact extracted from "${target.label}" — evidence kept for retry${target.place_id ? "; crawl recorded as visited" : ""}.`,
+      );
       return;
     }
 
@@ -468,7 +562,10 @@ export class AutonomousForager {
     if (!fact) {
       return {
         status: "learned",
-        message: `no fact extracted from "${target.label}" — nothing to file upstream.`,
+        message:
+          session.candidates === 0
+            ? `0 place candidates from "${target.label}" — marked completed, cooling the URL down for 7 days.`
+            : `no fact extracted from "${target.label}" — nothing to file upstream.`,
         target,
         fed: false,
       };

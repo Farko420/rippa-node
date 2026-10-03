@@ -1013,6 +1013,8 @@ if (navToggle) {
 
 let ollamaUnlocked = false;
 let ollamaManagedState = false;
+/** True only while the Embedding Model tile last reported a FAILED pull — arms the retry click. */
+let ollamaEmbedFailed = false;
 
 /** Paints a shared status badge (Active / Error / Downloading / Idle). */
 function setStatusBadge(id, state) {
@@ -1021,6 +1023,40 @@ function setStatusBadge(id, state) {
   const labels = { active: "Active", error: "Error", downloading: "Downloading", idle: "Idle" };
   badge.textContent = labels[state] || "Idle";
   badge.className = "status-badge status-" + (labels[state] ? state : "idle");
+}
+
+/**
+ * EMBEDDING MODEL TILE — three visible states, because "pulling…" forever is a lie.
+ *
+ * The server owns the state machine (`embeddingModelStatus` on
+ * /api/ollama/status, backed by a 10-minute AbortController and periodic
+ * reconciliation against GET /api/tags):
+ *   ready   -> the model name; confirmed against the tag list, not hoped for
+ *   pulling -> the NDJSON pull stream is open; progress hits the terminal
+ *   failed  -> the pull timed out or errored — clicking the tile retries it
+ *   idle    -> before the first attempt; shown as pulling (it is about to run)
+ */
+function renderEmbeddingTile(status) {
+  const tile = $("ollamaEmbed");
+  const state = status.embeddingModelStatus || (status.embeddingModelReady ? "ready" : "pulling");
+  ollamaEmbedFailed = state === "failed";
+  if (!tile) return;
+  if (state === "ready") {
+    setText("ollamaEmbed", status.embeddingModel || "ready");
+    tile.style.cursor = "";
+    tile.title = "Local embedding model installed.";
+  } else if (state === "failed") {
+    setText("ollamaEmbed", "failed (click to retry)");
+    tile.style.cursor = "pointer";
+    tile.title =
+      "The embedding model pull failed" +
+      (status.embeddingModelError ? " — " + status.embeddingModelError : "") +
+      ". Click to retry.";
+  } else {
+    setText("ollamaEmbed", "pulling…");
+    tile.style.cursor = "";
+    tile.title = "Downloading the embedding model — progress streams into the Live Engine Terminal.";
+  }
 }
 
 function renderOllamaStatus(status) {
@@ -1033,7 +1069,7 @@ function renderOllamaStatus(status) {
   setText("ollamaTask", status.task || "Idle");
   setText("ollamaRestarts", String(status.restartCount || 0));
   setText("ollamaRam", status.ramGb ? status.ramGb + " GB" : "—");
-  setText("ollamaEmbed", status.embeddingModelReady ? (status.embeddingModel || "ready") : "pulling…");
+  renderEmbeddingTile(status);
   setStatusBadge(
     "ollamaStatusBadge",
     status.lastError ? "error" : status.running ? "active" : status.managed ? "downloading" : "idle",
@@ -1163,6 +1199,25 @@ function wireSelfHeal(btnId, path, after) {
       btn.textContent = original;
       if (after) void after();
     }
+  });
+}
+
+// CLICK-TO-RETRY for the Embedding Model tile. Armed ONLY while the last poll
+// reported a failed pull, so a stray click on a healthy or in-progress tile
+// does nothing. The route returns immediately; the 5s poll picks up the
+// pulling -> ready/failed transition, and progress lands in the terminal.
+const ollamaEmbedTile = $("ollamaEmbed");
+if (ollamaEmbedTile) {
+  ollamaEmbedTile.addEventListener("click", async () => {
+    if (!ollamaEmbedFailed) return;
+    ollamaEmbedFailed = false;
+    try {
+      const { data } = await api("/api/ollama/embedding-pull", { method: "POST", body: "{}" });
+      showAlert(data.message || "Retrying the embedding model pull…", "ok");
+    } catch (err) {
+      showAlert("Could not retry the embedding model pull.", "err");
+    }
+    void refreshOllama();
   });
 }
 

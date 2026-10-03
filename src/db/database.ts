@@ -169,6 +169,21 @@ const TABLES_SQL = `
     value      TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  -- THE CRAWL COOLDOWN — "this URL was read recently and yielded nothing".
+  --
+  -- Kept in the database rather than an in-memory map on purpose: the spin this
+  -- fixes (one zero-candidate page re-crawled on every pass) must stay fixed
+  -- across restarts, and a memory map would forget the verdict at 3am and start
+  -- hammering again on the next boot. The "until" column is an ISO timestamp
+  -- compared against the clock at read time, so an expired row simply stops
+  -- matching — no timer needs to fire for the cooldown to lapse.
+  CREATE TABLE IF NOT EXISTS crawl_cooldowns (
+    url        TEXT PRIMARY KEY,
+    until      TEXT NOT NULL,
+    reason     TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `;
 
 // Indexes are created separately so column migrations can run in between
@@ -516,6 +531,52 @@ export function selectForageTargets(limit: number): ForageTargetRow[] {
     if (addedThisRound === 0) break; // every queue exhausted
   }
   return merged;
+}
+
+// ---------------------------------------------------------------------------
+// CRAWL COOLDOWNS — the queue's "do not re-read this yet" list
+// ---------------------------------------------------------------------------
+
+/**
+ * ARMS (OR RE-ARMS) A COOLDOWN ON `url`.
+ *
+ * This is the stop-the-spin half of the zero-yield fix: a page that returned
+ * HTTP 200 and extracted cleanly but yielded NOTHING is recorded here so
+ * `selectForageTargets` can skip it for the next `cooldownMs` instead of the
+ * queue handing the same URL back on every pass.
+ *
+ * Written as an upsert keyed on the URL, so a second visit inside the window
+ * extends rather than duplicates, and expired rows are purged on the write path
+ * — the table is tiny either way, but "housekeeping happens somewhere" is better
+ * than "housekeeping happens never".
+ *
+ * Master-only (throws on satellites / before `initializeDeepBrain`), like every
+ * other helper in this file.
+ */
+export function recordCrawlCooldown(url: string, cooldownMs: number, reason: string): void {
+  if (!url) return;
+  const db = getDeepBrain();
+  const now = Date.now();
+  db.prepare("DELETE FROM crawl_cooldowns WHERE until <= ?").run(new Date(now).toISOString());
+  db.prepare(
+    `INSERT INTO crawl_cooldowns (url, until, reason) VALUES (?, ?, ?)
+       ON CONFLICT(url) DO UPDATE SET until    = excluded.until,
+                                      reason   = excluded.reason,
+                                      updated_at = datetime('now')`,
+  ).run(url, new Date(now + cooldownMs).toISOString(), reason);
+}
+
+/**
+ * EVERY URL WHOSE COOLDOWN IS STILL LIVE — what the forager consults before it
+ * picks a target. Expired rows never appear (compared against the caller's
+ * `nowIso`, defaulting to this instant), so no timer has to fire for a cooldown
+ * to lapse: it simply stops being returned.
+ */
+export function selectActiveCrawlCooldowns(nowIso = new Date().toISOString()): string[] {
+  const rows = getDeepBrain()
+    .prepare("SELECT url FROM crawl_cooldowns WHERE until > ?")
+    .all(nowIso) as Array<{ url: string }>;
+  return rows.map((row) => row.url);
 }
 
 /**
