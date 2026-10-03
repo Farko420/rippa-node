@@ -202,10 +202,10 @@ export class OtaUpdater {
    *          was committed (the process exits inside `applyIfNewer`, so this only
    *          returns on the non-exiting paths) or the dev-mode mock stood in for
    *          one. false means genuinely not applied: an unusable payload, a
-   *          refused handoff, or a failed download. Never throws — a throwing
+   *          refused handoff, a failed download, or "rejected_downgrade" for a refused downgrade. Never throws — a throwing
    *          updater would leave the Mothership waiting with no outcome at all.
    */
-  async forceUpdate(options: { allowDowngrade?: boolean } = {}): Promise<boolean> {
+  async forceUpdate(options: { allowDowngrade?: boolean } = {}): Promise<boolean | "rejected_downgrade"> {
     console.log("[Updater] FORCE_UPDATE received — resolving the Mothership payload.");
 
     if (this.updating) {
@@ -252,11 +252,18 @@ export class OtaUpdater {
     });
   }
 
-  /** Downloads, verifies and hands off to the replacement script. */
+  /**
+   * Downloads, verifies and hands off to the replacement script.
+   *
+   * Returns `"rejected_downgrade"` (rather than `false`) when the downgrade
+   * guard refused the advertised build, so the caller can tell "this node is
+   * already newer — retire the command" apart from a transient failure the
+   * Mothership may legitimately want to retry.
+   */
   private async applyIfNewer(
     latest: LatestVersionInfo,
     options: ApplyOptions = {},
-  ): Promise<boolean> {
+  ): Promise<boolean | "rejected_downgrade"> {
     const force = options.force === true;
     const allowDowngrade = options.allowDowngrade === true;
 
@@ -284,7 +291,10 @@ export class OtaUpdater {
           `node is running v${APP_VERSION}. Re-send the command with ` +
           `allow_downgrade: true if that is really intended.`,
       );
-      return false;
+      // A refusal is terminal, not transient: the node is already newer than
+      // the target, so reporting `false` here left the Mothership's queue entry
+      // outstanding and it re-dispatched the same command on every heartbeat.
+      return "rejected_downgrade";
     }
 
     /*

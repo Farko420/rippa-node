@@ -179,7 +179,7 @@ export interface CommandHandlers {
    *          (unusable payload, refused handoff, failed download, refused
    *          downgrade).
    */
-  forceUpdate: (options?: { allowDowngrade?: boolean }) => Promise<boolean> | boolean | void;
+  forceUpdate: (options?: { allowDowngrade?: boolean }) => Promise<boolean | "rejected_downgrade"> | boolean | "rejected_downgrade" | void;
   /** Enable or disable satellite-to-satellite mesh routing. */
   setP2pEnabled: (enabled: boolean) => Promise<void> | void;
   /** Reports the node's current P2P state, so TOGGLE_P2P can invert it. */
@@ -212,7 +212,7 @@ export interface CommandHandlers {
        * "in_progress" up front, because at that moment the outcome is not yet
        * knowable and claiming success would be a lie.
        */
-      status?: "completed" | "failed" | "in_progress";
+      status?: "completed" | "failed" | "in_progress" | "rejected_downgrade";
     },
   ) => Promise<void> | void;
 }
@@ -403,7 +403,7 @@ async function acknowledge(
   handlers: CommandHandlers,
   command: RemoteCommandName,
   detail: string,
-  context?: { commandId?: string; status?: "completed" | "failed" | "in_progress" },
+  context?: { commandId?: string; status?: "completed" | "failed" | "in_progress" | "rejected_downgrade" },
 ): Promise<void> {
   if (!handlers.acknowledgeCommand) return;
   try {
@@ -552,7 +552,27 @@ export async function executePendingCommands(
           const committed = await handlers.forceUpdate({
             ...(wantsDowngrade(entry) ? { allowDowngrade: true } : {}),
           });
-          if (committed === false) {
+          if (committed === "rejected_downgrade") {
+            /*
+              A REFUSED DOWNGRADE IS A TERMINAL ACKNOWLEDGEMENT, not a failure
+              to be retried.
+
+              The node is already running a NEWER build than the one the
+              Mothership advertised, so nothing the cloud could re-send would
+              ever change that answer. Reporting `failed` (the old behaviour)
+              left the row outstanding and `drainNodeCommands` handed the same
+              command back on every heartbeat — the "FORCE_UPDATE to v1.0.16
+              forever" loop. `rejected_downgrade` says so explicitly, and the
+              Mothership settles the row with it.
+            */
+            await acknowledge(
+              handlers,
+              "FORCE_UPDATE",
+              "rejected_downgrade — this node is already running a newer build than the target version; clearing the command",
+              { ...ackContext, status: "rejected_downgrade" },
+            );
+            acknowledgedUpFront = true;
+          } else if (committed === false) {
             await acknowledge(
               handlers,
               "FORCE_UPDATE",

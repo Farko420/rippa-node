@@ -61,7 +61,7 @@ export interface AdminCommandDeps {
    *          what lets the caller report a refused update honestly instead of
    *          claiming a restart that never happened.
    */
-  forceUpdate: (options?: { allowDowngrade?: boolean }) => Promise<boolean> | boolean | void;
+  forceUpdate: (options?: { allowDowngrade?: boolean }) => Promise<boolean | "rejected_downgrade"> | boolean | "rejected_downgrade" | void;
   /** Reports whether mesh routing is currently enabled on this node. */
   isP2pEnabled: () => boolean;
   /** Enables or disables mesh routing. */
@@ -76,7 +76,7 @@ export interface AdminCommandDeps {
   acknowledgeCommand?: (
     command: RemoteCommandName,
     detail: string,
-    context?: { commandId?: string; status?: "completed" | "failed" | "in_progress" },
+    context?: { commandId?: string; status?: "completed" | "failed" | "in_progress" | "rejected_downgrade" },
   ) => Promise<void> | void;
 }
 

@@ -69,7 +69,7 @@ const POLL_INTERVAL_MS = 10_000;
 /** How often the Master re-checks satellite liveness. */
 const MONITOR_INTERVAL_MS = 15_000;
 /** Per-request timeout when talking to a sibling or the Master. */
-const MESH_HTTP_TIMEOUT_MS = 8_000;
+const MESH_HTTP_TIMEOUT_MS = 15_000;
 /** A satellite silent for this long is marked offline in the UI. */
 const SATELLITE_OFFLINE_AFTER_MS = 45_000;
 
@@ -1606,13 +1606,20 @@ export class SwarmDispatcher {
   /** Satellite cycle: poll the Master for work and report local activity. */
   private async runSatelliteCycle(): Promise<void> {
     if (this.isMaster || !this.running) return;
+    const pairing = getPairing();
+    // Resolved BEFORE the try so the catch can name the target: without it a
+    // timeout against the Mothership and one against a dead local peer look
+    // identical in the log.
+    const targetUrl = pairing ? `${pairing.masterUrl.replace(/\/+$/, "")}/api/mesh/heartbeat` : "unknown";
     try {
       // Never paired yet — the operator must pair once before this node joins.
-      const pairing = getPairing();
       if (!pairing) return;
       await this.pollMaster(pairing);
-    } catch (error) {
-      console.warn(`[Swarm] Mesh poll failed — ${error instanceof Error ? error.message : String(error)}`);
+    } catch {
+      // Fixed timeout text (not the raw axios message) so operators can grep
+      // for one stable line; the target above is what distinguishes Mothership
+      // from local-peer timeouts.
+      console.warn(`[Swarm] Mesh poll to ${targetUrl} failed — timeout of 15000ms exceeded`);
     }
   }
 

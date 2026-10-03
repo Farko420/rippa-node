@@ -179,7 +179,7 @@ async function main(): Promise<void> {
     const acknowledgeUpstream = async (
       command: string,
       detail: string,
-      context?: { commandId?: string; status?: "completed" | "failed" | "in_progress" },
+      context?: { commandId?: string; status?: "completed" | "failed" | "in_progress" | "rejected_downgrade" },
     ): Promise<void> => {
       /*
         POSTED TO THE DEDICATED ACK ROUTE, CARRYING THE COMMAND ID.
@@ -235,7 +235,7 @@ async function main(): Promise<void> {
         so a genuine failure is still reported honestly rather than looking like a
         restart that never happened.
       */
-      forceUpdate: (options?: { allowDowngrade?: boolean }): Promise<boolean> =>
+      forceUpdate: (options?: { allowDowngrade?: boolean }) =>
         otaUpdater.forceUpdate(options ?? {}),
       setP2pEnabled: async (enabled: boolean) => {
         // Persisted through nodeAuth so the choice survives a restart.

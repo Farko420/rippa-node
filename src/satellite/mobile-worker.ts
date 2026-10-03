@@ -156,7 +156,7 @@ export class SatelliteWorker {
       const response = await axios.post(
         `${masterUrl}/api/mesh/heartbeat`,
         { status: "idle" },
-        { timeout: 8000, headers: this.meshHeaders() },
+        { timeout: 15000, headers: this.meshHeaders() },
       );
 
       const task = response.data?.task as TaskAssignment | undefined;

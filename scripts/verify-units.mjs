@@ -1242,6 +1242,137 @@ check(
   `gate@${swarmGate} download@${swarmDownload}`,
 );
 
+// --- 8h. THE REFUSED DOWNGRADE MUST BE RETIRED, NOT RETRIED -------------------
+/*
+ * The reported loop: the Mothership advertised v1.0.16 to a node running
+ * v1.0.19. The node refused correctly, but the refusal was reported as a bare
+ * `false` — and the queue entry it belonged to stayed outstanding, so
+ * `drainNodeCommands` handed the same FORCE_UPDATE back on every heartbeat,
+ * forever. These checks pin the three things that break that loop:
+ *
+ *   1. the updater returns a DISTINCT signal for "refused because I am newer",
+ *      so the executor can tell it apart from a transient download failure;
+ *   2. the executor turns that signal into a terminal acknowledgement carrying
+ *      the command id — the only thing that clears the cloud's row;
+ *   3. the Mothership's pre-check stops the NEXT command being written at all.
+ *
+ * (1) is asserted at the source because the guard sits inside a private method
+ * behind a network call, and (2)/(3) are exercised for real.
+ */
+check(
+  "OtaUpdater's downgrade guard returns the distinct rejected_downgrade signal",
+  /return\s+"rejected_downgrade"/.test(otaSource),
+);
+check(
+  "forceUpdate and applyIfNewer both declare the rejected_downgrade return",
+  (otaSource.match(/Promise<boolean \| "rejected_downgrade">/g) ?? []).length >= 2,
+  `${(otaSource.match(/Promise<boolean \| "rejected_downgrade">/g) ?? []).length} declaration(s)`,
+);
+
+resetExecutedCommands();
+const downgradeAcks = [];
+await executePendingCommands([{ id: "dg-ack-1", command: "FORCE_UPDATE" }], {
+  ...ackBase,
+  forceUpdate: () => "rejected_downgrade",
+  acknowledgeCommand: (command, detail, context) => downgradeAcks.push({ command, detail, context }),
+});
+check(
+  "a refused downgrade is acknowledged with a terminal rejected_downgrade status",
+  downgradeAcks.length === 2 && downgradeAcks[1].context?.status === "rejected_downgrade",
+  JSON.stringify(downgradeAcks.map((a) => a.context?.status)),
+);
+check(
+  "the downgrade acknowledgement still carries the command id (what clears the row)",
+  downgradeAcks[1]?.context?.commandId === "dg-ack-1",
+  JSON.stringify(downgradeAcks[1]?.context),
+);
+check(
+  "the downgrade acknowledgement is NOT filed as a generic failure the cloud may retry",
+  downgradeAcks[1]?.context?.status !== "failed",
+  downgradeAcks[1]?.context?.status,
+);
+
+// --- 8i. THE MESH POLL TIMEOUT IS 15s AND NAMES ITS TARGET --------------------
+/*
+ * The reported symptom was `[Swarm] Mesh poll failed — timeout of 8000ms
+ * exceeded` with no URL, which made it impossible to tell a slow Mothership
+ * (serverless cold start) from a dead local peer. Both halves are asserted at
+ * the source: the constant, and the log line that interpolates the target.
+ */
+const dispatcherSource = readFileSync(
+  path.join(ROOT, "src", "services", "swarmDispatcher.ts"),
+  "utf8",
+);
+check(
+  "the mesh poll timeout is raised to 15s for serverless cold starts",
+  /const MESH_HTTP_TIMEOUT_MS = 15_000;/.test(dispatcherSource),
+  /const MESH_HTTP_TIMEOUT_MS = \S+;/.exec(dispatcherSource)?.[0],
+);
+check(
+  "the mesh poll failure log names the target URL",
+  dispatcherSource.includes("`[Swarm] Mesh poll to ${targetUrl} failed — timeout of 15000ms exceeded`"),
+);
+check(
+  "no 8000ms mesh poll timeout remains in the dispatcher",
+  !/timeout: 8000/.test(dispatcherSource),
+);
+
+const mobileWorkerSource = readFileSync(
+  path.join(ROOT, "src", "satellite", "mobile-worker.ts"),
+  "utf8",
+);
+check(
+  "the mobile satellite's Master poll uses the same 15s timeout",
+  /timeout: 15000/.test(mobileWorkerSource) && !/timeout: 8000/.test(mobileWorkerSource),
+);
+
+// --- 8j. THE MOTHERSHIP'S TWO HALVES OF THE LOOP FIX --------------------------
+/*
+ * Both live in the sibling "Rippa Adventures" repository, so these are skipped
+ * on a standalone Node clone (the same rule section 8f uses) rather than failing
+ * on a path this repository does not own.
+ *
+ * WHAT IS BEING GUARDED. The node's `rejected_downgrade` ack settles the row
+ * that already exists; the pre-check stops a NEW one being written. Ship the
+ * node half without the cloud half and the loop simply moves one heartbeat
+ * later, which is why both are asserted here rather than only in the Node.
+ */
+if (mothershipPresent) {
+  const mothershipSwarm = readFileSync(
+    path.join(ROOT, "..", "Rippa Adventures", "src", "lib", "swarm.ts"),
+    "utf8",
+  );
+  const mothershipAdmin = readFileSync(
+    path.join(ROOT, "..", "Rippa Adventures", "src", "lib", "swarm-admin.functions.ts"),
+    "utf8",
+  );
+  const mothershipServer = readFileSync(
+    path.join(ROOT, "..", "Rippa Adventures", "src", "lib", "swarm.server.ts"),
+    "utf8",
+  );
+  const mothershipFeed = readFileSync(mothershipFeedPath, "utf8");
+
+  check(
+    "the Mothership settles a rejected_downgrade ack instead of leaving it outstanding",
+    mothershipSwarm.includes('status === "rejected_downgrade"'),
+  );
+  check(
+    "the Mothership pre-checks the node's reported version before queueing a force_ota_update",
+    mothershipAdmin.includes('data.command === "force_ota_update"') &&
+      mothershipAdmin.includes("readNodeReportedVersion") &&
+      mothershipAdmin.includes("compareVersions(nodeVersion, targetVersion) >= 0"),
+  );
+  check(
+    "the heartbeat carries the node's version so the pre-check has something to read",
+    mothershipServer.includes("capability_version = COALESCE(?, capability_version)") &&
+      mothershipSwarm.includes("version: normaliseShortText(source.version"),
+  );
+  check(
+    "the Mothership exposes the same target-version answer to the pre-check",
+    /export function resolveTargetNodeVersion\(\): string \{/.test(mothershipFeed),
+  );
+}
+
 // --- 5. Autonomous task claiming -------------------------------------------
 const { TaskEngine } = await load("dist/services/taskEngine.js");
 const seen = [];

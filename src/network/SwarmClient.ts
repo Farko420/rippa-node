@@ -11,6 +11,7 @@ import {
   type OllamaTelemetry,
 } from "../services/heartbeat";
 import { parseMeshKeySync, type MeshKeySyncDirective } from "../services/meshKeySync";
+import { APP_VERSION } from "../version";
 
 /**
  * SWARM CLIENT â€” secure connection between this node and the Cloudflare Mothership.
@@ -54,6 +55,16 @@ export interface HeartbeatPayload {
   efficiency_score: number;
   /** Node codes currently linked peer-to-peer. */
   connected_satellites: string[];
+  /**
+   * The build this node is RUNNING, e.g. "1.0.19".
+   *
+   * Sent so the Mothership can refuse to queue a `FORCE_UPDATE` the node would
+   * only answer "Refusing to downgrade" to. Without it the cloud's only evidence
+   * of a node's version is a capability report that fires rarely (or never), so
+   * it cannot tell "already current" from "needs updating" and re-dispatches the
+   * command on every heartbeat.
+   */
+  version: string;
   /** Embedded Ollama AI status — server state, model, port, active task. */
   ollama: OllamaTelemetry;
 }
@@ -364,6 +375,9 @@ export class SwarmClient {
       role: env.NODE_ROLE,
       status: this.status,
       timestamp: new Date().toISOString(),
+      // The build, so the Mothership can pre-check `force_ota_update` instead of
+      // queueing a command this node would only refuse as a downgrade.
+      version: APP_VERSION,
       ...buildHeartbeatTelemetry(connectedSatellites, efficiency),
     };
 
@@ -686,7 +700,7 @@ export class SwarmClient {
     /** Human-readable outcome, shown on the fleet dashboard. */
     detail: string;
     /** Set to "failed" when the command did not complete. */
-    status?: "completed" | "failed" | "in_progress";
+    status?: "completed" | "failed" | "in_progress" | "rejected_downgrade";
   }): Promise<boolean> {
     const status = input.status ?? "completed";
     const commandId = input.commandId?.trim() ?? "";
