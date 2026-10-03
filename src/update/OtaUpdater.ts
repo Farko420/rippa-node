@@ -5,7 +5,7 @@ import { pipeline } from "node:stream/promises";
 import axios from "axios";
 import { env } from "../config";
 import { APP_VERSION, APP_VERSION_RESOLVED, isVersionNewer, isVersionOlder } from "../version";
-import { RELEASE_ASSET_NAME, resolveGitHubAssetDownload } from "./githubAsset";
+import { currentReleaseAssetName, resolveGitHubAssetDownload } from "./githubAsset";
 import type { LatestVersionInfo, SwarmClient } from "../network/SwarmClient";
 import {
   HANDOFF_STAMP,
@@ -393,6 +393,12 @@ export class OtaUpdater {
    * is configured the download is switched to GitHub's authenticated API asset
    * endpoint with `Accept: application/octet-stream`; with no token the URL is
    * used unchanged, which is exactly right for a public repository.
+   *
+   * WHY THE RESOLUTION'S LOG LINES ARE COLLECTED AND RE-THROWN. The resolver
+   * already prints each failure it survives (401 vs 404 vs no asset). This
+   * method gathers the same lines and appends them to the error it throws, so
+   * the single line the Mothership records as a FAILED update carries the actual
+   * cause instead of a bare "HTTP 404" that three different faults all produce.
    */
   private async download(
     latest: LatestVersionInfo,
@@ -402,13 +408,22 @@ export class OtaUpdater {
     const headers: Record<string, string> = { Accept: "application/octet-stream" };
     let downloadUrl = latest.downloadUrl;
 
-    const authenticated = await resolveGitHubAssetDownload(latest.downloadUrl);
+    const diagnostics: string[] = [];
+    const authenticated = await resolveGitHubAssetDownload(latest.downloadUrl, {
+      logPrefix: "[OTA]",
+      diagnostics,
+      allowPrerelease: process.env.RIPPA_GITHUB_ALLOW_PRERELEASE === "true",
+    });
     if (authenticated) {
       downloadUrl = authenticated.url;
       Object.assign(headers, authenticated.headers);
     } else if (this.isSameOrigin(latest.downloadUrl)) {
       headers["Authorization"] = `Bearer ${env.NODE_API_KEY}`;
     }
+
+    // One line, however many the resolution produced, appended to any failure so
+    // the log never shows a 404 without the reason it was a 404.
+    const cause = (): string => (diagnostics.length ? ` ${diagnostics.join(" ")}` : "");
 
     let response;
     try {
@@ -428,9 +443,17 @@ export class OtaUpdater {
       if (axios.isAxiosError(error) && error.response?.status === 404) {
         throw new Error(
           `HTTP 404 downloading ${downloadUrl} — either no release asset named ` +
-            `"${RELEASE_ASSET_NAME}" exists on the latest release, or the repository ` +
+            `"${currentReleaseAssetName()}" exists on the latest release, or the repository ` +
             "is PRIVATE and no GITHUB_TOKEN / RIPPA_GITHUB_TOKEN is configured (a " +
-            "private repo 404s every anonymous request)",
+            `private repo 404s every anonymous request).${cause()}`,
+        );
+      }
+      // 401/403 from the ASSET endpoint are just as opaque as the 404 above, and
+      // a rejected token is the single most likely misconfiguration here.
+      if (axios.isAxiosError(error) && (error.response?.status === 401 || error.response?.status === 403)) {
+        throw new Error(
+          `HTTP ${error.response?.status} downloading ${downloadUrl} — GitHub rejected the ` +
+            `configured token: ${statusExplanation(error.response?.status ?? 0)}${cause()}`,
         );
       }
       throw error;
@@ -553,6 +576,26 @@ async function readFirstBytes(filePath: string, count: number): Promise<Buffer> 
 
 function formatMb(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Names the likely cause of a rejected GitHub credential.
+ *
+ * A 401/403 from the asset endpoint means the token itself is wrong — expired,
+ * revoked, or scoped without access to this repository — and that is a
+ * completely different operator task from "the asset is missing". Without this,
+ * both surface as an anonymous HTTP status with no actionable content.
+ */
+function statusExplanation(status: number): string {
+  if (status === 401) {
+    return "the token is missing, expired or malformed. Set RIPPA_GITHUB_TOKEN or " +
+      "GITHUB_TOKEN in the node's .env with read access to the release repository.";
+  }
+  if (status === 403) {
+    return "the token lacks access to this repository, or the GitHub API rate limit " +
+      "for it has been exhausted.";
+  }
+  return "GitHub rejected the request.";
 }
 
 function describeError(error: unknown): string {

@@ -755,6 +755,217 @@ check(
 );
 check("an assetless release resolves to nothing", ghAsset.selectAssetForDownload([], ["rippa-node.exe"]) === null);
 
+// --- 8e-ii. THE DIAGNOSTICS — a 404 that finally says WHY --------------------
+// Every cause of the private-repo 404 (no token, private repo, wrong repo, bad
+// credentials, renamed asset, pre-release-only) produces the SAME opaque HTTP
+// status. A resolver that returns null silently on all of them cannot be
+// diagnosed from a node log, which is exactly the situation being fixed here.
+{
+  const REAL_FETCH = globalThis.fetch;
+  const REAL_WARN = console.warn;
+  const SHORTCUT = "https://github.com/Farko420/rippa-node/releases/latest/download/rippa-node.exe";
+
+  /** Runs `fn` with fetch stubbed and every emitted diagnostic captured. */
+  const capture = async (stub, fn) => {
+    const lines = [];
+    console.warn = (line) => lines.push(String(line));
+    globalThis.fetch = stub;
+    try {
+      return { lines, result: await fn(lines) };
+    } finally {
+      console.warn = REAL_WARN;
+      globalThis.fetch = REAL_FETCH;
+    }
+  };
+  const jsonResponse = (body, ok = true) => ({
+    ok,
+    json: async () => body,
+    text: async () => JSON.stringify(body),
+  });
+
+  // 1. NO TOKEN — the documented warning, and it must not be swallowed.
+  delete process.env.RIPPA_GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  {
+    let asked = 0;
+    const { lines, result } = await capture(
+      async () => { asked += 1; return jsonResponse({}); },
+      () => ghAsset.resolveGitHubAssetDownload(SHORTCUT),
+    );
+    check("with no token the URL is still left untouched", result === null);
+    check("with no token no API call is wasted", asked === 0);
+    check(
+      "with no token the public-fallback warning is emitted verbatim",
+      lines.some((l) =>
+        l.includes("No GITHUB_TOKEN provided") &&
+        l.includes("public unauthenticated download") &&
+        l.includes("will fail if the repo is private")),
+      JSON.stringify(lines),
+    );
+    check(
+      "the no-token warning names the env vars that fix it",
+      lines.some((l) => l.includes("RIPPA_GITHUB_TOKEN") && l.includes("GITHUB_TOKEN")),
+      JSON.stringify(lines),
+    );
+  }
+
+  process.env.RIPPA_GITHUB_TOKEN = "ghp_private_repo";
+
+  // 2. 401 — the body must be echoed, or a bad token is indistinguishable.
+  {
+    const { lines, result } = await capture(
+      async () => ({ ok: false, status: 401, text: async () => '{"message":"Bad credentials"}' }),
+      () => ghAsset.resolveGitHubAssetDownload(SHORTCUT),
+    );
+    check("a 401 falls back to the plain URL", result === null);
+    check(
+      "a 401 logs the status AND GitHub's response body",
+      lines.some((l) => l.includes("401") && l.includes("Bad credentials")),
+      JSON.stringify(lines),
+    );
+  }
+
+  // 3. 404 — must say this is what a private repo answers, not just the number.
+  {
+    const { lines } = await capture(
+      async () => ({ ok: false, status: 404, text: async () => '{"message":"Not Found"}' }),
+      () => ghAsset.resolveGitHubAssetDownload(SHORTCUT),
+    );
+    check(
+      "a 404 explains that a private repo is indistinguishable from a missing one",
+      lines.some((l) => l.includes("404") && /private/i.test(l)),
+      JSON.stringify(lines),
+    );
+  }
+
+  // 4. WRONG REPO / NETWORK — a transport failure is named as such.
+  {
+    const { lines } = await capture(
+      async () => { throw new Error("getaddrinfo ENOTFOUND api.github.com"); },
+      () => ghAsset.resolveGitHubAssetDownload(SHORTCUT),
+    );
+    check(
+      "a DNS failure is reported as a network fault, not an HTTP status",
+      lines.some((l) => l.includes("ENOTFOUND") && /network/i.test(l)),
+      JSON.stringify(lines),
+    );
+  }
+  // 5. THE RENAME — the exact log the runbook greps for. A release that ships
+  // NO .exe at all is the only case that reaches the "Failed to find" branch:
+  // a release with some other .exe still installs via the documented
+  // endsWith(".exe") fallback, which is asserted separately above.
+  {
+    const { lines, result } = await capture(
+      async () => jsonResponse({
+        tag_name: "v1.0.16",
+        assets: [
+          { id: 6, name: "checksums.txt", url: "https://api.github.com/x/6" },
+          { id: 7, name: "source.zip", url: "https://api.github.com/x/7" },
+        ],
+      }),
+      () => ghAsset.resolveGitHubAssetDownload(SHORTCUT),
+    );
+    check("a release with no .exe at all falls back to the plain URL", result === null);
+    check(
+      "a missing .exe asset logs the release tag AND every available asset name",
+      lines.some(
+        (l) =>
+          l.includes("Failed to find .exe asset in release v1.0.16") &&
+          l.includes("Available assets:") &&
+          l.includes("checksums.txt") &&
+          l.includes("source.zip"),
+      ),
+      JSON.stringify(lines),
+    );
+  }
+
+  // 6. PRE-RELEASES — off by default, and that default must not resolve.
+  {
+    const asked = [];
+    const { result } = await capture(
+      async (url) => {
+        asked.push(String(url));
+        return { ok: false, status: 404, text: async () => '{"message":"Not Found"}' };
+      },
+      () => ghAsset.resolveGitHubAssetDownload(SHORTCUT),
+    );
+    check("pre-releases are NOT consulted unless opted in", result === null);
+    check(
+      "only /releases/latest is called without the opt-in",
+      asked.length === 1 && asked[0].endsWith("/releases/latest"),
+      JSON.stringify(asked),
+    );
+  }
+
+  // ...and ON when opted in: /releases/latest skips pre-releases, so the list is
+  // the only endpoint that can see an RC-only repo.
+  {
+    const asked = [];
+    const { result } = await capture(
+      async (url) => {
+        asked.push(String(url));
+        if (String(url).endsWith("/releases/latest")) {
+          return { ok: false, status: 404, text: async () => '{"message":"Not Found"}' };
+        }
+        return jsonResponse([
+          { tag_name: "v1.1.0-rc.1", draft: true, assets: [] },
+          {
+            tag_name: "v1.1.0-rc.1",
+            prerelease: true,
+            assets: [{ id: 21, name: "rippa-node.exe", url: "https://api.github.com/x/21" }],
+          },
+        ]);
+      },
+      () => ghAsset.resolveGitHubAssetDownload(SHORTCUT, { allowPrerelease: true }),
+    );
+    check(
+      "a pre-release resolves to its authenticated asset endpoint",
+      result?.url === "https://api.github.com/x/21",
+      result?.url,
+    );
+    check(
+      "the fallback consults the releases LIST endpoint",
+      asked.some((u) => /\/releases\?per_page=/.test(u)),
+      JSON.stringify(asked),
+    );
+    check(
+      "a successful resolution returns the octet-stream Accept header",
+      result?.headers?.Accept === "application/octet-stream",
+    );
+    check(
+      "a successful resolution carries the bearer token and API version",
+      result?.headers?.Authorization === "Bearer ghp_private_repo" &&
+        result?.headers?.["X-GitHub-Api-Version"] === "2022-11-28",
+      JSON.stringify(result?.headers),
+    );
+  }
+}
+
+// A draft must never be installable, even with pre-releases enabled.
+check(
+  "a draft release is never selected",
+  ghAsset.pickNewestRelease([
+    { tag_name: "v2.0.0", draft: true },
+    { tag_name: "v1.0.16", draft: false },
+  ])?.tag_name === "v1.0.16",
+);
+check(
+  "a list of nothing but drafts selects nothing",
+  ghAsset.pickNewestRelease([{ tag_name: "d", draft: true }]) === null,
+);
+
+// The asset-list renderer is what makes the rename diagnosable.
+check(
+  "the asset description lists names for the log",
+  ghAsset.describeAssets([{ name: "a.exe" }, { name: "b.exe" }]) === "a.exe, b.exe",
+);
+check(
+  "an assetless release is described explicitly, not as a blank",
+  ghAsset.describeAssets([]) === "(the release publishes no assets at all)",
+  ghAsset.describeAssets([]),
+);
+
 /*
   THE 404 REGRESSION ITSELF. A private repo's anonymous answer and a missing asset
   are the same 404, so the only thing assertable offline is the DECISION: with a

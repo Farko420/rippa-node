@@ -80,6 +80,7 @@ export { claimHandoffSlot, releaseHandoffClaim, isPackagedExe, installDir };
 export {
   GITHUB_REPO,
   RELEASE_ASSET_NAME,
+  currentReleaseAssetName,
   githubHeaders,
   isGitHubUrl,
   releaseDownloadUrl,
@@ -89,9 +90,10 @@ export {
 import {
   GITHUB_REPO,
   RELEASE_ASSET_NAME,
+  currentReleaseAssetName,
   githubHeaders,
-  isGitHubUrl,
   releaseDownloadUrl,
+  resolveGitHubAssetDownload,
   resolveGitHubToken,
 } from "../update/githubAsset";
 
@@ -632,19 +634,39 @@ export class SwarmUpdater {
    * Streams the release exe to `partialPath`, verifying size, PE magic and
    * (when published) SHA-256 before it can ever be promoted.
    *
-   * The token is attached for GitHub-hosted downloads only. Without it a PRIVATE
-   * repo's asset URL answers 404 even though the metadata call succeeded with a
-   * token, and the 404 surfaces here as a failed update with no explanation —
-   * so the same header builder is used for both halves of the conversation.
+   * A GitHub-hosted URL goes through {@link resolveGitHubAssetDownload} first, for
+   * exactly the reason the Mothership updater does the same thing: this repository
+   * is PRIVATE, so `.../releases/latest/download/rippa-node.exe` answers 404 to
+   * every anonymous request — a response byte-identical to "no asset by that
+   * name". Attaching a token to that shortcut URL is not enough; the URL itself
+   * has to become the authenticated API asset endpoint, which is what that helper
+   * resolves it to. Its log lines are collected into `cause` so a failure here
+   * reports WHY the 404 happened rather than only that it did.
+   *
+   * A non-GitHub URL keeps the bare octet-stream request, so a signed CDN link
+   * never receives this node's repo token or API key.
    */
   private async download(release: ReleaseInfo, partialPath: string): Promise<void> {
-    const headers = isGitHubUrl(release.downloadUrl)
-      ? githubHeaders({ Accept: "application/octet-stream" })
-      : { Accept: "application/octet-stream", "User-Agent": "rippa-node-updater" };
+    const headers: Record<string, string> = { Accept: "application/octet-stream" };
+    let downloadUrl = release.downloadUrl;
+
+    const diagnostics: string[] = [];
+    const authenticated = await resolveGitHubAssetDownload(release.downloadUrl, {
+      logPrefix: "[Updater]",
+      diagnostics,
+      allowPrerelease: process.env.RIPPA_GITHUB_ALLOW_PRERELEASE === "true",
+    });
+    if (authenticated) {
+      downloadUrl = authenticated.url;
+      Object.assign(headers, authenticated.headers);
+    } else {
+      headers["User-Agent"] = "rippa-node-updater";
+    }
+    const cause = (): string => (diagnostics.length ? ` ${diagnostics.join(" ")}` : "");
 
     let response;
     try {
-      response = await axios.get(release.downloadUrl, {
+      response = await axios.get(downloadUrl, {
         responseType: "stream",
         timeout: DOWNLOAD_TIMEOUT_MS,
         headers,
@@ -655,9 +677,18 @@ export class SwarmUpdater {
     } catch (error) {
       if (axios.isAxiosError(error) && error.response?.status === 404) {
         throw new Error(
-          `HTTP 404 downloading ${release.downloadUrl} — the asset "${RELEASE_ASSET_NAME}" ` +
+          `HTTP 404 downloading ${downloadUrl} — the asset "${currentReleaseAssetName()}" ` +
             "does not exist under that exact name on the latest release, or the " +
-            "repository is private and no GITHUB_TOKEN is configured",
+            `repository is private and no GITHUB_TOKEN is configured.${cause()}`,
+        );
+      }
+      if (
+        axios.isAxiosError(error) &&
+        (error.response?.status === 401 || error.response?.status === 403)
+      ) {
+        throw new Error(
+          `HTTP ${error.response?.status} downloading ${downloadUrl} — GitHub rejected the ` +
+            `configured token (expired, revoked, or no access to this repository).${cause()}`,
         );
       }
       throw error;

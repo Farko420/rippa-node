@@ -117,9 +117,33 @@ export function releaseDownloadUrl(repo = GITHUB_REPO, asset = RELEASE_ASSET_NAM
   return `https://github.com/${repo}/releases/latest/download/${asset}`;
 }
 
+/**
+ * The asset name, read from the environment at CALL time.
+ *
+ * {@link RELEASE_ASSET_NAME} captures the environment when this module is first
+ * evaluated, which is only guaranteed to happen after `dotenv` has run if some
+ * earlier import happened to pull it in. A node started from a folder where the
+ * `.env` load happens later would therefore silently resolve the DEFAULT asset
+ * name instead of the operator's override, and the resulting 404 would name the
+ * wrong file. Reading it lazily removes that import-ordering dependency.
+ */
+export function currentReleaseAssetName(): string {
+  return (process.env.RIPPA_GITHUB_ASSET || "").trim() || RELEASE_ASSET_NAME;
+}
+
 /** The releases API endpoint holding the asset list. */
 export function githubReleaseApiUrl(repo = GITHUB_REPO): string {
   return `https://api.github.com/repos/${repo}/releases/latest`;
+}
+
+/**
+ * The releases LIST endpoint — the only one that includes pre-releases.
+ *
+ * `per_page` is small on purpose: this is read at most once per update attempt,
+ * not polled, and a long list would only slow the failure path down.
+ */
+export function githubReleasesApiUrl(repo = GITHUB_REPO): string {
+  return `https://api.github.com/repos/${repo}/releases?per_page=10`;
 }
 
 /** The API endpoint that streams one asset's bytes. */
@@ -162,6 +186,49 @@ export interface GitHubAssetDownload {
   url: string;
   /** Headers for that GET, including `Accept: application/octet-stream`. */
   headers: Record<string, string>;
+  /**
+   * Every diagnostic line this resolution emitted, in order.
+   *
+   * The caller re-throws these with its own failure message, so the reason the
+   * authenticated path was chosen (or skipped) survives into the node log and
+   * on to the Mothership's FAILED acknowledgement.
+   */
+  notes?: string[];
+}
+
+/**
+ * Knobs for {@link resolveGitHubAssetDownload}.
+ *
+ * Every option has a default that keeps the pre-existing call sites — and their
+ * tests — unchanged, because this helper sits on the critical path of a fleet
+ * wide self-update and must never surprise a caller that only wants a URL back.
+ */
+export interface GitHubAssetResolveOptions {
+  /**
+   * Prefix for emitted log lines. The two updaters label their own output
+   * differently (`[OTA]` vs `[Updater]`) and this keeps that convention.
+   */
+  logPrefix?: string;
+  /**
+   * A sink that ALSO receives every emitted line.
+   *
+   * `console.warn` alone is not enough for the failure path: the interesting
+   * detail has to be attached to the thrown error so the caller's own log line
+   * carries the cause, and the process may exit before a flush.
+   */
+  diagnostics?: string[];
+  /**
+   * Consult the releases LIST (which includes pre-releases) when
+   * `/releases/latest` has nothing to offer.
+   *
+   * Off by default, deliberately. `GET /releases/latest` skips pre-releases and
+   * answers 404 when the newest published release is one, so a repo shipping
+   * only an RC looks exactly like a repo that has published nothing — but a
+   * node that silently starts installing release candidates because the stable
+   * feed went quiet is a worse failure than one that waits. Opt in per node
+   * with `RIPPA_GITHUB_ALLOW_PRERELEASE=true`.
+   */
+  allowPrerelease?: boolean;
 }
 
 /** Minimal shape of one asset in the releases payload. */
@@ -170,6 +237,14 @@ interface GithubAsset {
   name?: string;
   url?: string;
   browser_download_url?: string;
+}
+
+/** Minimal shape of one release in the releases payload. */
+interface GithubRelease {
+  tag_name?: string;
+  draft?: boolean;
+  prerelease?: boolean;
+  assets?: unknown;
 }
 
 /** Picks the asset to install: exact contract name first, then any `.exe`. */
@@ -198,8 +273,139 @@ export function selectAssetForDownload(
   return usable.find((candidate) => candidate.name!.toLowerCase().endsWith(".exe")) ?? null;
 }
 
+/**
+ * Renders a release payload's asset list for a human-readable log line.
+ *
+ * Used ONLY for diagnostics. The selection itself is {@link selectAssetForDownload}.
+ */
+export function describeAssets(assets: unknown): string {
+  if (!Array.isArray(assets)) return "(the payload had no assets array)";
+  if (assets.length === 0) return "(the release publishes no assets at all)";
+  const names = assets
+    .map((candidate) => (candidate as GithubAsset)?.name)
+    .filter((name): name is string => typeof name === "string" && name.length > 0);
+  return names.length ? names.join(", ") : "(assets present but none were named)";
+}
+
 /** Metadata lookup timeout. A node polls hourly; this must not hang a check. */
 const ASSET_LOOKUP_TIMEOUT_MS = 20_000;
+
+/** How much of a GitHub error body to echo into the log. */
+const MAX_BODY_SNIPPET = 400;
+
+/**
+ * Reads a failed response's body without letting the read itself throw.
+ *
+ * The body is the single most useful thing GitHub gives us here — `401` says
+ * "Bad credentials", `404` says "Not Found", and `403` says which rate limit or
+ * permission was hit — and it is exactly what the previous silent `return null`
+ * threw away. A body that cannot be read is reported as such rather than
+ * silently omitted, because "no body" and "not attempted" are different bugs.
+ */
+async function readBodySnippet(response: Response): Promise<string> {
+  try {
+    const text = await response.text();
+    const trimmed = text.trim();
+    if (!trimmed) return "(empty body)";
+    return trimmed.length > MAX_BODY_SNIPPET
+      ? `${trimmed.slice(0, MAX_BODY_SNIPPET)}… (truncated)`
+      : trimmed;
+  } catch (error) {
+    return `(body could not be read: ${error instanceof Error ? error.message : String(error)})`;
+  }
+}
+
+/**
+ * Names the likely cause of a GitHub status, so the log says something an
+ * operator can act on rather than just the number.
+ */
+function explainStatus(status: number): string {
+  if (status === 401) {
+    return "401 Unauthorized — the token is missing, expired, or malformed. " +
+      "Check RIPPA_GITHUB_TOKEN / GITHUB_TOKEN.";
+  }
+  if (status === 403) {
+    return "403 Forbidden — the token lacks access to this repository, or the " +
+      "GitHub API rate limit for it has been exhausted.";
+  }
+  if (status === 404) {
+    return "404 Not Found — GitHub returns this for a PRIVATE repository to " +
+      "anonymous callers (deliberately, so its existence is not disclosed), for a " +
+      "repo name that does not exist, AND for a repo with no published releases. " +
+      "They are indistinguishable from outside; a token is what separates them.";
+  }
+  if (status === 422) {
+    return "422 Unprocessable Entity — GitHub could not find a release for this " +
+      "request; often a repo with no non-draft releases at all.";
+  }
+  return `HTTP ${status}`;
+}
+
+/**
+ * Fetches one GitHub releases endpoint as JSON, logging every failure loudly.
+ *
+ * Returns `null` for ANY failure so the caller can fall back to the plain public
+ * URL — but it always leaves a diagnostic line explaining itself first. A silent
+ * fallback is what turned a private repo, a bad token and a renamed asset into
+ * one indistinguishable "HTTP 404" at the download.
+ */
+async function fetchReleaseJson(
+  url: string,
+  headers: Record<string, string>,
+  emit: (line: string) => void,
+): Promise<unknown | null> {
+  let response: Response;
+  try {
+    response = await fetch(url, { headers, signal: AbortSignal.timeout(ASSET_LOOKUP_TIMEOUT_MS) });
+  } catch (error) {
+    // DNS, TLS, timeout, or a malformed body — never an HTTP status at all.
+    emit(
+      `[OTA] Could not reach ${url} — ${error instanceof Error ? error.message : String(error)}. ` +
+        "This is a network or DNS failure, not a GitHub response.",
+    );
+    return null;
+  }
+
+  if (!response.ok) {
+    const body = await readBodySnippet(response);
+    emit(`[OTA] ${explainStatus(response.status)} from ${url}. Response body: ${body}`);
+    return null;
+  }
+
+  try {
+    return (await response.json()) as unknown;
+  } catch (error) {
+    emit(
+      `[OTA] ${url} answered ${response.status} with a body that is not JSON — ` +
+        `${error instanceof Error ? error.message : String(error)}.`,
+    );
+    return null;
+  }
+}
+
+/** The `tag_name` of a release payload, for log lines. */
+function tagOf(release: unknown): string {
+  const tag = (release as GithubRelease | null)?.tag_name;
+  return typeof tag === "string" && tag ? tag : "(untagged)";
+}
+
+/**
+ * Picks the newest usable release out of a `GET /releases` LIST payload.
+ *
+ * Drafts are skipped: they are not published to anybody and a node must never
+ * install one. Pre-releases are kept — reaching this function at all is the
+ * explicit `allowPrerelease` opt-in, and the newest usable entry is what the
+ * operator asked for by enabling it.
+ */
+export function pickNewestRelease(list: unknown): GithubRelease | null {
+  if (!Array.isArray(list)) return null;
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") continue;
+    if ((entry as GithubRelease).draft === true) continue;
+    return entry as GithubRelease;
+  }
+  return null;
+}
 
 /**
  * Turns a GitHub download URL into an AUTHENTICATED API download when that is
@@ -211,16 +417,56 @@ const ASSET_LOOKUP_TIMEOUT_MS = 20_000;
  * strictly better served by the caller's original request than by a refusal:
  * this helper improves the private-repo case without ever making the public one
  * worse, and never throws on a path that must not.
+ *
+ * WHY IT IS NOW LOUD. The original version returned `null` from every failure
+ * branch and said nothing, so all three real causes of the 404 — no token, a
+ * private repo, a renamed asset — collapsed into the caller's single opaque
+ * "HTTP 404" line, and there was no way to tell an expired token from a
+ * mistyped repo. Every branch below now emits a line naming the endpoint, the
+ * HTTP status, the response body and the assets actually published, and returns
+ * those lines on `notes` so the caller can attach them to its thrown error.
+ *
+ * THE RESOLUTION ORDER, matching the documented download pipeline:
+ *   1. `GET /repos/{repo}/releases/latest`  — the stable release.
+ *   2. `GET /repos/{repo}/releases`         — only with `allowPrerelease`, and
+ *      only when step 1 found nothing; `releases/latest` deliberately SKIPS
+ *      pre-releases, so a repo whose newest release is an RC 404s there.
+ *   3. Pick the asset whose `name` matches exactly, else the first `.exe`.
+ *   4. Use its `url` (the API endpoint) with `Accept: application/octet-stream`.
  */
 export async function resolveGitHubAssetDownload(
   url: string,
+  options: GitHubAssetResolveOptions = {},
 ): Promise<GitHubAssetDownload | null> {
+  const prefix = options.logPrefix ?? "[OTA]";
+  const notes: string[] = [];
+  /** Logs one line and mirrors it into the caller's sink. */
+  const emit = (line: string): void => {
+    notes.push(line);
+    console.warn(line);
+    options.diagnostics?.push(line);
+  };
+
   if (!isGitHubUrl(url)) return null;
 
   const token = resolveGitHubToken();
-  // No token: a public repo still works unauthenticated, so leave it alone and
-  // let the caller surface a 404 that names the missing token as a cause.
-  if (!token) return null;
+  /*
+    NO TOKEN. A public repo still downloads fine unauthenticated, so the URL is
+    left exactly as advertised — but this is THE most common cause of the 404 on
+    a private repo, and it used to pass in complete silence. Say it, name the
+    consequence, and name the two env vars that fix it.
+  */
+  if (!token) {
+    emit(
+      `${prefix} No GITHUB_TOKEN provided. Attempting public unauthenticated download, ` +
+        "which will fail if the repo is private.",
+    );
+    emit(
+      `${prefix} To fix: set RIPPA_GITHUB_TOKEN or GITHUB_TOKEN in the node's .env, with ` +
+        "read access to the release repository (a fine-grained token with Contents: Read).",
+    );
+    return null;
+  }
 
   const trimmed = url.trim();
 
@@ -231,6 +477,7 @@ export async function resolveGitHubAssetDownload(
     return {
       url: trimmed,
       headers: githubHeaders({ Accept: "application/octet-stream" }),
+      notes,
     };
   }
 
@@ -238,32 +485,50 @@ export async function resolveGitHubAssetDownload(
   if (!repo) return null; // a CDN redirect URL: not ours to rewrite.
 
   // Prefer the name the URL itself asked for, then the contract name. Both
-  // candidates may be null (a URL with no filename), and the selector skips
+  // candidates may be empty (a URL with no filename), and the selector skips
   // blanks rather than treating "" as a name to match.
-  const preferred = [assetNameFromDownloadUrl(trimmed) ?? "", RELEASE_ASSET_NAME];
+  const preferred = [assetNameFromDownloadUrl(trimmed) ?? "", currentReleaseAssetName()];
+  const headers = githubHeaders();
 
-  let payload: unknown;
-  try {
-    const response = await fetch(githubReleaseApiUrl(repo), {
-      headers: githubHeaders(),
-      signal: AbortSignal.timeout(ASSET_LOOKUP_TIMEOUT_MS),
-    });
-    if (!response.ok) return null;
-    payload = await response.json();
-  } catch {
-    // DNS, TLS, timeout, or malformed JSON. Falling back to the plain URL keeps
-    // a public repo — and any authenticated redirect that still works — alive.
+  // 1. The stable release.
+  let payload = await fetchReleaseJson(githubReleaseApiUrl(repo), headers, emit);
+
+  // 2. Pre-releases, only on explicit opt-in and only when step 1 found nothing.
+  if (!payload && options.allowPrerelease) {
+    emit(
+      `${prefix} No release from /releases/latest for ${repo}; falling back to the ` +
+        "releases list because pre-releases are enabled (RIPPA_GITHUB_ALLOW_PRERELEASE).",
+    );
+    const list = await fetchReleaseJson(githubReleasesApiUrl(repo), headers, emit);
+    payload = pickNewestRelease(list);
+    if (!payload) {
+      emit(`${prefix} The releases list for ${repo} contained no usable (non-draft) release.`);
+    }
+  }
+
+  if (!payload) return null;
+
+  // 3. Pick the asset, and say so when there is nothing to pick.
+  const assets = (payload as GithubRelease | null)?.assets;
+  const asset = selectAssetForDownload(assets, preferred);
+  if (!asset || typeof asset.url !== "string") {
+    emit(
+      `${prefix} Failed to find .exe asset in release ${tagOf(payload)} payload. ` +
+        `Available assets: ${describeAssets(assets)}.`,
+    );
     return null;
   }
 
-  const assets = (payload as { assets?: unknown } | null)?.assets;
-  const asset = selectAssetForDownload(assets, preferred);
-  if (!asset || typeof asset.url !== "string") return null;
+  emit(
+    `${prefix} Resolved "${asset.name}" in release ${tagOf(payload)} to the authenticated ` +
+      `asset endpoint ${asset.url} (Accept: application/octet-stream).`,
+  );
 
   return {
     // GitHub's own asset `url` is the API endpoint; `browser_download_url` is the
     // anonymous shortcut that 404s here. Use the former, with octet-stream.
     url: asset.url,
     headers: githubHeaders({ Accept: "application/octet-stream" }),
+    notes,
   };
 }
