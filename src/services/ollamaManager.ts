@@ -17,16 +17,25 @@ import {
   publishLine,
   type EngineHealth,
 } from "./engineTelemetry";
+import {
+  BUNDLED_OLLAMA_ORIGIN,
+  BUNDLED_OLLAMA_PORT,
+  bundledBinaryPath,
+  bundledBinaryPresent,
+  bundledOllamaEnv,
+  bundledOllama,
+  ensureBundledBinary,
+} from "./bundled-ollama";
 
 /**
- * OLLAMA PROCESS MANAGER — supervises a locally-spawned `ollama serve` child.
+ * OLLAMA PROCESS MANAGER — supervises the Ollama child this node runs.
  *
- * SCOPE AND INTENT. This module manages the LIFECYCLE of an Ollama process
- * this node already has installed; it never downloads or executes an Ollama
- * binary it fetched itself. That is a deliberate boundary — auto-downloading
- * and running third-party executables is a different, higher-risk feature
- * that needs its own explicit sign-off (see OtaUpdater/SwarmUpdater for the
- * existing, carefully-gated self-update path this project already has).
+ * SCOPE AND INTENT. This module manages the LIFECYCLE of the Ollama process. The
+ * runtime itself — obtaining the standalone binary, confining its model store
+ * and its port, and enforcing the default model — lives in
+ * `services/bundled-ollama.ts`, which this module drives. Splitting it that way
+ * keeps "which process is running" (here, and the concern the Control Panel talks
+ * to) separate from "where did the binary come from" (there).
  *
  * RESPONSIBILITIES:
  *   1. OPT-IN SUPERVISION — only takes over the process when the operator
@@ -35,7 +44,9 @@ import {
  *   2. AUTO-RESTART — a crashed child is relaunched with backoff.
  *   3. MODEL FALLBACK — pulls/switches to FALLBACK_MODEL when the primary
  *      model fails, so the mesh keeps a locally-capable node.
- *   4. STATUS — a small snapshot consumed by heartbeat telemetry and the
+ *   4. CLEAN SHUTDOWN — the child is confirmed dead before `stop()` returns, so
+ *      the node can exit without leaving a bound port behind.
+ *   5. STATUS — a small snapshot consumed by heartbeat telemetry and the
  *      dashboard's Ollama Control Panel.
  */
 
@@ -68,6 +79,12 @@ export interface OllamaStatus {
   embeddingModelReady: boolean;
   /** Name of the embedding model this node auto-pulls. */
   embeddingModel: string;
+  /** True when the runtime binary lives in the node's own directory. */
+  bundledRuntime: boolean;
+  /** Absolute path of the bundled runtime binary, or "" when none is installed. */
+  bundledBinaryPath: string;
+  /** Release tag of the installed bundled runtime, or "". */
+  bundledVersion: string;
 }
 
 function extractPort(url: string): number {
@@ -168,22 +185,62 @@ class OllamaManager {
       ramGb: systemRamGb(),
       embeddingModelReady: this.embeddingModelReady,
       embeddingModel: EMBEDDING_MODEL,
+      // Surfaces WHERE the runtime came from, so an operator can tell a node that
+      // owns its own contained Ollama from one borrowing a host-wide install.
+      bundledRuntime: bundledBinaryPresent(),
+      bundledBinaryPath: bundledBinaryPresent() ? bundledBinaryPath() : "",
+      bundledVersion: bundledOllama.getStatus().version,
     };
   }
 
-  /** Spawns `ollama serve` bound to the configured port, if not already up. */
+  /**
+   * Spawns `ollama serve` bound to the configured port, if not already up.
+   *
+   * THE BINARY IS THE BUNDLED ONE, NOT `ollama` RESOLVED FROM PATH. This used to
+   * spawn the bare name, which resolved against the operator's PATH and therefore
+   * required a global install — defeating the "all-in-one appliance" premise and
+   * failing outright on a clean machine. `ensureBundledBinary()` puts the
+   * standalone release in the node's own `bin` folder first, and the child is
+   * spawned from that ABSOLUTE path with the isolation env applied.
+   *
+   * NOT `detached`, deliberately: the child stays in this process's job object and
+   * dies with the node, which is what makes "Shutdown Node" in the Admin UI
+   * actually stop Ollama instead of orphaning it on the port.
+   */
   async start(): Promise<void> {
     if (!this.managed || this.child) return;
     this.stopping = false;
     this.state = "starting";
-    const port = extractPort(env.OLLAMA_URL ?? "http://127.0.0.1:11434");
+
+    /*
+      THE BUNDLED RUNTIME OWNS ITS PORT, AND SAYS SO TO EVERY CONSUMER.
+
+      Spawning on `extractPort(env.OLLAMA_URL)` while everything else in the
+      codebase (OllamaClient, localAi, the /api/chat proxy) reads OLLAMA_URL is
+      how a node ends up serving on one port and being asked about another. So
+      the isolated origin is published into the environment as soon as we take
+      ownership, and the rest of the process is pointed at it atomically.
+
+      An operator who does NOT enable management keeps their own OLLAMA_URL
+      untouched — this only happens on the path where we spawn the child, so a
+      node borrowing a host-wide Ollama behaves exactly as it did before.
+    */
+    const port = BUNDLED_OLLAMA_PORT;
+    process.env.OLLAMA_URL = BUNDLED_OLLAMA_ORIGIN;
+
     // HARDWARE AUTO-PROFILING — a weak satellite laptop must never be handed
     // the 7B coder model; pick the model BEFORE spawning so the first pull
     // (below, once the server answers) requests the right one.
     this.model = recommendedPrimaryModel();
     try {
-      const child = spawn("ollama", ["serve"], {
-        env: { ...process.env, OLLAMA_HOST: `127.0.0.1:${port}` },
+      // Materialise the runtime before spawning it. A throw here (caught below)
+      // means this platform genuinely has no published build AND nothing is on
+      // disk — a real "cannot run here", not a transient fault.
+      const binary = bundledBinaryPresent() ? bundledBinaryPath() : await ensureBundledBinary();
+      const child = spawn(binary, ["serve"], {
+        // Isolation env applied LAST so it wins over any stray value already in
+        // this process's environment (see bundledOllamaEnv for why each matters).
+        env: { ...process.env, ...bundledOllamaEnv() },
         /*
           THE CHILD'S OUTPUT IS PIPED, NOT IGNORED.
 
@@ -355,22 +412,68 @@ class OllamaManager {
     }
   }
 
-  /** Stops the managed child, if any. Never throws. */
+  /**
+   * Stops the managed child, if any. Never throws.
+   *
+   * ESCALATES SIGTERM → SIGKILL, and waits for the process to actually be gone.
+   * The old version fired `kill()` and returned immediately, so `index.ts`'s
+   * shutdown handler could `process.exit()` while Ollama was still alive: the
+   * port stayed bound and the next boot failed to start with "address in use".
+   * The child is now confirmed dead before this returns.
+   */
   async stop(): Promise<void> {
     this.stopping = true;
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
     }
-    if (this.child) {
+    const child = this.child;
+    this.child = null;
+    if (child && child.exitCode === null) {
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
       try {
-        this.child.kill();
+        child.kill("SIGTERM");
       } catch {
         /* best-effort */
       }
-      this.child = null;
+      // Bounded wait: the node's own teardown awaits this, so a child that
+      // ignores SIGTERM must not be able to hang shutdown forever.
+      const survived = await Promise.race([
+        exited.then(() => false),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 5_000)),
+      ]);
+      if (survived) {
+        console.warn("[OllamaManager] Child ignored SIGTERM — sending SIGKILL.");
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* best-effort */
+        }
+        await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 3_000))]);
+      }
     }
+    // The bundled supervisor owns its own child handle; tear that down too so a
+    // node started through the bundled path leaves nothing listening behind it.
+    await bundledOllama.stop();
     this.state = this.managed ? "stopped" : "unmanaged";
+  }
+
+  /**
+   * REINSTALLS THE BUNDLED RUNTIME — the repair action for a node whose binary is
+   * corrupted, quarantined by antivirus, or simply outdated. Re-downloads the
+   * official standalone build into the node's own `bin` folder and restarts it.
+   */
+  async reinstallBundled(): Promise<{ ok: boolean; message: string }> {
+    const result = await bundledOllama.repair();
+    if (result.ok) {
+      this.lastError = null;
+      publishNodeEvent({
+        kind: "info",
+        title: "Bundled Ollama repaired",
+        detail: result.message,
+      });
+    }
+    return result;
   }
 
   /** Restarts the managed process immediately (manual or admin-triggered). */

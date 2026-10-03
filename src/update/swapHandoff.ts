@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { ensureDataDir } from "../utils/paths";
+import { EXIT_APPLY_UPDATE, isUnderWatchdog } from "./exitCodes";
 
 /**
  * SELF-REPLACEMENT HANDOFF — the one place a running node swaps its own binary.
@@ -243,6 +244,62 @@ export function spawnDetached(scriptPath: string, cwd: string): number | undefin
 
   child.unref();
   return child.pid;
+}
+
+/**
+ * Whether the running process will be replaced by a SUPERVISOR rather than by
+ * its own detached script.
+ *
+ * THE DECISION, AND WHY IT IS IN ONE PLACE. Both OTA paths end the same way, and
+ * they used to end it two different ways: each wrote `update.bat`, spawned it
+ * detached, and called `process.exit(0)`. That worked for a binary swap and
+ * nothing else — there was no process left to notice the replacement dying, so a
+ * restart could never come back.
+ *
+ * Under the Watchdog the script is not just unnecessary, it is actively harmful:
+ * it would race the watchdog for the same executable, and it relaunches the node
+ * directly, so the newly-booted process would not be a watchdog child and would
+ * have no supervisor. So exactly one of the two paths runs, chosen here, and both
+ * updaters call the same function to choose it.
+ *
+ * @returns "watchdog" when the running process is a Watchdog child and must exit
+ *          with {@link EXIT_APPLY_UPDATE}; "script" for a standalone install that
+ *          still has to hand itself off.
+ */
+export function handoffMode(): "watchdog" | "script" {
+  return isUnderWatchdog() ? "watchdog" : "script";
+}
+
+/**
+ * Completes a handoff once a verified build is staged.
+ *
+ * The staging directory already holds `temp_update.exe`, verified by the caller
+ * (size floor, PE magic, and SHA-256 when published), so the remaining work is
+ * only the file replacement — which a running process cannot do to itself.
+ *
+ * Under the Watchdog, exiting with 43 hands the job to a process that is not
+ * locked against the executable. Without one, the legacy detached script is
+ * spawned first and the process exits 0 so the image lock is released before the
+ * script's `copy /y`.
+ *
+ * NEVER RETURNS under either mode: both paths end in `process.exit`.
+ */
+export function completeHandoff(stagedUpdatePath: string, targetExe: string): never {
+  if (handoffMode() === "watchdog") {
+    console.log(
+      `[OTA] Staged build ready — exiting ${EXIT_APPLY_UPDATE} so rippa-watchdog.exe ` +
+        "can swap the executable and boot the new version.",
+    );
+    process.exit(EXIT_APPLY_UPDATE);
+  }
+
+  const scriptPath = writeSwapScript(stagedUpdatePath, targetExe);
+  const pid = spawnDetached(scriptPath, path.dirname(targetExe));
+  console.log(`[OTA] Handoff script spawned (detached, pid ${pid ?? "unknown"}).`);
+  // Release the .exe lock so the script's overwrite can succeed. Exit code 0 is
+  // the "I am finished" signal in the standalone path; with no watchdog present
+  // there is nothing to misread it.
+  process.exit(0);
 }
 
 /** Absolute path of the running executable — the thing being replaced. */

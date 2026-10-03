@@ -4,18 +4,17 @@ import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import axios from "axios";
 import { env } from "../config";
-import { APP_VERSION, APP_VERSION_RESOLVED, isVersionNewer } from "../version";
+import { APP_VERSION, APP_VERSION_RESOLVED, isVersionNewer, isVersionOlder } from "../version";
 import type { LatestVersionInfo, SwarmClient } from "../network/SwarmClient";
 import {
   HANDOFF_STAMP,
   PARTIAL_SUFFIX,
   TEMP_UPDATE_FILE,
   claimHandoffSlot,
+  completeHandoff,
   currentExecutable,
   isPackagedExe,
-  spawnDetached,
   stagingDir,
-  writeSwapScript,
 } from "./swapHandoff";
 
 /**
@@ -112,6 +111,18 @@ interface InstallTarget {
  */
 interface ApplyOptions {
   force?: boolean;
+  /**
+   * Permits installing a build OLDER than the one running.
+   *
+   * Off by default, and `force` does NOT turn it on. Those are separate
+   * decisions: `force` means "install this exact version even though it is the one
+   * I am already running" (a repair of a corrupt install), while a downgrade
+   * means "install a version older than the one I am running". Conflating them is
+   * what turned `FORCE_UPDATE` into a downgrade vector — the operator's "Force
+   * Update" button on a v1.0.15 node would happily install whatever the
+   * Mothership happened to be advertising, including v1.0.13.
+   */
+  allowDowngrade?: boolean;
 }
 
 export class OtaUpdater {
@@ -189,7 +200,7 @@ export class OtaUpdater {
    *          refused handoff, or a failed download. Never throws — a throwing
    *          updater would leave the Mothership waiting with no outcome at all.
    */
-  async forceUpdate(): Promise<boolean> {
+  async forceUpdate(options: { allowDowngrade?: boolean } = {}): Promise<boolean> {
     console.log("[Updater] FORCE_UPDATE received — resolving the Mothership payload.");
 
     if (this.updating) {
@@ -230,7 +241,10 @@ export class OtaUpdater {
     }
 
     console.log(`[Updater] Mothership supplied v${latest.version} — ${latest.downloadUrl}`);
-    return this.applyIfNewer(latest, { force: true });
+    return this.applyIfNewer(latest, {
+      force: true,
+      ...(options.allowDowngrade ? { allowDowngrade: true } : {}),
+    });
   }
 
   /** Downloads, verifies and hands off to the replacement script. */
@@ -239,9 +253,33 @@ export class OtaUpdater {
     options: ApplyOptions = {},
   ): Promise<boolean> {
     const force = options.force === true;
+    const allowDowngrade = options.allowDowngrade === true;
 
     if (this.updating) {
       return false; // an update is already in flight
+    }
+
+    /*
+      THE DOWNGRADE GUARD, CHECKED BEFORE THE VERSION GATE.
+
+      A forced update bypasses "is this newer than what I am running?" entirely,
+      which is correct for its actual purpose (reinstalling the SAME build to
+      repair a corrupt one). But it also meant a `FORCE_UPDATE` would install
+      whatever the Mothership advertised — including a build OLDER than the one
+      running, e.g. rolling a v1.0.15 node back to v1.0.13.
+
+      That is refused unless the payload explicitly carries `allow_downgrade:
+      true`. The check is a strict "older than", not "not newer than", so the
+      ordinary force-reinstall of the current version still works: equal versions
+      are not downgrades.
+    */
+    if (!allowDowngrade && isVersionOlder(latest.version, APP_VERSION)) {
+      console.warn(
+        `[OTA] Refusing to downgrade: the Mothership offered v${latest.version} but this ` +
+          `node is running v${APP_VERSION}. Re-send the command with ` +
+          `allow_downgrade: true if that is really intended.`,
+      );
+      return false;
     }
 
     /*
@@ -317,14 +355,15 @@ export class OtaUpdater {
       const { size } = fs.statSync(updatePath);
       console.log(`[OTA] Download complete — ${TEMP_UPDATE_FILE} (${formatMb(size)}).`);
 
-      const scriptPath = writeSwapScript(updatePath, currentExecutable());
-      const pid = spawnDetached(scriptPath, target.dir);
-      console.log(`[OTA] Handoff script spawned (detached, pid ${pid ?? "unknown"}).`);
+      /*
+        THE HANDOFF IS NOW A SUPERVISOR DECISION, NOT A LOCAL ONE.
 
-      console.log("[OTA] Handoff complete. Restarting node for update...");
-      // Release the .exe lock so the script's overwrite can succeed.
-      process.exit(0);
-      return true; // unreachable: process.exit does not return
+        Under the Watchdog this exits 43 and the watchdog swaps the executable and
+        boots the new build; a standalone install keeps the detached `update.bat`
+        path. Both are chosen by `completeHandoff`, which never returns.
+      */
+      completeHandoff(updatePath, currentExecutable());
+      return true; // unreachable: completeHandoff always exits
     } catch (error) {
       // Abort cleanly: no half-written update, no restart, node carries on.
       // This is the "unreachable download_url" path — a dead link, an expired

@@ -5,6 +5,7 @@ import { startVitalsSampler } from "./services/telemetry";
 import { describeRuntime, supportsBrowserScraping } from "./platform";
 import { ollamaManager } from "./services/ollamaManager";
 import { OtaUpdater } from "./update/OtaUpdater";
+import { EXIT_CRASH, EXIT_RESTART, EXIT_SHUTDOWN, isUnderWatchdog } from "./update/exitCodes";
 
 // Deeper fatal-error stacks (the default of 10 frames hides the caller module).
 (Error as { stackTraceLimit?: number }).stackTraceLimit = 60;
@@ -69,6 +70,21 @@ async function main(): Promise<void> {
   );
   console.log(` Mothership: ${env.MOTHERSHIP_URL}`);
   console.log(` Ollama: ${env.OLLAMA_URL}`);
+  /*
+    SUPERVISION, STATED PLAINLY AT BOOT.
+
+    Whether a restart comes back is the single most-asked operational question,
+    and the answer depends entirely on whether a watchdog is watching this
+    process. Printing it removes the guesswork: an operator seeing "watchdog:
+    none" knows immediately that this node will stay down after a remote restart
+    until someone starts it by hand, and can fix that with
+    `rippa-watchdog.exe --install` instead of discovering it during an incident.
+  */
+  console.log(
+    isUnderWatchdog()
+      ? " Watchdog: supervising (restarts and updates are automatic)"
+      : " Watchdog: none — this node will NOT come back by itself after a restart or a crash",
+  );
   console.log("══════════════════════════════════════════════");
 
   // --- 2. Always: local API + Web GUI. Master-only: Deep Brain. ---
@@ -188,7 +204,22 @@ async function main(): Promise<void> {
     };
 
     const adminCommands = {
-      restartNode: () => shutdown("REMOTE_COMMAND"),
+      /*
+        RESTART IS AN EXIT CODE, NOT A SCRIPT.
+
+        This used to call the same `shutdown()` as a signal handler, which ended in
+        `process.exit(0)` — the "I am finished" code. With no supervisor, that made
+        a remote restart indistinguishable from a remote shutdown: the node went
+        away and nothing ever brought it back. It now exits 42, which
+        `rippa-watchdog.exe` reads as "restart me", and a standalone install with
+        no watchdog still gets a clean stop (and, if the admin really wanted a
+        restart, the OS Startup entry brings it back on next logon).
+
+        `shutdown` performs the full graceful teardown first, so the exit code is
+        only reached once services, Ollama, SQLite and the HTTP listener are all
+        closed — the restart is clean, not abrupt.
+      */
+      restartNode: () => shutdown("REMOTE_COMMAND", EXIT_RESTART),
       /*
         `FORCE_UPDATE` IS ANSWERED BY THE MOTHERSHIP-PAYLOAD UPDATER.
 
@@ -204,7 +235,8 @@ async function main(): Promise<void> {
         so a genuine failure is still reported honestly rather than looking like a
         restart that never happened.
       */
-      forceUpdate: (): Promise<boolean> => otaUpdater.forceUpdate(),
+      forceUpdate: (options?: { allowDowngrade?: boolean }): Promise<boolean> =>
+        otaUpdater.forceUpdate(options ?? {}),
       setP2pEnabled: async (enabled: boolean) => {
         // Persisted through nodeAuth so the choice survives a restart.
         require("./config/nodeAuth").setP2pEnabled(enabled);
@@ -380,9 +412,32 @@ async function main(): Promise<void> {
     void openDashboard(url);
   }
 
-  // Graceful shutdown.
-  const shutdown = async (signal: string): Promise<void> => {
-    console.log(`\n[Boot] ${signal} received — shutting down...`);
+  /*
+    GRACEFUL SHUTDOWN, AND THE EXIT CODE THAT COMES WITH IT.
+
+    The teardown is identical for every exit; only the final code differs, and
+    that code is the message to the Rippa Watchdog (see `update/exitCodes.ts`):
+
+      0   a signal, or an admin pressing "Shutdown" — the watchdog exits too and
+          the machine is left dark, which is the point
+      42  an admin pressing "Restart" — the watchdog relaunches immediately
+
+    Every step before the exit matters and is awaited: a process that drops the
+    SQLite handle mid-write leaves a -wal file that the next boot has to
+    recover, and a listener that is not closed leaves the next instance unable
+    to bind the port — which is precisely the state a "restart" must not create.
+
+    A guard makes this idempotent, because RESTART_NODE and a concurrent SIGTERM
+    can both land here: without it the second pass re-enters the teardown while
+    the first is still awaiting, and `stopNodeServices` would be run twice over
+    services that are already stopped.
+  */
+  let shuttingDown = false;
+  const shutdown = async (signal: string, exitCode: number = EXIT_SHUTDOWN): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    console.log(`\n[Boot] ${signal} received — shutting down (exit ${exitCode})...`);
     await stopNodeServices();
     await ollamaManager.stop();
     if (deepBrainOpen) {
@@ -393,8 +448,23 @@ async function main(): Promise<void> {
       await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
       httpServer = null;
     }
-    process.exit(0);
+    process.exit(exitCode);
   };
+
+  /*
+    THE `/api/node/restart` ROUTE IS WIRED HERE.
+
+    The route itself lives in server.ts (which owns the Express app and the auth
+    gate) but it cannot reach `shutdown`, so the boot sequence registers it —
+    the same shape `onConfigChange` already uses. Keeping the teardown in one
+    place means a restart from the LAN, a restart from the Mothership, and a
+    restart from a Ctrl+C all stop services identically; they differ only in the
+    exit code they end on.
+  */
+  serverModule.setNodeLifecycle({
+    restart: () => shutdown("API_RESTART", EXIT_RESTART),
+    shutdown: () => shutdown("API_SHUTDOWN", EXIT_SHUTDOWN),
+  });
 
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
@@ -402,5 +472,5 @@ async function main(): Promise<void> {
 
 main().catch((error) => {
   console.error("[Boot] Fatal error:", error);
-  process.exit(1);
+  process.exit(EXIT_CRASH);
 });

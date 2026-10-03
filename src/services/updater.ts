@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { APP_VERSION, isVersionNewer } from "../version";
+import { APP_VERSION, isVersionNewer, isVersionOlder } from "../version";
 import { ensureNodeIdentity } from "../config/nodeAuth";
 import type { PeerEndpoint } from "../config/nodeAuth";
 import type { SwarmDispatcher } from "./swarmDispatcher";
@@ -12,13 +12,12 @@ import {
   PARTIAL_SUFFIX,
   TEMP_UPDATE_FILE,
   claimHandoffSlot,
+  completeHandoff,
   currentExecutable,
   installDir,
   isPackagedExe,
   releaseHandoffClaim,
-  spawnDetached,
   stagingDir,
-  writeSwapScript,
 } from "../update/swapHandoff";
 
 export { claimHandoffSlot, releaseHandoffClaim, isPackagedExe, installDir };
@@ -40,16 +39,17 @@ export { claimHandoffSlot, releaseHandoffClaim, isPackagedExe, installDir };
  *   4. BROADCAST — the Master walks every ONLINE satellite in the swarm registry
  *                  and sends it a `SWARM_UPDATE_TRIGGER` carrying the release
  *                  version and the download URL.
- *   5. SWAP      — each satellite downloads, verifies, writes `update.bat`,
- *                  spawns it fully detached, then `process.exit(0)` to release
- *                  the Windows image lock so the script can swap the binary.
+ *   5. SWAP      — each satellite downloads and verifies the build, then hands
+ *                  off: under the Watchdog it exits 43 and the watchdog swaps
+ *                  the binary and boots it; a standalone install keeps the
+ *                  detached `update.bat` path.
  *
- * WHY THE BATCH HANDOFF: Windows keeps a running .exe mapped and locked, so a
- * Node process cannot replace its own binary. The batch script is spawned
- * detached so it survives `process.exit`, waits for the lock to clear, swaps the
- * files and relaunches — the node replaces itself with nobody at the keyboard.
- * The script itself is built by `update/swapHandoff`, which is shared with the
- * Mothership-driven `OtaUpdater` so the two paths cannot drift apart again.
+ * WHY THE HANDOFF IS A SUPERVISOR DECISION: Windows keeps a running .exe mapped
+ * and locked, so a Node process cannot replace its own binary. The Watchdog is a
+ * second process that is not locked against the executable, so it can. The
+ * legacy batch script remains for installs with no watchdog; the choice between
+ * the two is made once, in `update/swapHandoff`, and both OTA paths call it, so
+ * they cannot drift apart again.
  *
  * SECURITY: only a mesh-key authenticated Master can trigger an update on a
  * satellite, so no peer node can force a binary swap on another node.
@@ -69,6 +69,100 @@ export { claimHandoffSlot, releaseHandoffClaim, isPackagedExe, installDir };
  * `Farko420/rippa-node`. Overridable so a fork can point at its own releases.
  */
 const GITHUB_REPO = process.env.RIPPA_GITHUB_REPO || "Farko420/rippa-node";
+
+/**
+ * THE RELEASE ASSET NAME, EXACTLY.
+ *
+ * THE 404 THIS FIXES. The updater is pointed at
+ * `https://github.com/Farko420/rippa-node/releases/latest/download/rippa-node.exe`,
+ * and that URL is a literal filename lookup — GitHub serves nothing but a 404
+ * unless an asset with EXACTLY this name exists on the release. A release that
+ * published `rippa-node 1.0.15.exe`, or `rippa-node_windows.exe`, or (once the
+ * watchdog ships) a second `.exe` under a different name, produces that 404 even
+ * though a perfectly good binary is sitting right there.
+ *
+ * So the asset is selected by exact name first, and only falls back to "first
+ * `.exe`" if no asset matches. That fallback keeps a hand-renamed asset
+ * installable, but the exact match is what makes the documented URL — and the
+ * one the Mothership hands out — resolve.
+ *
+ * `RIPPA_GITHUB_ASSET` overrides it for a fork that publishes under its own
+ * name; the workflow must publish a matching asset for that to work.
+ */
+export const RELEASE_ASSET_NAME = process.env.RIPPA_GITHUB_ASSET || "rippa-node.exe";
+
+/**
+ * Resolves a GitHub token from the environment.
+ *
+ * A PRIVATE repository 404s every unauthenticated request — deliberately, so the
+ * existence of a private repo is not disclosed. That is why an anonymous poll of
+ * a private repo looks exactly like "no release published yet" and why the node
+ * never updates. Supplying a token is the only fix.
+ *
+ * Three names are accepted, in priority order:
+ *   `RIPPA_GITHUB_TOKEN`  the node-specific name, preferred so a repo token is
+ *                         not accidentally shadowed by something else
+ *   `GITHUB_TOKEN`        the conventional CI/secret-injection name, so a
+ *                         standard build-time secret works with no extra config
+ *   `GH_TOKEN`            the GitHub CLI's name, honoured so a machine already
+ *                         set up for `gh` needs nothing extra
+ *
+ * Never logged, and never sent to a non-GitHub host — see {@link githubHeaders}.
+ */
+export function resolveGitHubToken(): string {
+  const candidates = [
+    process.env.RIPPA_GITHUB_TOKEN,
+    process.env.GITHUB_TOKEN,
+    process.env.GH_TOKEN,
+  ];
+  for (const candidate of candidates) {
+    const value = (candidate ?? "").trim();
+    if (value) return value;
+  }
+  return "";
+}
+
+/** True when `url` is served by GitHub (api or the release download hosts). */
+export function isGitHubUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return (
+      host === "github.com" ||
+      host === "www.github.com" ||
+      host === "api.github.com" ||
+      host.endsWith(".githubusercontent.com")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Builds the request headers for a GitHub call, attaching the token when one is
+ * configured.
+ *
+ * The Authorization header is only ever attached to GitHub hosts. Sending a
+ * repo token to a third-party download host — or, far worse, letting a
+ * Mothership-supplied `download_url` point anywhere — would leak it, so the
+ * guard is `isGitHubUrl` and not merely "a token exists".
+ */
+export function githubHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "rippa-node-updater",
+    ...extra,
+  };
+  const token = resolveGitHubToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  return headers;
+}
+
+/** The canonical direct-download URL for {@link RELEASE_ASSET_NAME}. */
+export function releaseDownloadUrl(repo = GITHUB_REPO, asset = RELEASE_ASSET_NAME): string {
+  return `https://github.com/${repo}/releases/latest/download/${asset}`;
+}
+
 /** How often the Master polls GitHub for a newer release. */
 const CHECK_INTERVAL_MS = 60 * 60_000; // hourly
 /** Delay before the first check, so boot finishes before a large exe download. */
@@ -110,6 +204,37 @@ function extractVersion(text: string): string | null {
 }
 
 /**
+ * Picks the release asset to download.
+ *
+ * EXACT NAME FIRST. A release carries every binary this project publishes, and
+ * the updater must not simply take whichever `.exe` happens to sort first —
+ * `rippa-node.exe` and `rippa-watchdog.exe` are both `.exe`, and picking the
+ * wrong one either 404s on download or, worse, installs the supervisor over the
+ * worker. So {@link RELEASE_ASSET_NAME} is matched case-insensitively, and only
+ * if nothing matches do we fall back to "first `.exe`" — which keeps a
+ * hand-renamed asset installable instead of bricking OTA entirely.
+ *
+ * Exported so the workflow's own verification and the unit tests assert against
+ * the same rule the updater runs, rather than a re-implementation of it.
+ */
+export function selectReleaseAsset(assets: readonly ReleaseAsset[] | undefined): ReleaseAsset | null {
+  const list = assets ?? [];
+  const usable = list.filter(
+    (candidate) =>
+      typeof candidate.name === "string" &&
+      typeof candidate.browser_download_url === "string" &&
+      candidate.browser_download_url,
+  );
+
+  const exact = usable.find(
+    (candidate) => candidate.name!.toLowerCase() === RELEASE_ASSET_NAME.toLowerCase(),
+  );
+  if (exact) return exact;
+
+  return usable.find((candidate) => candidate.name!.toLowerCase().endsWith(".exe")) ?? null;
+}
+
+/**
  * Parses the GitHub releases payload into the one release we care about.
  *
  * Returns null when the payload has no usable Windows exe, so a half-published
@@ -135,15 +260,14 @@ export function parseLatestRelease(payload: unknown): ReleaseInfo | null {
     return null;
   }
 
-  const asset = (release.assets ?? []).find(
-    (candidate) =>
-      typeof candidate.name === "string" &&
-      candidate.name.toLowerCase().endsWith(".exe") &&
-      typeof candidate.browser_download_url === "string" &&
-      candidate.browser_download_url,
-  );
+  const asset = selectReleaseAsset(release.assets);
   if (!asset?.browser_download_url) {
-    console.warn(`[Updater] Release ${tag} has no .exe asset — ignoring.`);
+    console.warn(
+      `[Updater] Release ${tag} has no "${RELEASE_ASSET_NAME}" asset — ignoring. ` +
+        "A release must publish that exact filename: " +
+        releaseDownloadUrl() +
+        " is a literal name lookup and 404s on any other spelling.",
+    );
     return null;
   }
 
@@ -165,16 +289,11 @@ export function parseLatestRelease(payload: unknown): ReleaseInfo | null {
  *
  * Unauthenticated requests are capped by GitHub at 60/hour, which matches the
  * hourly poll exactly. A token is used when supplied to raise that ceiling and
- * to read a private repo.
+ * to read a private repo — see {@link resolveGitHubToken} for why the private
+ * case is not optional.
  */
 export async function fetchLatestRelease(repo = GITHUB_REPO): Promise<ReleaseInfo | null> {
-  const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "rippa-node-updater",
-  };
-  const token = (process.env.RIPPA_GITHUB_TOKEN || "").trim();
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const headers = githubHeaders();
 
   /*
     A 404 IS THE NORMAL, EXPECTED ANSWER until the first release is published —
@@ -185,6 +304,12 @@ export async function fetchLatestRelease(repo = GITHUB_REPO): Promise<ReleaseInf
     So: swallow the 404 quietly, say so once in plain language, and let every
     OTHER failure (401 rate limit, 5xx, DNS, timeout) keep propagating to the
     caller's catch, which still logs it as a warning.
+
+    The 404 message now also names the two causes that are NOT "wait for the
+    first release" — a private repository with no token, and a misspelled
+    RIPPA_GITHUB_REPO — because from the node's side those two are
+    indistinguishable from an empty release list, and an operator who is told
+    only "no releases yet" will never find them.
   */
   let response;
   try {
@@ -197,18 +322,30 @@ export async function fetchLatestRelease(repo = GITHUB_REPO): Promise<ReleaseInf
     });
   } catch (error) {
     if (axios.isAxiosError(error) && error.response?.status === 404) {
-      console.log("[Updater] No published releases found on GitHub yet.");
+      logNoReleases(repo);
       return null;
     }
     throw error;
   }
 
   if (response.status === 404) {
-    console.log("[Updater] No published releases found on GitHub yet.");
+    logNoReleases(repo);
     return null;
   }
 
   return parseLatestRelease(response.data);
+}
+
+/** Explains a 404 in terms an operator can act on, rather than "nothing yet". */
+function logNoReleases(repo: string): void {
+  const token = resolveGitHubToken();
+  const privateRepoGuess = token
+    ? ""
+    : " (no GITHUB_TOKEN / RIPPA_GITHUB_TOKEN is set — a PRIVATE repository 404s every anonymous request)";
+  console.log(
+    `[Updater] No published releases found for ${repo}${privateRepoGuess}. ` +
+      `Expected asset: ${RELEASE_ASSET_NAME} at ${releaseDownloadUrl(repo)}.`,
+  );
 }
 
 /** Reads the first `count` bytes of a file. */
@@ -308,12 +445,18 @@ export class SwarmUpdater {
    *   bad build. The unattended path leaves `force` off, so a routine hourly
    *   check can never reinstall the version already running.
    *
+   * @param options.allowDowngrade permits installing a release OLDER than the
+   *   running build. Never implied by `force` — see the downgrade guard below.
+   *
    * @returns true when this node's own swap is committed and the process is
    *          about to exit. False for every other outcome — including "nothing
    *          to do", "already in flight" and "GitHub unreachable" — so a caller
    *          reporting to the fleet never claims a restart that will not happen.
    */
-  async checkNow(force = false): Promise<boolean> {
+  async checkNow(
+    force = false,
+    options: { allowDowngrade?: boolean } = {},
+  ): Promise<boolean> {
     if (this.updating) {
       console.log("[Updater] An update is already in flight — standing down.");
       return false;
@@ -345,6 +488,29 @@ export class SwarmUpdater {
       return false;
     }
     this.latest = release;
+
+    /*
+      THE DOWNGRADE GUARD, BEFORE THE VERSION GATE.
+
+      `force` means "install this exact release even though it is the one I am
+      already running" — the repair for a corrupt or half-swapped install. It does
+      NOT mean "install anything the cloud points at": without this check, a
+      `FORCE_UPDATE` on a v1.0.15 node would happily install an advertised
+      v1.0.13 and walk the whole swarm backwards. Rolling back is not
+      self-repairing the way a failed upgrade is, so it takes an explicit
+      `allow_downgrade: true`.
+
+      The comparison is a strict "older than", so re-installing the SAME version
+      — the actual point of a forced update — still works.
+    */
+    const allowDowngrade = options.allowDowngrade === true;
+    if (!allowDowngrade && isVersionOlder(release.version, APP_VERSION)) {
+      console.warn(
+        `[Updater] Refusing to downgrade: the latest release is v${release.version} but this ` +
+          `node runs v${APP_VERSION}. Pass allow_downgrade to force it if that is intended.`,
+      );
+      return false;
+    }
 
     if (!force && !isVersionNewer(release.version)) {
       console.log(`[Updater] Fleet is up to date (v${APP_VERSION}).`);
@@ -385,13 +551,17 @@ export class SwarmUpdater {
    * a node is stuck on a corrupt or half-swapped build and the only fix is to
    * put the same good bytes back down.
    *
+   * @param options.allowDowngrade permits installing a release OLDER than the
+   *          running build. Forcing alone never does; see the guard in
+   *          {@link checkNow}.
+   *
    * @returns true when a swap is committed. The process exits inside
    *          `applyToSelf`, so in practice this returns only on the refused /
    *          aborted paths; it exists so the caller knows the difference.
    */
-  async forceUpdate(): Promise<boolean> {
+  async forceUpdate(options: { allowDowngrade?: boolean } = {}): Promise<boolean> {
     console.log("[Updater] FORCE UPDATE requested by the fleet controller.");
-    return this.checkNow(true);
+    return this.checkNow(true, options);
   }
 
   /**
@@ -510,15 +680,15 @@ export class SwarmUpdater {
       console.log(`[Updater] Verified download — ${TEMP_UPDATE_FILE} (${formatMb(size)}).`);
 
       const targetExe = currentExecutable();
-      const scriptPath = writeSwapScript(updatePath, targetExe);
-      console.log(`[Updater] Swap script written — ${path.basename(scriptPath)}`);
-      const pid = spawnDetached(scriptPath, path.dirname(targetExe));
-      console.log(`[Updater] Handoff script spawned (detached, pid ${pid ?? "unknown"}).`);
-
+      /*
+        THE HANDOFF IS A SUPERVISOR DECISION. Under the Watchdog this exits 43
+        and the watchdog puts the new build in place and boots it; a standalone
+        install keeps the detached `update.bat` path. `completeHandoff` chooses
+        between them and never returns.
+      */
       console.log("[Updater] Handoff complete — restarting into the new build...");
-      // Release the .exe image lock so the script's overwrite can succeed.
-      process.exit(0);
-      return true; // unreachable: process.exit does not return
+      completeHandoff(updatePath, targetExe);
+      return true; // unreachable: completeHandoff always exits
     } catch (error) {
       // Abort cleanly: no half-written update, no restart, node carries on.
       console.warn(`[Updater] Update to v${release.version} aborted — ${describeError(error)}`);
@@ -529,13 +699,37 @@ export class SwarmUpdater {
 /**
    * Streams the release exe to `partialPath`, verifying size, PE magic and
    * (when published) SHA-256 before it can ever be promoted.
+   *
+   * The token is attached for GitHub-hosted downloads only. Without it a PRIVATE
+   * repo's asset URL answers 404 even though the metadata call succeeded with a
+   * token, and the 404 surfaces here as a failed update with no explanation —
+   * so the same header builder is used for both halves of the conversation.
    */
   private async download(release: ReleaseInfo, partialPath: string): Promise<void> {
-    const response = await axios.get(release.downloadUrl, {
-      responseType: "stream",
-      timeout: DOWNLOAD_TIMEOUT_MS,
-      headers: { Accept: "application/octet-stream", "User-Agent": "rippa-node-updater" },
-    });
+    const headers = isGitHubUrl(release.downloadUrl)
+      ? githubHeaders({ Accept: "application/octet-stream" })
+      : { Accept: "application/octet-stream", "User-Agent": "rippa-node-updater" };
+
+    let response;
+    try {
+      response = await axios.get(release.downloadUrl, {
+        responseType: "stream",
+        timeout: DOWNLOAD_TIMEOUT_MS,
+        headers,
+        // 404 is the private-repo-without-a-token signature, so it is surfaced
+        // as a named cause rather than as a generic HTTP failure.
+        validateStatus: (status) => status >= 200 && status < 300,
+      });
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        throw new Error(
+          `HTTP 404 downloading ${release.downloadUrl} — the asset "${RELEASE_ASSET_NAME}" ` +
+            "does not exist under that exact name on the latest release, or the " +
+            "repository is private and no GITHUB_TOKEN is configured",
+        );
+      }
+      throw error;
+    }
 
     const hash = createHash("sha256");
     let bytes = 0;
@@ -600,6 +794,12 @@ export interface UpdateTriggerBody {
   tag: string;
   downloadUrl: string;
   sha256?: string;
+  /**
+   * Set only by a Master that means it. Without it, a trigger naming a version
+   * OLDER than the running build is refused — the Master pushing a stale
+   * advertisement must not be able to walk a satellite backwards.
+   */
+  allowDowngrade?: boolean;
   issuedBy: string;
   issuedAt: string;
 }
@@ -628,12 +828,16 @@ export function parseUpdateTrigger(body: unknown): UpdateTriggerBody | null {
   }
 
   const sha256 = String(raw["sha256"] ?? "").trim();
+  // Strictly `=== true`: a truthy string like "false" must not be read as consent
+  // to walk a node backwards, so only a real boolean opts in.
+  const allowDowngrade = raw["allowDowngrade"] === true || raw["allow_downgrade"] === true;
   return {
     command: SWARM_UPDATE_TRIGGER,
     version,
     tag: String(raw["tag"] ?? `v${version}`),
     downloadUrl,
     ...(sha256 ? { sha256 } : {}),
+    ...(allowDowngrade ? { allowDowngrade: true } : {}),
     issuedBy: String(raw["issuedBy"] ?? "unknown"),
     issuedAt: String(raw["issuedAt"] ?? new Date().toISOString()),
   };
@@ -650,7 +854,34 @@ export async function handleUpdateTrigger(
   updater: SwarmUpdater,
   trigger: UpdateTriggerBody,
 ): Promise<{ accepted: boolean; message: string }> {
-  if (trigger.issuedBy !== ensureNodeIdentity().code && !isVersionNewer(trigger.version)) {
+  /*
+    THE DOWNGRADE GUARD.
+
+    A Master pushing an OLDER version is the one push that is not self-healing:
+    a failed upgrade leaves the node on the old build and the next poll retries,
+    while a downgrade is adopted, reported as a successful update, and then
+    blocks every future upgrade until someone notices. So it needs an explicit
+    `allowDowngrade: true` on the trigger, and `issuedBy === self` — which
+    previously bypassed the version check entirely — no longer does.
+
+    `allow_downgrade` is accepted as well as `allowDowngrade` because the
+    Mothership's other command surface is snake_case, and an operator who sets
+    the flag in one place must not silently fail to set it in another.
+  */
+  if (isVersionOlder(trigger.version, APP_VERSION) && !trigger.allowDowngrade) {
+    return {
+      accepted: false,
+      message:
+        `v${trigger.version} is OLDER than the running v${APP_VERSION} — refusing to ` +
+        "downgrade. Re-send with allow_downgrade: true if that is intended.",
+    };
+  }
+
+  if (
+    trigger.issuedBy !== ensureNodeIdentity().code &&
+    !isVersionNewer(trigger.version) &&
+    !trigger.allowDowngrade
+  ) {
     return {
       accepted: false,
       message: `v${trigger.version} is not newer than the running build — ignoring.`,

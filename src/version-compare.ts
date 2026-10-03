@@ -48,3 +48,29 @@ export function isVersionNewer(candidate: string, current: string): boolean {
   }
   return false; // same core version — prerelease tags do not force an update
 }
+/**
+ * True when `candidate` is strictly OLDER than `current` — the mirror image of
+ * {@link isVersionNewer}, and the guard the OTA pipeline needs.
+ *
+ * WHY IT IS NOT JUST `!isVersionNewer()`. That expression is also true when the
+ * two versions are EQUAL, and "equal" and "older" call for opposite behaviour:
+ * an equal version is the routine no-op an hourly poll produces on every node
+ * that is already current, while an older version means the Mothership is asking
+ * a node to walk its build backwards. Only a genuine downgrade needs refusing, so
+ * the comparison has to distinguish the two — which is what this does.
+ *
+ * Unparseable input on EITHER side returns `false`, so a malformed version can
+ * never be mistaken for a downgrade and can never trigger one.
+ */
+export function isVersionOlder(candidate: string, current: string): boolean {
+  const next = parseVersion(candidate);
+  const mine = parseVersion(current);
+  if (!next || !mine) return false;
+
+  for (let index = 0; index < 3; index += 1) {
+    if (next[index] !== mine[index]) {
+      return next[index] < mine[index];
+    }
+  }
+  return false; // identical versions are neither newer nor older
+}

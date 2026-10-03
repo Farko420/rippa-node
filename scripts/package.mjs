@@ -38,6 +38,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const distDir = path.join(root, "dist");
 const exeName = "rippa-node.exe";
 const exePath = path.join(distDir, exeName);
+const watchdogName = "rippa-watchdog.exe";
+const watchdogPath = path.join(distDir, watchdogName);
 const isWindows = process.platform === "win32";
 
 /** Runs a command, inheriting stdio; exits the build on failure. */
@@ -79,24 +81,35 @@ function resolvePkgInvocation() {
 }
 
 // --- 1. Clean ---------------------------------------------------------------
-console.log("[Package] 1/6 Cleaning dist/ ...");
+console.log("[Package] 1/7 Cleaning dist/ ...");
 fs.rmSync(distDir, { recursive: true, force: true });
 
 // --- 2. Compile TypeScript ---------------------------------------------------
-console.log("[Package] 2/6 Compiling TypeScript ...");
+console.log("[Package] 2/7 Compiling TypeScript ...");
 run(process.execPath, [path.join(root, "node_modules", "typescript", "bin", "tsc"), "-p", "tsconfig.json"]);
 
-// --- 3. Verify the Web GUI ---------------------------------------------------
+// --- 2b. Write the watchdog's reduced pkg manifest --------------------------
+// The watchdog imports nothing from `services/`, `db/` or `network/` — it only
+// needs `update/exitCodes` and `update/swapHandoff` — so it does not need the
+// SQLite prebuild or the Playwright registry either. `package.json`'s own `pkg`
+// block would drag all of that in, which is why the watchdog gets its own
+// manifest rather than sharing the node's.
+//
+// The `bin`/`scripts`/`dependencies` fields are copies of the real ones so pkg
+// resolves the runtime version and the module tree identically for both exes.
+console.log("[Package] 2b/7 Writing the watchdog pkg manifest ...");
+run(process.execPath, [path.join(root, "scripts", "build-watchdog.mjs")]);
+
 // `pkg` snapshots whatever `public/` contains AT THIS MOMENT and that snapshot is
 // frozen into the exe forever after. If the folder is empty or half-copied the
 // only symptom an operator ever sees is a 503 dashboard with no build error, so
 // the packaging is aborted here instead. `npm run package` normally runs this
 // check first via `build:webgui`; running this file directly must be just as safe.
-console.log("[Package] 3/6 Verifying Web GUI assets ...");
+console.log("[Package] 3/7 Verifying Web GUI assets ...");
 run(process.execPath, [path.join(root, "scripts", "build-webgui.mjs")]);
 
 // --- 4. Bundle with pkg ------------------------------------------------------
-console.log("[Package] 4/6 Bundling rippa-node.exe (@yao-pkg/pkg, node22-win-x64) ...");
+console.log("[Package] 4/7 Bundling rippa-node.exe (@yao-pkg/pkg, node22-win-x64) ...");
 const pkg = resolvePkgInvocation();
 // Relative entry + output paths (no spaces) + cwd:root keep this safe in any
 // checkout. Explicit entry file — pkg doesn't need a package.json "bin".
@@ -123,8 +136,53 @@ if (!fs.existsSync(exePath)) {
   process.exit(1);
 }
 
-// --- 5. Prune build artifacts ------------------------------------------------
-console.log("[Package] 5/6 Pruning intermediate build files from dist/ ...");
+/*
+  THE WATCHDOG IS BUNDLED AS A SECOND, SINGLE-ENTRY `pkg` RUN.
+
+  Both exes are built by the SAME pkg binary and the SAME `--targets node22-win-x64`,
+  which is what keeps the supervisor and the worker on one Node version — the two
+  processes share a data directory, a SQLite file and an exit-code protocol, and a
+  runtime-version skew between them would be a genuinely baffling thing to debug.
+  Two invocations also keep each `--output` name exact: pkg derives an exe's name
+  from its ENTRY POINT, so a two-entry run would emit `index.exe` plus
+  `watchdog.exe` and neither would be the filename the installer, the startup
+  entry and the OTA updater all refer to.
+
+  The watchdog gets its OWN `--config` pointing at a generated manifest with an
+  empty `assets` block, because `public/` is ~2 MB of dashboard files the watchdog
+  never reads. Freezing them into a supervisor with no UI would double the
+  installer size for nothing; `scripts/build-watchdog.mjs` writes that manifest.
+*/
+console.log("[Package] 5/7 Bundling rippa-watchdog.exe ...");
+const watchdogPkgConfig = path.join(distDir, "pkg-watchdog.json");
+if (!fs.existsSync(watchdogPkgConfig)) {
+  console.error(
+    `[Package] Expected ${watchdogPkgConfig} — build the watchdog first (npm run build:watchdog).`,
+  );
+  process.exit(1);
+}
+run(
+  pkg.command,
+  [
+    ...pkg.args,
+    "dist/watchdog.js",
+    "--config",
+    watchdogPkgConfig,
+    "--targets",
+    "node22-win-x64",
+    "--output",
+    `dist/${watchdogName}`,
+  ],
+  pkg.options,
+);
+
+if (!fs.existsSync(watchdogPath)) {
+  console.error(`[Package] Expected ${watchdogPath} to exist after pkg — aborting.`);
+  process.exit(1);
+}
+
+// --- 6. Prune build artifacts ------------------------------------------------
+console.log("[Package] 6/7 Pruning intermediate build files from dist/ ...");
 let pruned = 0;
 const prune = (dir) => {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -144,7 +202,7 @@ const prune = (dir) => {
 };
 prune(distDir);
 
-// --- 6. Stage public/ beside the exe (fallback for folder copies) -------------
+// --- 7. Stage public/ beside the exe (fallback for folder copies) -------------
 // This is a CONVENIENCE copy for "copy the whole dist/ folder" deployments, NOT
 // the primary source of the dashboard. The primary source is the recursive
 // `public/` glob frozen into the snapshot by pkg, read via `__dirname` in
@@ -155,15 +213,18 @@ const publicDest = path.join(distDir, "public");
 if (fs.existsSync(publicSrc)) {
   fs.rmSync(publicDest, { recursive: true, force: true });
   fs.cpSync(publicSrc, publicDest, { recursive: true });
-  console.log("[Package] 6/6 Staged public/ beside the exe (folder-copy convenience).");
+  console.log("[Package] 7/7 Staged public/ beside the exe (folder-copy convenience).");
 } else {
   console.error(`[Package] Expected ${publicSrc} to exist after step 3 — aborting.`);
   process.exit(1);
 }
 
 const sizeMb = fs.statSync(exePath).size / (1024 * 1024);
+const watchdogSizeMb = fs.statSync(watchdogPath).size / (1024 * 1024);
 console.log("");
 console.log(`[Package] ✔ dist/${exeName} (${sizeMb.toFixed(1)} MB) — ${pruned} build files pruned.`);
-console.log("[Package] Copy the whole dist/ folder to any Windows PC and run the exe;");
+console.log(`[Package] ✔ dist/${watchdogName} (${watchdogSizeMb.toFixed(1)} MB) — the supervisor.`);
+console.log("[Package] Copy the whole dist/ folder to any Windows PC and run rippa-watchdog.exe;");
 console.log("[Package] the first launch opens the Local Configuration Dashboard in the browser.");
+console.log("[Package] Run \"rippa-watchdog.exe --install\" once to start it automatically at logon.");
 console.log("");

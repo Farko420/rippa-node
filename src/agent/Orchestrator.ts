@@ -41,17 +41,27 @@ const DYNAMIC_SKILL = "DYNAMIC_SKILL";
  * orchestrator stays testable and the boot sequence in index.ts owns the wiring.
  */
 export interface AdminCommandDeps {
-  /** Gracefully stop every service and exit so the batch script relaunches. */
+  /**
+   * Gracefully stop every service and exit with the RESTART exit code.
+   *
+   * The exit code is the whole handoff: the Rippa Watchdog reads it and relaunches
+   * the node. The previous contract ("stop so something else relaunches me") had
+   * nothing on the other end for an ordinary restart, which is why a remote
+   * restart behaved exactly like a shutdown.
+   */
   restartNode: () => Promise<void> | void;
   /**
    * Fetch, verify and swap to the latest published release.
+   *
+   * @param options.allowDowngrade permits installing a build OLDER than the one
+   *          running. Off unless the task payload carries `allow_downgrade: true`.
    *
    * @returns true when a swap is committed (the process is about to exit). The
    *          boolean is only observable on paths that do NOT exit, but it is
    *          what lets the caller report a refused update honestly instead of
    *          claiming a restart that never happened.
    */
-  forceUpdate: () => Promise<boolean> | boolean | void;
+  forceUpdate: (options?: { allowDowngrade?: boolean }) => Promise<boolean> | boolean | void;
   /** Reports whether mesh routing is currently enabled on this node. */
   isP2pEnabled: () => boolean;
   /** Enables or disables mesh routing. */
@@ -296,6 +306,21 @@ export class Orchestrator {
   ): Promise<TaskOutcome> {
     const args = (task.payload ?? {}) as Record<string, unknown>;
     const requested = args["enabled"];
+    /*
+      BOTH CONSENT FLAGS ARE FORWARDED, NOT JUST `enabled`.
+
+      An admin task's payload can carry `TOGGLE_P2P`'s `enabled` and
+      `FORCE_UPDATE`'s `allow_downgrade`. Forwarding only the first meant a
+      rollback task arrived at the executor indistinguishable from a plain force
+      update — and so silently lost the consent it needed, which is a safe
+      failure but still a wrong one. Both are copied verbatim; the executor
+      decides which applies to which command.
+    */
+    const payloadArgs: Record<string, unknown> = {};
+    if (typeof requested === "boolean") payloadArgs["enabled"] = requested;
+    if (args["allow_downgrade"] === true) payloadArgs["allow_downgrade"] = true;
+    if (args["allowDowngrade"] === true) payloadArgs["allowDowngrade"] = true;
+
     const executed = await executePendingCommands(
       [
         {
@@ -306,12 +331,12 @@ export class Orchestrator {
           // match nothing and the admin task would be re-dispatched forever.
           ackId: task.id,
           command,
-          ...(typeof requested === "boolean" ? { args: { enabled: requested } } : {}),
+          ...(Object.keys(payloadArgs).length > 0 ? { args: payloadArgs } : {}),
         },
       ],
       {
         restartNode: () => this.admin.restartNode(),
-        forceUpdate: () => this.admin.forceUpdate(),
+        forceUpdate: (options) => this.admin.forceUpdate(options),
         setP2pEnabled: (enabled) => this.admin.setP2pEnabled(enabled),
         isP2pEnabled: () => this.admin.isP2pEnabled(),
         // Routed through so the queue-task channel is acknowledged to the

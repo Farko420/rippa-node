@@ -414,6 +414,291 @@ check(
 );
 fsSwap.rmSync(stageDir, { recursive: true, force: true });
 
+// --- 8b. The exit-code handoff protocol --------------------------------------
+// The watchdog's whole behaviour is "read the child's exit code", so the codes
+// are the contract between two separate processes. They are asserted as VALUES
+// here rather than merely read, because every one of them is load-bearing: a
+// collision between, say, SHUTDOWN and CRASH would make a deliberate shutdown
+// restart itself in a crash loop, and no test would notice until it shipped.
+const exitCodes = await load("dist/update/exitCodes.js");
+
+check("exit code 0 means shutdown", exitCodes.EXIT_SHUTDOWN === 0);
+check("exit code 1 means crash", exitCodes.EXIT_CRASH === 1);
+check("exit code 42 means restart", exitCodes.EXIT_RESTART === 42);
+check("exit code 43 means apply update", exitCodes.EXIT_APPLY_UPDATE === 43);
+
+const codes = [
+  exitCodes.EXIT_SHUTDOWN,
+  exitCodes.EXIT_CRASH,
+  exitCodes.EXIT_RESTART,
+  exitCodes.EXIT_APPLY_UPDATE,
+];
+check(
+  "the four codes are distinct (no code can be read as two intents)",
+  new Set(codes).size === codes.length,
+  codes.join(", "),
+);
+
+check(
+  "a crash is distinguishable from a shutdown",
+  exitCodes.describeExitCode(exitCodes.EXIT_CRASH) !== exitCodes.describeExitCode(exitCodes.EXIT_SHUTDOWN),
+);
+check(
+  "a restart is distinguishable from an apply-update",
+  exitCodes.describeExitCode(exitCodes.EXIT_RESTART) !== exitCodes.describeExitCode(exitCodes.EXIT_APPLY_UPDATE),
+);
+
+// The watchdog flags its child; the node reads that flag to choose its handoff.
+const prevFlag = process.env.RIPPA_WATCHDOG;
+delete process.env.RIPPA_WATCHDOG;
+check("no flag means the node is unsupervised", exitCodes.isUnderWatchdog() === false);
+process.env.RIPPA_WATCHDOG = "1";
+check("the flag marks the node as watchdog-supervised", exitCodes.isUnderWatchdog() === true);
+// A dev run that exported RIPPA_WATCHDOG=false must not be mistaken for a
+// supervised one, or its updates would exit 43 into a supervisor that is not there.
+process.env.RIPPA_WATCHDOG = "false";
+check("an explicit 'false' is not supervision", exitCodes.isUnderWatchdog() === false);
+if (prevFlag === undefined) delete process.env.RIPPA_WATCHDOG;
+else process.env.RIPPA_WATCHDOG = prevFlag;
+
+check(
+  "an unsupervised node keeps the legacy detached-script handoff",
+  swap.handoffMode() === "script",
+  `unsupervised handoffMode is "${swap.handoffMode()}"`,
+);
+process.env.RIPPA_WATCHDOG = "1";
+check(
+  "RIPPA_WATCHDOG=1 switches the handoff to the watchdog",
+  swap.handoffMode() === "watchdog",
+  `supervised handoffMode is "${swap.handoffMode()}"`,
+);
+if (prevFlag === undefined) delete process.env.RIPPA_WATCHDOG;
+else process.env.RIPPA_WATCHDOG = prevFlag;
+
+// --- 8c. Downgrade protection ------------------------------------------------
+// The bug this guards is a fleet walking backwards: a FORCE_UPDATE meant to
+// reinstall the current build instead installing an older one, which is not
+// self-healing the way a failed upgrade is.
+const { isVersionNewer, isVersionOlder } = await load("dist/version-compare.js");
+
+check("1.0.16 is newer than 1.0.15", isVersionNewer("1.0.16", "1.0.15") === true);
+check("1.0.13 is NOT newer than 1.0.15", isVersionNewer("1.0.13", "1.0.15") === false);
+check("1.0.13 is older than 1.0.15", isVersionOlder("1.0.13", "1.0.15") === true);
+check("1.0.16 is NOT older than 1.0.15", isVersionOlder("1.0.16", "1.0.15") === false);
+check(
+  "an EQUAL version is neither newer nor older (force-reinstall still works)",
+  isVersionOlder("1.0.15", "1.0.15") === false && isVersionNewer("1.0.15", "1.0.15") === false,
+);
+check(
+  "the 1.0.15 -> 1.0.13 downgrade the Mothership asked for is detected",
+  isVersionOlder("1.0.13", "1.0.15") === true && isVersionNewer("1.0.13", "1.0.15") === false,
+);
+check(
+  "an unparseable version is never treated as a downgrade",
+  isVersionOlder("garbage", "1.0.15") === false && isVersionOlder("1.0.13", "garbage") === false,
+);
+
+// The consent flag is read from the command payload, and ONLY a real boolean
+// counts — a JSON payload can carry the string "false", and `Boolean("false")`
+// would read that as consent to roll the fleet backwards.
+const { wantsDowngrade } = await load("dist/services/heartbeat.js");
+check("no args means no downgrade consent", wantsDowngrade({}) === false);
+check(
+  "allow_downgrade: true grants consent (snake_case wire format)",
+  wantsDowngrade({ args: { allow_downgrade: true } }) === true,
+);
+check(
+  "allowDowngrade: true grants consent (camelCase internal format)",
+  wantsDowngrade({ args: { allowDowngrade: true } }) === true,
+);
+check(
+  'the STRING "false" is NOT consent',
+  wantsDowngrade({ args: { allow_downgrade: "false" } }) === false,
+);
+check("0 is NOT consent", wantsDowngrade({ args: { allow_downgrade: 0 } }) === false);
+check("an absent flag is NOT consent", wantsDowngrade({ args: { enabled: true } }) === false);
+
+// And the flag must actually reach the updater through the executor, or setting
+// it in the Mothership would be silently ignored — which would refuse a rollback
+// the operator explicitly asked for.
+const receivedOptions = [];
+await executePendingCommands([{ id: "dg-1", command: "FORCE_UPDATE", args: { allow_downgrade: true } }], {
+  restartNode: () => {},
+  forceUpdate: (options) => {
+    receivedOptions.push(options ?? {});
+  },
+  setP2pEnabled: () => {},
+  isP2pEnabled: () => true,
+});
+check(
+  "allow_downgrade reaches the updater through the command executor",
+  receivedOptions[0]?.allowDowngrade === true,
+  JSON.stringify(receivedOptions),
+);
+
+const plainOptions = [];
+resetExecutedCommands();
+await executePendingCommands([{ id: "dg-2", command: "FORCE_UPDATE" }], {
+  restartNode: () => {},
+  forceUpdate: (options) => {
+    plainOptions.push(options ?? {});
+  },
+  setP2pEnabled: () => {},
+  isP2pEnabled: () => true,
+});
+check(
+  "an ordinary FORCE_UPDATE carries no downgrade consent",
+  plainOptions[0]?.allowDowngrade === undefined,
+  JSON.stringify(plainOptions),
+);
+
+// --- 8d. The GitHub release asset contract ----------------------------------
+// The download URL is a LITERAL FILENAME LOOKUP on GitHub, so the asset name is
+// part of the updater's public contract. These assertions stop a future rename
+// from silently reintroducing the 404 that made every node report "no release".
+const updater = await load("dist/services/updater.js");
+
+check("the release asset is named rippa-node.exe", updater.RELEASE_ASSET_NAME === "rippa-node.exe");
+check(
+  "the canonical download URL matches what the updater requests",
+  updater.releaseDownloadUrl() ===
+    "https://github.com/Farko420/rippa-node/releases/latest/download/rippa-node.exe",
+  updater.releaseDownloadUrl(),
+);
+
+// With the watchdog also shipping an .exe, "first .exe wins" is a coin flip
+// between the worker and its supervisor. The exact name must win.
+const twoAssetRelease = {
+  tag_name: "latest",
+  name: "rippa-node 1.0.16",
+  assets: [
+    { name: "rippa-watchdog.exe", browser_download_url: "https://example.invalid/watchdog.exe" },
+    { name: "rippa-node.exe", browser_download_url: "https://example.invalid/node.exe" },
+  ],
+};
+check(
+  "the exactly-named asset is chosen over another .exe",
+  updater.parseLatestRelease(twoAssetRelease)?.downloadUrl === "https://example.invalid/node.exe",
+  JSON.stringify(updater.parseLatestRelease(twoAssetRelease)),
+);
+check(
+  "asset selection is case-insensitive on the name",
+  updater.selectReleaseAsset([
+    { name: "RIPPA-NODE.EXE", browser_download_url: "https://example.invalid/upper.exe" },
+  ])?.name === "RIPPA-NODE.EXE",
+);
+// A renamed asset must still install: refusing outright would wedge OTA for
+// good, which is a worse failure than a documented fallback.
+check(
+  "a renamed asset still falls back to the first .exe (OTA is not wedged)",
+  updater.parseLatestRelease({
+    tag_name: "latest",
+    name: "rippa-node 1.0.16",
+    assets: [{ name: "rippa-node-1.0.16.exe", browser_download_url: "https://example.invalid/renamed.exe" }],
+  })?.downloadUrl === "https://example.invalid/renamed.exe",
+);
+// An assetless release is refused, because there is nothing to install.
+check(
+  "an assetless release is still refused",
+  updater.parseLatestRelease({ tag_name: "latest", name: "rippa-node 1.0.16", assets: [] }) === null,
+);
+
+// GITHUB_TOKEN is what makes a PRIVATE repo readable: GitHub answers 404 to every
+// unauthenticated request, which is indistinguishable from "no release yet". The
+// accepted names are asserted so the CI secret name cannot silently stop working.
+const savedTokens = {
+  rippa: process.env.RIPPA_GITHUB_TOKEN,
+  gh: process.env.GITHUB_TOKEN,
+  cli: process.env.GH_TOKEN,
+};
+delete process.env.RIPPA_GITHUB_TOKEN;
+delete process.env.GITHUB_TOKEN;
+delete process.env.GH_TOKEN;
+
+check("no token resolves to an empty string", updater.resolveGitHubToken() === "");
+// Deleted in turn, so each name is proven to work on its OWN rather than being
+// shadowed by one that outranks it.
+process.env.GITHUB_TOKEN = "ghp_ci_secret";
+check(
+  "GITHUB_TOKEN is accepted (the standard CI secret name)",
+  updater.resolveGitHubToken() === "ghp_ci_secret",
+);
+delete process.env.GITHUB_TOKEN;
+process.env.GH_TOKEN = "gh_cli_secret";
+check(
+  "GH_TOKEN is accepted (the GitHub CLI's name)",
+  updater.resolveGitHubToken() === "gh_cli_secret",
+);
+delete process.env.GH_TOKEN;
+process.env.RIPPA_GITHUB_TOKEN = "node_specific";
+check(
+  "RIPPA_GITHUB_TOKEN wins over the others",
+  updater.resolveGitHubToken() === "node_specific",
+);
+
+// The token must reach the ACTUAL asset download, not just the metadata call —
+// omitting it there is why a private repo's metadata succeeded while its binary
+// answered 404.
+check(
+  "an authenticated call carries the bearer token",
+  updater.githubHeaders()["Authorization"] === "Bearer node_specific",
+);
+
+// ...and must NEVER go anywhere that is not GitHub, or a token could leak to a
+// third-party host named in a Mothership-supplied download_url.
+check(
+  "github.com is recognised as a GitHub host",
+  updater.isGitHubUrl("https://github.com/a/b/releases/latest/download/rippa-node.exe") === true,
+);
+check("api.github.com is recognised", updater.isGitHubUrl("https://api.github.com/repos/a/b") === true);
+check(
+  "a CDN redirect host is recognised",
+  updater.isGitHubUrl("https://objects.githubusercontent.com/x") === true,
+);
+check("a NON-GitHub host is not", updater.isGitHubUrl("https://evil.example.com/rippa-node.exe") === false);
+check(
+  "a lookalike host is not treated as GitHub",
+  updater.isGitHubUrl("https://github.com.evil.example/rippa-node.exe") === false,
+);
+check("a non-URL is not treated as GitHub", updater.isGitHubUrl("not a url") === false);
+
+for (const [key, value] of [
+  ["RIPPA_GITHUB_TOKEN", savedTokens.rippa],
+  ["GITHUB_TOKEN", savedTokens.gh],
+  ["GH_TOKEN", savedTokens.cli],
+]) {
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+}
+
+// The satellite trigger carries the same consent flag, so a Master pushing a
+// stale version cannot walk a satellite backwards by accident.
+const triggerOf = (extra) =>
+  updater.parseUpdateTrigger({
+    command: "SWARM_UPDATE_TRIGGER",
+    version: "1.0.16",
+    tag: "v1.0.16",
+    downloadUrl: "https://example.invalid/rippa-node.exe",
+    issuedBy: "RIPPA-AAAA-BBBB",
+    ...extra,
+  });
+
+check("a trigger can carry allow_downgrade", triggerOf({ allow_downgrade: true })?.allowDowngrade === true);
+check(
+  "a trigger without the flag has no consent",
+  triggerOf({})?.allowDowngrade === undefined,
+);
+check(
+  'a trigger with the STRING "false" has no consent',
+  triggerOf({ allow_downgrade: "false" })?.allowDowngrade === undefined,
+);
+// A trigger naming an older build must still parse — the refusal belongs in the
+// handler, which can be reasoned about, not in the parser.
+check(
+  "a trigger naming an OLDER version still parses (the handler refuses it)",
+  triggerOf({}) !== null,
+);
+
 // --- 5. Autonomous task claiming -------------------------------------------
 const { TaskEngine } = await load("dist/services/taskEngine.js");
 const seen = [];

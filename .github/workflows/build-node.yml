@@ -148,21 +148,38 @@ jobs:
       # dist\rippa-node.exe in three places meant a single change to
       # scripts/package.mjs broke the build at three different points. This
       # searches the same directories the upload glob covers.
+      #
+      # IT PICKS THE FILE BY NAME, NOT BY SIZE — and that is now load-bearing.
+      # `npm run package` produces TWO executables, rippa-node.exe and its
+      # supervisor rippa-watchdog.exe. The old "largest .exe wins" heuristic
+      # happened to pick the worker only because it is bigger; it is an accident,
+      # not a guarantee, and a watchdog that grows by 30% would silently become the
+      # release asset. Worse, publishing the wrong file would leave the fleet
+      # downloading a supervisor where a worker belongs.
+      #
+      # The name is also the ASSET NAME the updater fetches by literal URL lookup,
+      # so it must be exact and not merely correct — see RELEASE_ASSET_NAME in
+      # src/services/updater.ts.
       - name: Locate and verify the artifact
         id: exe
         shell: pwsh
         run: |
+          $wanted = 'rippa-node.exe'
           $found = @()
           foreach ($dir in @('dist', 'build', '.')) {
             if (Test-Path $dir) {
-              $found += Get-ChildItem -Path $dir -Filter *.exe -File -ErrorAction SilentlyContinue
+              $found += Get-ChildItem -Path $dir -Filter $wanted -File -Recurse -ErrorAction SilentlyContinue
             }
           }
           if ($found.Count -eq 0) {
-            Write-Error "npm run package produced no .exe in dist/, build/ or the repo root"
+            Write-Error "npm run package produced no $wanted in dist/, build/ or the repo root"
             exit 1
           }
-          $exe = $found | Sort-Object Length -Descending | Select-Object -First 1
+          if ($found.Count -gt 1) {
+            Write-Error "Found $($found.Count) copies of $wanted ($($found.FullName -join ', ')). Exactly one must be published, or the release would carry a duplicate asset."
+            exit 1
+          }
+          $exe = $found[0]
           $size = $exe.Length
           Write-Host ("Artifact: {0}" -f $exe.FullName)
           Write-Host ("Artifact size: {0:N1} MB" -f ($size / 1MB))
@@ -173,6 +190,7 @@ jobs:
           # Relative, forward-slashed: feeds straight into glob paths and the
           # release `files` list without Windows separators confusing them.
           "path=$($exe.FullName.Replace($PWD.Path + '\', '').Replace('\', '/'))" >> $env:GITHUB_OUTPUT
+          "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
 
       # Ship the checksum with the release so the updater can verify the binary
       # it downloads instead of trusting size + PE magic alone.
@@ -254,16 +272,24 @@ jobs:
 
             The Master node polls this release hourly and broadcasts the update to
             every paired satellite automatically.
+          # EXACT PATHS, NOT `dist/*.exe`.
+          #
+          # The updater fetches the worker by LITERAL FILENAME lookup
+          # (`/releases/latest/download/rippa-node.exe`), and the watchdog ships as a
+          # second, separate asset. A `dist/*.exe` glob would publish whatever
+          # happened to be in dist/ — including the watchdog, and including a stale
+          # exe left by an earlier run — and the asset the fleet requests would then
+          # be whatever sorted first. Both files are named explicitly so the release
+          # contents are a decision rather than an accident.
           files: |
-            dist/*.exe
-            build/*.exe
-            *.exe
-          # Not `true`: with wildcards, a renamed or relocated binary makes the
-          # glob match nothing, and a hard failure here would abort the job
-          # before the artifact safety-net upload below can run. The release
-          # body already carries the version + SHA for provenance, so a miss
-          # must not cost us the release.
-          fail_on_unmatched_files: false
+            dist/rippa-node.exe
+            dist/rippa-watchdog.exe
+          # `true`, NOT `false`. A missing file must now FAIL the run: the whole
+          # point of naming them exactly is that a rename is a broken contract, and
+          # `fail_on_unmatched_files: false` would publish a release the fleet
+          # cannot download while reporting success — which is precisely how the
+          # fleet came to sit on an old binary with nothing to fetch.
+          fail_on_unmatched_files: true
         env:
           # Passed explicitly. The action falls back to `github.token`, but the
           # implicit value depends on the repository's default token permissions,
@@ -301,6 +327,10 @@ jobs:
           $repo = "${{ github.repository }}"
           $expectedVersion = "${{ steps.version.outputs.version }}"
           $expectedSha = "${{ steps.checksum.outputs.sha256 }}"
+          # MUST match RELEASE_ASSET_NAME in src/services/updater.ts. The fleet
+          # fetches this by literal filename, so an exact match here is the only
+          # thing standing between a rename and a fleet-wide 404.
+          $expectedAsset = 'rippa-node.exe'
 
           # `$ErrorActionPreference` covers PowerShell's own errors; a non-2xx HTTP
           # response is not one, so the status is checked explicitly below.
@@ -321,17 +351,29 @@ jobs:
             exit 1
           }
 
-          $asset = $release.assets | Where-Object { $_.name -like "*.exe" } | Select-Object -First 1
+          # BY EXACT NAME, NOT "the first .exe". The release also carries
+          # rippa-watchdog.exe, so a first-match rule is a coin flip between the
+          # worker and its supervisor — and the old check here actively FAILED a
+          # correct release for having two .exe assets. Naming both removes the
+          # ambiguity instead of banning it.
+          $asset = $release.assets | Where-Object { $_.name -eq $expectedAsset } | Select-Object -First 1
           if (-not $asset) {
-            Write-Error "::error::Release '$($release.tag_name)' has no .exe asset. parseLatestRelease ignores such a release, so every node would silently skip this update."
+            Write-Error "::error::Release '$($release.tag_name)' has no asset named exactly '$expectedAsset' (found: $(@($release.assets).name -join ', ')). The updater requests /releases/latest/download/$expectedAsset, which is a literal filename lookup and 404s on any other name."
             exit 1
           }
 
-          # `parseLatestRelease` takes the FIRST .exe it finds, so an ambiguous
-          # pair means the fleet's choice is arbitrary.
-          $exeAssets = @($release.assets | Where-Object { $_.name -like "*.exe" })
-          if ($exeAssets.Count -gt 1) {
-            Write-Error "::error::Release has $($exeAssets.Count) .exe assets; parseLatestRelease takes the first, so which binary ships is arbitrary."
+          # The watchdog ships alongside the worker, so both must be present and
+          # neither may be duplicated. Two assets with the same name make which one
+          # a node downloads arbitrary.
+          $dupes = @($release.assets | Where-Object { $_.name -eq $expectedAsset })
+          if ($dupes.Count -gt 1) {
+            Write-Error "::error::Release has $($dupes.Count) assets named '$expectedAsset'; which one a node downloads would be arbitrary."
+            exit 1
+          }
+
+          $watchdogAsset = $release.assets | Where-Object { $_.name -eq 'rippa-watchdog.exe' } | Select-Object -First 1
+          if (-not $watchdogAsset) {
+            Write-Error "::error::Release has no rippa-watchdog.exe. A node installing this release would have a worker with no supervisor, so restarts would go back to acting as shutdowns."
             exit 1
           }
 
@@ -341,13 +383,19 @@ jobs:
             Write-Error "::error::Published asset $($asset.name) is only $($asset.size) bytes. The Locate step refuses to publish under 1MB, so this is a truncated upload rather than a real binary."
             exit 1
           }
+          if ($watchdogAsset.size -lt 1MB) {
+            Write-Error "::error::Published asset $($watchdogAsset.name) is only $($watchdogAsset.size) bytes; it cannot be a real supervisor."
+            exit 1
+          }
 
           if ($release.body -notmatch [regex]::Escape($expectedSha)) {
             Write-Error "::error::Release body does not carry the built SHA-256, so the updater cannot verify what it downloads."
             exit 1
           }
 
-          Write-Host "Verified: latest -> $($release.name), asset $($asset.name) ($([math]::Round($asset.size/1MB,1)) MB), SHA recorded."
+          Write-Host "Verified: latest -> $($release.name)"
+          Write-Host "  worker   $($asset.name) ($([math]::Round($asset.size/1MB,1)) MB), SHA recorded"
+          Write-Host "  watchdog $($watchdogAsset.name) ($([math]::Round($watchdogAsset.size/1MB,1)) MB)"
 
       # DIAGNOSTIC. `npm run package` writes dist/rippa-node.exe (see
       # scripts/package.mjs), but when packaging fails upstream the upload step

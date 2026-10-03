@@ -10,7 +10,7 @@
  * (health probes, log scrapers, the OTA updater itself).
  */
 
-import { isVersionNewer as isNewer } from "./version-compare";
+import { isVersionNewer as isNewer, isVersionOlder as isOlder } from "./version-compare";
 
 declare global {
   /** Version of the running build, sourced from package.json. */
@@ -71,4 +71,18 @@ export { parseVersion } from "./version-compare";
  */
 export function isVersionNewer(candidate: string, current: string = APP_VERSION): boolean {
   return isNewer(candidate, current);
+}
+
+/**
+ * True when `candidate` is strictly older than `current`.
+ *
+ * THE DOWNGRADE GUARD. A Mothership advertising v1.0.13 to a fleet sitting on
+ * v1.0.15 must not be obeyed by default: rolling a whole swarm backwards is
+ * almost always a stale advertisement, a rolled-back publish, or a bug in the
+ * version the cloud believes is current — and unlike a failed upgrade, a
+ * downgrade is not self-repairing. The only way to override this is an explicit
+ * `allow_downgrade: true` in the command payload (see `OtaUpdater.forceUpdate`).
+ */
+export function isVersionOlder(candidate: string, current: string = APP_VERSION): boolean {
+  return isOlder(candidate, current);
 }

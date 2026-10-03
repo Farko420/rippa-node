@@ -98,6 +98,26 @@ export interface RemoteCommand {
   args?: Record<string, unknown>;
 }
 
+/**
+ * True when a command payload explicitly authorises a DOWNGRADE.
+ *
+ * `allow_downgrade` (snake_case, matching the rest of the Mothership's wire
+ * contract) and `allowDowngrade` (camelCase, matching this codebase's internal
+ * types) are both accepted, because the same flag is set in two different
+ * places — a `pending_commands` entry from the cloud and a task payload from the
+ * queue — and an operator must not have to remember which spelling applies where.
+ *
+ * ONLY A REAL BOOLEAN TRUE COUNTS. A JSON payload can carry the string "false",
+ * the number 0, or a nested object, and `Boolean(value)` would read every one of
+ * those as consent to roll a node backwards. This is a consent flag, so it is
+ * checked strictly.
+ */
+export function wantsDowngrade(entry: Pick<RemoteCommand, "args">): boolean {
+  const args = entry.args;
+  if (!args || typeof args !== "object") return false;
+  return args["allow_downgrade"] === true || args["allowDowngrade"] === true;
+}
+
 /** The task this node is currently executing, mirrored from Task Manager. */
 export interface CurrentProcessInfo {
   /** Task type/id, e.g. "scrape" or the swarm task id. */
@@ -146,14 +166,20 @@ export interface CommandHandlers {
   /** Gracefully stop work and exit. */
   restartNode: () => Promise<void> | void;
   /**
-   * Run the OTA pipeline now (download + detached swap).
+   * Run the OTA pipeline now (download + handoff to the watchdog).
+   *
+   * @param options.allowDowngrade permits installing a build OLDER than the one
+   *          running. Off unless the operator's `FORCE_UPDATE` payload explicitly
+   *          carries `allow_downgrade: true` — forcing alone must never roll a
+   *          node backwards.
    *
    * @returns true when the command counts as APPLIED — a swap is committed (and
    *          the process is exiting), or the node is in dev mode and physically
    *          cannot swap itself. Only meaningful on paths that do NOT exit
-   *          (unusable payload, refused handoff, failed download).
+   *          (unusable payload, refused handoff, failed download, refused
+   *          downgrade).
    */
-  forceUpdate: () => Promise<boolean> | boolean | void;
+  forceUpdate: (options?: { allowDowngrade?: boolean }) => Promise<boolean> | boolean | void;
   /** Enable or disable satellite-to-satellite mesh routing. */
   setP2pEnabled: (enabled: boolean) => Promise<void> | void;
   /** Reports the node's current P2P state, so TOGGLE_P2P can invert it. */
@@ -523,12 +549,14 @@ export async function executePendingCommands(
             status: "in_progress",
           });
           acknowledgedUpFront = true;
-          const committed = await handlers.forceUpdate();
+          const committed = await handlers.forceUpdate({
+            ...(wantsDowngrade(entry) ? { allowDowngrade: true } : {}),
+          });
           if (committed === false) {
             await acknowledge(
               handlers,
               "FORCE_UPDATE",
-              "not applied — no swap was committed (Mothership payload unusable, download failed, or another updater owns the handoff)",
+              "not applied — no swap was committed (Mothership payload unusable, download failed, the requested version was older than this node's, or another updater owns the handoff)",
               { ...ackContext, status: "failed" },
             );
             // The record is now correct, so the generic completion ack below

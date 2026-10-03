@@ -25,12 +25,15 @@ import { latestNodeEvent, publishNodeEvent, subscribeNodeEvents } from "./servic
 import { getDeepBrain } from "./db/database";
 import { ollamaManager } from "./services/ollamaManager";
 import {
+  RELEASE_ASSET_NAME,
   SwarmUpdater,
   handleUpdateTrigger,
   isPackagedExe,
   parseUpdateTrigger,
+  releaseDownloadUrl,
 } from "./services/updater";
 import { isVersionNewer } from "./version";
+import { EXIT_APPLY_UPDATE, EXIT_RESTART, EXIT_SHUTDOWN, isUnderWatchdog } from "./update/exitCodes";
 import {
   DEFAULT_DASHBOARD_PIN,
   applyConfigToEnv,
@@ -140,6 +143,32 @@ export function getSwarmUpdater(): SwarmUpdater {
 /** Registers the re-initializer run after a GUI config save. */
 export function onConfigChange(handler: ConfigChangeHandler | null): void {
   configChangeHandler = handler;
+}
+
+/**
+ * THE NODE'S LIFECYCLE ACTIONS, registered by index.ts.
+ *
+ * The Express app lives here but the graceful-teardown sequence lives in the boot
+ * sequence, because it owns the service handles that have to be stopped. So the
+ * routes below cannot call `shutdown` directly; the boot sequence registers it,
+ * exactly as it does for `onConfigChange`.
+ *
+ * Both handlers end in `process.exit`, with a code the Rippa Watchdog reads:
+ * restart is 42 and shutdown is 0 (see `src/update/exitCodes.ts`). That is the
+ * whole reason a remote restart is no longer a remote shutdown — there is a
+ * process on the other end of the exit code whose job is to bring the node back.
+ */
+export interface NodeLifecycleHandlers {
+  /** Stop every service cleanly and exit 42 so the watchdog relaunches us. */
+  restart: () => Promise<void> | void;
+  /** Stop every service cleanly and exit 0, leaving the machine dark. */
+  shutdown: () => Promise<void> | void;
+}
+
+let lifecycle: NodeLifecycleHandlers | null = null;
+
+export function setNodeLifecycle(handlers: NodeLifecycleHandlers | null): void {
+  lifecycle = handlers;
 }
 
 function parseCookies(header: string | undefined): Record<string, string> {
@@ -1528,6 +1557,90 @@ export function createApp(): Express {
     }
   });
 
+// POST /api/node/restart — the operator-facing restart, and the exit-code handoff.
+  //
+  // WHY THIS ENDS IN AN EXIT CODE AND NOT A SCRIPT. This node cannot relaunch
+  // itself: Windows keeps a running .exe mapped, and even if it could, a process
+  // that spawns a replacement has nothing left to notice the replacement dying.
+  // The old implementation therefore treated "restart" as "shut down and hope",
+  // which is exactly why a remote restart acted like a remote shutdown. The
+  // restart is now performed by `rippa-watchdog.exe`, which is told what to do
+  // by the code this handler exits with.
+  //
+  // The response is written BEFORE the exit is scheduled, so the operator's
+  // browser gets a definite answer rather than a dropped connection — and the
+  // delay gives the SSE stream a moment to deliver the "Restarting…" overlay, so
+  // the dashboard explains itself instead of just going blank.
+  app.post("/api/node/restart", requireDashboardAuth, (_req: Request, res: Response) => {
+    if (!lifecycle) {
+      res.status(503).json({
+        success: false,
+        message: "The node's lifecycle handlers are not registered yet — try again in a moment.",
+      });
+      return;
+    }
+
+    const supervised = isUnderWatchdog();
+    publishNodeEvent({
+      kind: "admin_command",
+      command: "RESTART_NODE",
+      title: "Restarting Node…",
+      detail: supervised
+        ? `The Rippa Watchdog will relaunch this node immediately (exit ${EXIT_RESTART}).`
+        : "No watchdog is supervising this node, so it will not come back automatically.",
+      blocking: true,
+    });
+
+    res.json({
+      success: true,
+      action: "restart",
+      exitCode: EXIT_RESTART,
+      supervised,
+      message: supervised
+        ? `Restarting — the watchdog will relaunch rippa-node.exe (exit ${EXIT_RESTART}).`
+        : `Restarting — but no watchdog is running, so this node will stay down (exit ${EXIT_RESTART}). Run "rippa-watchdog.exe --install" and start it to supervise.`,
+    });
+
+    setTimeout(() => void lifecycle?.restart(), 250);
+  });
+
+  // POST /api/node/shutdown — the operator-facing shutdown.
+  //
+  // Exit 0 is the code that tells the watchdog "this was deliberate, do not
+  // restart it". That is the whole distinction between this route and the one
+  // above, and it is why a genuine shutdown leaves the machine dark on purpose
+  // instead of the watchdog fighting the operator's decision on every poll.
+  app.post("/api/node/shutdown", requireDashboardAuth, (_req: Request, res: Response) => {
+    if (!lifecycle) {
+      res.status(503).json({
+        success: false,
+        message: "The node's lifecycle handlers are not registered yet — try again in a moment.",
+      });
+      return;
+    }
+
+    const supervised = isUnderWatchdog();
+    publishNodeEvent({
+      kind: "admin_command",
+      command: "SHUTDOWN_NODE",
+      title: "Shutting Down…",
+      detail: "The operator asked this node to stop. The watchdog will not restart it.",
+      blocking: true,
+    });
+
+    res.json({
+      success: true,
+      action: "shutdown",
+      exitCode: EXIT_SHUTDOWN,
+      supervised,
+      message: supervised
+        ? `Shutting down — the watchdog will exit and leave the node down (exit ${EXIT_SHUTDOWN}).`
+        : "Shutting down.",
+    });
+
+    setTimeout(() => void lifecycle?.shutdown(), 250);
+  });
+
 // GET /api/mesh/updater — OTA status for the dashboard.
   app.get("/api/mesh/updater", requireDashboardAuth, (_req: Request, res: Response) => {
     const latest = swarmUpdater.getLatest();
@@ -1537,6 +1650,23 @@ export function createApp(): Express {
       latest,
       updateAvailable: latest ? isVersionNewer(latest.version) : false,
       selfReplaceable: isPackagedExe(),
+      /*
+        PUBLISHED ASSET CONTRACT. The download URL is a literal filename lookup on
+        GitHub, so the exact asset name is part of the updater's public contract —
+        not an implementation detail. Surfacing it lets an operator confirm, from
+        the dashboard, that the release their node will fetch is the one the URL
+        in the Mothership payload actually names.
+      */
+      releaseAsset: RELEASE_ASSET_NAME,
+      releaseDownloadUrl: releaseDownloadUrl(),
+      // Whether a watchdog will bring this node back after a restart, a crash or
+      // an update. Without it, "restart" and "shutdown" look identical.
+      watchdog: {
+        supervised: isUnderWatchdog(),
+        // Exit codes this process will use to talk to the watchdog, spelled out so
+        // an operator reading the log can match it against the watchdog's own.
+        exitCodes: { shutdown: EXIT_SHUTDOWN, restart: EXIT_RESTART, update: EXIT_APPLY_UPDATE },
+      },
       onlineSatellites: dispatcher.listOnlineSatellites().length,
     });
   });

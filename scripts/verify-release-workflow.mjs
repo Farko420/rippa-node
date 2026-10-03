@@ -99,15 +99,86 @@ const commitBump = (job.steps ?? []).find((s) => s.name === "Commit the version 
 check("the commit-back is skipped on a tag (detached HEAD)", /github\.ref_type != 'tag'/.test(commitBump?.if ?? ""), commitBump?.if);
 
 /*
-  THE VERIFICATION STEP. `fail_on_unmatched_files: false` is deliberate, and its
-  consequence is that a renamed binary publishes a release with no .exe asset
-  while the run stays green — and `parseLatestRelease` ignores such a release
-  outright. Something has to ask GitHub what it actually published.
+  THE VERIFICATION STEP, AND THE ASSET NAME IT ENFORCES.
+
+  The updater fetches its binary by LITERAL FILENAME lookup —
+  `/releases/latest/download/rippa-node.exe` — so the asset name is part of the
+  updater's public contract, not a packaging detail. A release that publishes the
+  right bytes under any other name 404s on every node, and does so silently: the
+  release page looks perfect and the fleet simply never updates.
+
+  So this step is asserted to check for that EXACT name, and the workflow's
+  `files:` list is asserted to name the same file explicitly. The two are the same
+  contract seen from each side, which is why they are asserted together rather
+  than separately — a rename that changed only one of them is precisely the bug.
+
+  The watchdog is asserted too: a release carrying a worker with no supervisor
+  reproduces the original fault (a restart that acts as a shutdown), so shipping
+  one without the other is not a state the fleet should ever reach.
 */
 const verify = (job.steps ?? []).find((s) => String(s.name ?? "").startsWith("Verify the published"));
 check("a post-publish verification step exists", Boolean(verify));
 check("it reads the endpoint the fleet polls", /releases\/latest/.test(verify?.run ?? ""));
-check("it requires a .exe asset", /-like "\*\.exe"/.test(verify?.run ?? ""));
+
+// The exact name, matching RELEASE_ASSET_NAME in src/services/updater.ts.
+const ASSET = "rippa-node.exe";
+check(
+  "the verification names the exact asset the updater requests",
+  verify?.run?.includes(`$expectedAsset = '${ASSET}'`),
+  "the workflow and the updater must agree on the literal filename",
+);
+check(
+  "it matches that asset by EXACT name, not by wildcard",
+  /Where-Object \{ \$_\.name -eq \$expectedAsset \}/.test(verify?.run ?? "") &&
+    !/Where-Object \{ \$_\.name -like "\*\\\.exe" \}/.test(verify?.run ?? ""),
+  'a -like "*.exe" rule is a coin flip between the worker and the watchdog',
+);
+check(
+  "it requires the watchdog asset as well",
+  /rippa-watchdog\.exe/.test(verify?.run ?? ""),
+  "a worker with no supervisor regresses restart-as-shutdown",
+);
+
+/*
+  THE RELEASE MUST NAME ITS FILES, NOT GLOB THEM.
+
+  `files: dist/*.exe` published whatever happened to be in dist/ — which, now that
+  the supervisor ships too, includes a second .exe the asset-selection rule has to
+  disambiguate. Worse, `fail_on_unmatched_files: false` meant a rename published a
+  release with NO asset at all while the run reported success: the exact shape of
+  the silent 404 this whole contract exists to prevent.
+*/
+const files = publish?.with?.files ?? "";
+check(
+  "the worker is published under its exact name",
+  files.includes(`dist/${ASSET}`),
+  files,
+);
+check("the watchdog is published too", files.includes("dist/rippa-watchdog.exe"), files);
+check(
+  "no wildcard .exe glob is published",
+  !/\*\.exe/.test(files),
+  "a glob publishes whatever dist/ happens to contain, which is not a contract",
+);
+check(
+  "a missing file FAILS the release instead of publishing an empty one",
+  publish?.with?.fail_on_unmatched_files === true,
+  String(publish?.with?.fail_on_unmatched_files),
+);
+
+/*
+  THE LOCATE STEP MUST PICK THE WORKER BY NAME.
+
+  It used to take the LARGEST .exe, which only ever returned the worker by
+  accident — an accident that ends the moment the watchdog grows past it, and
+  would then publish a supervisor as the fleet's worker.
+*/
+const locate = (job.steps ?? []).find((s) => s.id === "exe");
+check(
+  "the artifact is located by exact name, not by size",
+  locate?.run?.includes(`$wanted = '${ASSET}'`) && !/Sort-Object Length/.test(locate?.run ?? ""),
+  "size-ordering is how the wrong binary gets published",
+);
 
 /* ── 2. PowerShell parses ────────────────────────────────────────────────── */
 
