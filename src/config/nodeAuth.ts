@@ -111,14 +111,23 @@ function read(): ReturnType<typeof readConfigLenient> {
  * This is the only write path for mesh state, which guarantees a GUI save
  * (which round-trips through normalizeConfig) can never erase a node code, a
  * completed pairing handshake, or Master-provisioned sibling endpoints.
+ *
+ * IT CREATES THE FILE WHEN THERE ISN'T ONE. It used to read the config and
+ * `return` silently when `readConfigLenient()` gave back null, which is the
+ * case on a first boot — there is no config.json yet. That early return is what
+ * made the node code regenerate on every restart: `ensureNodeIdentity()` minted
+ * a code, called this, got a silent no-op back, returned the code to its caller
+ * for the life of the process, and threw it away on exit. Nothing was written,
+ * so the next boot minted another one, and the Mothership accumulated a new
+ * ghost node per restart. A persist helper that drops data when there is no file
+ * yet is precisely inverted: no file is the case where writing matters MOST.
  */
 function persist(patch: Record<string, unknown>): void {
   const stored = read();
-  if (!stored) return;
-  writeConfig(resolveAppRoot(), {
-    ...(JSON.parse(JSON.stringify(stored)) as Record<string, unknown>),
-    ...patch,
-  } as never);
+  // `?? {}` rather than an early return: an absent config is an empty config, so
+  // the patch simply becomes the whole first file.
+  const base = stored ? (JSON.parse(JSON.stringify(stored)) as Record<string, unknown>) : {};
+  writeConfig(resolveAppRoot(), { ...base, ...patch } as never);
 }
 
 /**

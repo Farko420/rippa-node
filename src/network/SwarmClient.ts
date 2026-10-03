@@ -1,7 +1,7 @@
 ﻿import axios, { type AxiosInstance } from "axios";
 import { schedule, type ScheduledTask } from "node-cron";
 import { env } from "../config";
-import { currentNodeIdentity } from "../config/nodeAuth";
+import { currentNodeIdentity, ensureNodeIdentity } from "../config/nodeAuth";
 import {
   buildHeartbeatTelemetry,
   executePendingCommands,
@@ -32,6 +32,22 @@ export type NodeStatus = "idle" | "busy" | "working";
  */
 export interface HeartbeatPayload {
   nodeName: string;
+  /**
+   * This node's permanent identity, e.g. "RIPPA-QJ9T-25WL".
+   *
+   * WHY IT IS IN THE HEARTBEAT, and why it is the identity and not `nodeName`:
+   * the Mothership keys its fleet table on the node code, and every other message
+   * this node sends identifies itself that way — the claim, the result, the
+   * forage push. The heartbeat was the one POST in that set carrying no code at
+   * all, so the fleet's view of this node could not be matched to the row the rest
+   * of its traffic updates, and the cloud had nothing durable to correlate on.
+   *
+   * `nodeName` is operator-editable and NOT unique, so it can only ever be a
+   * display label. Two nodes both called "Desktop" is normal and must not merge
+   * into one fleet entry; the node code is what makes the row stable across
+   * renames, IP changes and OTA updates.
+   */
+  nodeCode: string;
   role: "master" | "satellite";
   status: NodeStatus;
   timestamp: string;
@@ -370,8 +386,22 @@ export class SwarmClient {
       /* provider unavailable â€” fall back to the neutral default */
     }
 
+    /*
+      THE NODE CODE COMES FROM THE PERSISTED IDENTITY.
+
+      `ensureNodeIdentity()` rather than `currentNodeIdentity()` so the very first
+      heartbeat of a first boot MINTS AND PERSISTS a code, instead of putting "" on
+      the wire and leaving the cloud to invent an identity it could never match
+      again. After that it is a plain config.json read, so the value is identical
+      on every ping for the life of the install - which is the whole point: the
+      Mothership upserts one fleet row per code, and a value that changed between
+      pings is exactly what created a ghost row per restart.
+    */
+    const nodeCode = ensureNodeIdentity().code;
+
     const payload: HeartbeatPayload = {
       nodeName: env.NODE_NAME,
+      nodeCode,
       role: env.NODE_ROLE,
       status: this.status,
       timestamp: new Date().toISOString(),

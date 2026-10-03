@@ -492,6 +492,46 @@ export interface ConfigValidationFailure {
 }
 
 /**
+ * Fields that belong to the MESH, not to the operator's settings form.
+ *
+ * WHY THIS LIST EXISTS. `writeConfig` normalises and writes whatever it is
+ * given — it is NOT a merge — so any field the incoming payload does not name is
+ * DELETED. The Setup / Settings form has inputs for the role, name, API key,
+ * Master URL, Cloud Link, port and Ollama URL, and nothing else. It therefore
+ * posts a payload in which every key below is absent, and saving any setting
+ * silently destroyed the node's identity, its mesh key and its pairing.
+ *
+ * THAT WAS THE SECOND HALF OF THE "NEW NODE CODE ON EVERY RESTART" BUG. With the
+ * code wiped by a settings save, the next boot found no `NODE_CODE`, minted a
+ * fresh one, and reported a different identity to the Mothership — so the fleet
+ * database accumulated a duplicate "ghost node" for every save/restart cycle, and
+ * any Cloud Link tunnel keyed to the old code pointed nowhere.
+ *
+ * These fields are machine-owned: written by the pairing handshake, the Master's
+ * provisioning push and `nodeAuth`, and NEVER edited by the operator. Carrying
+ * them forward on every save is therefore correct by construction, and it means a
+ * future field added to the mesh layer is protected by default instead of being
+ * silently destroyed until someone notices.
+ */
+const MESH_OWNED_FIELDS = [
+  "NODE_CODE",
+  "NODE_CREATED_AT",
+  "PAIRED_MASTER_CODE",
+  "PAIRED_MASTER_URL",
+  "PAIRED_MASTER_CLOUD_URL",
+  "PAIRED_MASTER_AT",
+  "MESH_KEY",
+  "MESH_KEY_ISSUER",
+  "MESH_KEY_PREVIOUS",
+  "MESH_KEY_ROTATED_AT",
+  "MESH_KEY_REVOKED",
+  "P2P_ENABLED",
+  "PEER_MESH",
+  "SATELLITE_REGISTRY",
+  "GITHUB_OTA_TOKEN",
+] as const;
+
+/**
  * Validates GUI/API input for POST /api/system/config.
  * Accepts both UPPER_SNAKE and lowercase node_role / master_node_url keys.
  */
@@ -561,7 +601,30 @@ export function validateConfigInput(
     });
   }
   if (errors.length > 0) return { ok: false, errors };
-  const config = normalizeConfig({ ...record, NODE_ROLE: role, node_role: role });
+
+  /*
+    CARRY THE MESH-OWNED STATE FORWARD.
+
+    `record` is the operator's settings form, which contains no mesh fields, and
+    `writeConfig` REPLACES the file rather than merging into it. Merging here —
+    at the single point every config write passes through — is what stops a
+    settings save from deleting the node code, the mesh key and the pairing.
+
+    An existing value is only applied to a key the payload did NOT mention, so a
+    caller that genuinely intends to change one (the pairing handshake and mesh
+    key rotation both write through `nodeAuth`) still wins.
+  */
+  const merged: Record<string, unknown> = { ...record };
+  const stored = readConfigLenient();
+  if (stored) {
+    const existing = stored as unknown as Record<string, unknown>;
+    for (const field of MESH_OWNED_FIELDS) {
+      if (record[field] === undefined && existing[field] !== undefined) {
+        merged[field] = existing[field];
+      }
+    }
+  }
+  const config = normalizeConfig({ ...merged, NODE_ROLE: role, node_role: role });
   return { ok: true, config };
 }
 

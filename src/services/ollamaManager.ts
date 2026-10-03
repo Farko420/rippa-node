@@ -22,6 +22,7 @@ import {
   BUNDLED_OLLAMA_PORT,
   bundledBinaryPath,
   bundledBinaryPresent,
+  bundledRuntimeComplete,
   bundledOllamaEnv,
   bundledOllama,
   ensureBundledBinary,
@@ -114,6 +115,16 @@ export interface OllamaStatus {
   bundledRuntime: boolean;
   /** Absolute path of the bundled runtime binary, or "" when none is installed. */
   bundledBinaryPath: string;
+  /**
+   * True only when the bundled runtime is COMPLETE - both `ollama.exe` and
+   * `lib/ollama/llama-server[.exe]` are present.
+   *
+   * `bundledRuntime` stays true for a half-install, and the difference matters:
+   * a supervisor with no llama-server beside it boots, binds the port and answers
+   * `/api/tags`, then fails every single inference. A panel that only showed
+   * "binary present" would call that state healthy.
+   */
+  bundledRuntimeComplete: boolean;
   /** Release tag of the installed bundled runtime, or "". */
   bundledVersion: string;
 }
@@ -248,6 +259,9 @@ class OllamaManager {
       // owns its own contained Ollama from one borrowing a host-wide install.
       bundledRuntime: bundledBinaryPresent(),
       bundledBinaryPath: bundledBinaryPresent() ? bundledBinaryPath() : "",
+      // Deliberately reported alongside `bundledRuntime`: they disagree exactly
+      // when the install is broken, which is the case worth surfacing.
+      bundledRuntimeComplete: bundledRuntimeComplete(),
       bundledVersion: bundledOllama.getStatus().version,
     };
   }
@@ -295,7 +309,15 @@ class OllamaManager {
       // Materialise the runtime before spawning it. A throw here (caught below)
       // means this platform genuinely has no published build AND nothing is on
       // disk — a real "cannot run here", not a transient fault.
-      const binary = bundledBinaryPresent() ? bundledBinaryPath() : await ensureBundledBinary();
+      //
+      // THE CONDITION IS `bundledRuntimeComplete()`, NOT `bundledBinaryPresent()`.
+      // Checking only for `ollama.exe` is what produced the reported failure: a
+      // folder holding the supervisor but no `lib/ollama/llama-server.exe` was
+      // treated as ready, so nothing was ever downloaded, the server started, and
+      // every extraction then failed with "llama-server binary not found". The
+      // cheap path now requires the whole runtime tree; `ensureBundledBinary()`
+      // is the fallback that notices a half-install and rebuilds it.
+      const binary = bundledRuntimeComplete() ? bundledBinaryPath() : await ensureBundledBinary();
       const child = spawn(binary, ["serve"], {
         // Isolation env applied LAST so it wins over any stray value already in
         // this process's environment (see bundledOllamaEnv for why each matters).

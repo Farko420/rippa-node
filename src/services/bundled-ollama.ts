@@ -1,9 +1,10 @@
 ﻿import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { gunzipSync, inflateRawSync, zstdDecompressSync } from "node:zlib";
 import axios from "axios";
+import extractZip from "extract-zip";
 import { dataFilePath } from "../utils/paths";
 import { clearEngineActivity, noteEngineActivity, publishLine } from "./engineTelemetry";
 import { publishNodeEvent } from "./nodeEvents";
@@ -29,6 +30,24 @@ import { publishNodeEvent } from "./nodeEvents";
  *   - `OllamaSetup.exe`. It is an MSI-wrapped installer that wants elevation,
  *     writes to Program Files, registers a service, and starts a tray app. Every
  *     one of those is exactly what "portable, no admin, contained" rules out.
+ *
+ * THE ARCHIVE IS THE RUNTIME - `ollama.exe` ALONE IS NOT. This is the single
+ * most important fact in this file, and it is stated up here because getting it
+ * wrong produces a node that boots cleanly and then fails every single
+ * inference. `ollama serve` is a SUPERVISOR: for every model load it execs
+ * `lib/ollama/llama-server.exe`, which in turn dynamically loads
+ * `lib/ollama/libllama-server-impl.dll` and the `ggml-*` / CUDA / Vulkan
+ * backends beside it. The Windows release zip is therefore 87 entries - one
+ * executable plus a ~1.8 GB `lib/ollama/` tree - and an install that keeps only
+ * the executable produces exactly this at run time:
+ *
+ *     failure during llama-server GPU discovery ... llama-server binary not found
+ *
+ * So the installer downloads the WHOLE archive and unpacks it with its
+ * directory structure intact. `bin/` only counts as a usable runtime when BOTH
+ * `bin/ollama.exe` AND `bin/lib/ollama/llama-server.exe` are on disk (see
+ * `bundledRuntimeComplete()`), and a `bin/` folder that fails that check is
+ * deleted and re-fetched rather than spawned against.
  *   - The `curl https://ollama.com/install.sh | sh` one-liner. Same reason, plus
  *     it installs a systemd unit and a global binary â€” again host mutation.
  *
@@ -77,15 +96,32 @@ export const BUNDLED_OLLAMA_ORIGIN = `http://127.0.0.1:${BUNDLED_OLLAMA_PORT}`;
  */
 export const BUNDLED_DEFAULT_MODEL = "qwen2.5-coder:7b";
 
-/** GitHub release feed the standalone binaries are published to. */
+/** GitHub release feed the release archives are published to. */
 const RELEASE_API = "https://api.github.com/repos/ollama/ollama/releases/latest";
 
-/** A release binary is tens of MB; a slow satellite link needs a real budget. */
-const DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
+/**
+ * The canonical "give me the newest one" download URL for a published asset.
+ *
+ * Used as a FALLBACK when the release feed cannot be read (rate limit, no
+ * network to api.github.com but a working proxy, corporate JSON filtering).
+ * The feed path is preferred because it names the version we installed; this
+ * path installs whatever is newest without saying so, which is why it is second.
+ */
+const RELEASE_LATEST_DOWNLOAD = "https://github.com/ollama/ollama/releases/latest/download";
+
+/** A release archive is ~1.4 GB on Windows; a slow satellite link needs a real budget. */
+const DOWNLOAD_TIMEOUT_MS = 30 * 60_000;
 /** Anything under this is an HTML error page or a truncated transfer. */
-const MIN_BINARY_BYTES = 1024 * 1024;
-/** Sanity ceiling â€” no Ollama binary is gigabytes. */
-const MAX_BINARY_BYTES = 2 * 1024 * 1024 * 1024;
+const MIN_ARCHIVE_BYTES = 1024 * 1024;
+/** Sanity ceiling - the largest published Windows archive is ~1.5 GB. */
+const MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024;
+/**
+ * Floor for a plausible `ollama.exe` (~25 MB today).
+ *
+ * Deliberately NOT reused for `llama-server.exe`, which is only ~20 KB because it
+ * is a thin loader beside `libllama-server-impl.dll` - see `bundledRuntimeComplete`.
+ */
+const MIN_BINARY_BYTES = 8 * 1024 * 1024;
 
 /** How long to wait for the freshly-spawned server to answer `/api/tags`. */
 const SERVER_READY_TIMEOUT_MS = 60_000;
@@ -106,6 +142,32 @@ function describeError(error: unknown): string {
  */
 export function bundledBinaryName(): string {
   return process.platform === "win32" ? "ollama.exe" : "ollama";
+}
+
+/**
+ * Path of the llama.cpp server binary, RELATIVE to `bin/`.
+ *
+ * THIS IS NOT OPTIONAL. `ollama serve` execs this on every model load; without
+ * it the server starts, answers `/api/tags`, lists no models, and fails every
+ * inference with "llama-server binary not found". Ollama resolves it relative to
+ * its own executable, which is precisely why the archive has to be unpacked with
+ * its `lib/ollama/` tree intact rather than flattening `ollama.exe` alone.
+ *
+ * Verified against the live v0.35.1 release: the Windows zip really does carry
+ * `lib/ollama/llama-server.exe` (plus `libllama-server-impl.dll` and the ggml
+ * backends), and the Linux tarball carries `lib/ollama/llama-server`.
+ */
+export const LLAMA_SERVER_RELATIVE_PATH = "lib/ollama/llama-server";
+
+/** Full path of the llama.cpp server binary this runtime depends on. */
+export function bundledLlamaServerPath(): string {
+  const name = process.platform === "win32" ? `${LLAMA_SERVER_RELATIVE_PATH}.exe` : LLAMA_SERVER_RELATIVE_PATH;
+  return path.join(bundledBinDir(), ...name.split("/"));
+}
+
+/** Absolute path of the `lib/ollama` directory inside the bundled runtime. */
+export function bundledLibOllamaDir(): string {
+  return path.join(bundledBinDir(), "lib", "ollama");
 }
 
 /** `<dataDir>/bin`, created on demand. Holds the runtime, not user data. */
@@ -147,13 +209,74 @@ export function installedBundledVersion(): string {
   }
 }
 
-/** True when a usable binary is already sitting in the node's own bin folder. */
+/**
+ * Deletes the whole `bin` folder.
+ *
+ * THE RECOVERY PRIMITIVE FOR A HALF-UNPACKED RUNTIME. An extraction interrupted
+ * by a crash, a full disk, or antivirus can leave a folder that LOOKS installed
+ * (`ollama.exe` is present and correctly sized) but is missing `lib/ollama/`,
+ * because that is where the 1.8 GB of DLLs go and that is what fails first.
+ * Every such folder is poison: the server starts and then cannot load a model.
+ *
+ * So the repair is destructive by design - `recursive: true`, no questions asked
+ * - and it is confined to `<dataDir>/bin`, which contains nothing but the runtime
+ * this function exists to replace. Nothing outside the node's own directory is
+ * ever touched.
+ */
+export function purgeBundledRuntime(): void {
+  const dir = path.join(dataFilePath(), "bin");
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    console.log(`[BundledOllama] Removed ${dir} - the runtime was incomplete.`);
+  } catch (error) {
+    // Loud, because the re-extraction that follows will fail without it.
+    console.warn(`[BundledOllama] Could not remove ${dir} - ${describeError(error)}`);
+  }
+}
+
+/** True when the llama.cpp server binary is sitting in `bin/lib/ollama`. */
+export function bundledLlamaServerPresent(): boolean {
+  try {
+    return fs.statSync(bundledLlamaServerPath()).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when a usable binary is already sitting in the node's own bin folder.
+ *
+ * ONLY checks `ollama.exe`. Use {@link bundledRuntimeComplete} before spawning -
+ * this stays permissive because it also answers "has an operator hand-placed a
+ * binary here?", which is a question about one file rather than about a whole
+ * runtime tree.
+ */
 export function bundledBinaryPresent(): boolean {
   try {
     return fs.statSync(bundledBinaryPath()).size >= MIN_BINARY_BYTES;
   } catch {
     return false;
   }
+}
+
+/**
+ * THE GATE. True only when `bin/` holds BOTH the supervisor and the llama.cpp
+ * server it execs.
+ *
+ * THIS IS THE CHECK THAT THE REPORTED BUG WAS MISSING. `ollama.exe` on its own
+ * is a working PROGRAM that cannot do any WORK, so "the binary is there" was
+ * never a sufficient answer to "is the runtime usable". The failure this catches
+ * is silent at boot and loud at inference time, which is the worst place to find
+ * out: the node looks healthy, the server answers `/api/tags`, and then every
+ * single extraction dies with "llama-server binary not found".
+ *
+ * Both halves are `fs.existsSync`-style stat checks rather than a size heuristic
+ * because `llama-server.exe` is only ~20 KB - it is a thin loader that pulls in
+ * `libllama-server-impl.dll` beside it - so any "is it plausibly sized?" test
+ * tuned for `ollama.exe` would reject it.
+ */
+export function bundledRuntimeComplete(): boolean {
+  return bundledBinaryPresent() && bundledLlamaServerPresent();
 }
 
 // MARK: - Environment isolation
@@ -183,141 +306,217 @@ export function bundledOllamaEnv(): NodeJS.ProcessEnv {
 // MARK: - Archive extraction
 
 /**
- * ZIP member headers. Windows ships `ollama-windows-amd64.zip`, so one reader is
- * genuinely required rather than hypothetical.
+ * Rejects any archive member that would land outside `destDir`.
  *
- * WHY NO LIBRARY. This project is frozen into a single `pkg` exe with no runtime
- * install step, so every dependency is bytes in the binary and a native module
- * must ship prebuilt for each target. A ZIP central-directory walk plus
- * `zlib.inflateRawSync` is ~100 lines and adds nothing to the bundle.
+ * The release archives are downloaded over the network and unpacked, which is a
+ * zip-slip surface: a member named `../../Windows/System32/evil.dll` is enough
+ * to write outside the destination if the name is ever joined to a path without
+ * a check. `extract-zip` performs this same containment check internally, so the
+ * POSIX path below is deliberately held to the identical standard rather than
+ * being the one branch that trusts archive metadata.
+ *
+ * Normalising to a relative path BEFORE the join is what makes this sound: a
+ * leading `/`, a drive letter, or any `..` segment all escape a plain
+ * `path.join(dest, name)`, so they are rejected outright rather than trimmed.
  */
-const EOCD_SIGNATURE = 0x06054b50;
-const CENTRAL_SIGNATURE = 0x02014b50;
-
-/** Pulls the End Of Central Directory record out of a ZIP buffer. */
-function findEocd(buf: Buffer): number {
-  // The EOCD is at the very end but may be followed by up to 64 KB of comment.
-  const start = Math.max(0, buf.length - 0xffff - 22);
-  for (let i = buf.length - 22; i >= start; i--) {
-    if (buf.readUInt32LE(i) === EOCD_SIGNATURE) return i;
+function safeArchiveDestination(destDir: string, entryName: string): string | null {
+  if (!entryName || entryName.includes("\0")) return null;
+  // Reject absolute POSIX paths, Windows drive-qualified paths and UNC paths
+  // before normalising, so `path.join` cannot quietly resolve them back inside.
+  if (entryName.startsWith("/") || entryName.startsWith("\\") || /^[a-zA-Z]:/.test(entryName)) {
+    return null;
   }
-  return -1;
+  const normalised = path.normalize(entryName);
+  if (normalised === ".." || normalised.startsWith(`..${path.sep}`) || path.isAbsolute(normalised)) {
+    return null;
+  }
+  const root = path.resolve(destDir);
+  const resolved = path.resolve(destDir, normalised);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) return null;
+  return resolved;
 }
 
 /**
- * Extracts one named member from a ZIP archive held in memory.
+ * Unpacks a Windows `.zip` release into `bin/`, PRESERVING THE DIRECTORY TREE.
  *
- * Returns the inflated bytes, or null when the member is absent.
+ * THIS FUNCTION REPLACED A SINGLE-MEMBER EXTRACTOR, and that is the whole fix.
+ * The old code walked the ZIP central directory looking for one member whose
+ * BASENAME was `ollama.exe`, returned those ~25 MB, and threw the other 86
+ * entries away - including `lib/ollama/llama-server.exe`, which is what
+ * `ollama serve` execs for every model load. The node therefore installed
+ * cleanly and then failed every inference with "llama-server binary not found".
  *
- * THE SECURITY-RELEVANT DETAIL is that the member NAME IS NEVER USED AS A PATH.
- * A malicious or corrupt archive could carry `../../autorun.exe` as a member name,
- * and any "extract everything" implementation would happily write outside the
- * destination. Here the caller names the exact file it wants and we only ever hand
- * back bytes, so a path-traversal member name has nothing to act on. Stored
- * (uncompressed) members are supported as well as deflated ones.
+ * The archive is passed BY PATH, never as a Buffer. The Windows release is
+ * ~1.4 GB compressed; the previous implementation did `fs.readFileSync` on it
+ * and then held the inflated member in memory too, which on a 4 GB satellite
+ * laptop is an out-of-memory crash rather than an install. `extract-zip` streams
+ * entry-by-entry through `yauzl`, so peak memory is one entry's buffer.
+ *
+ * Returns the number of files written, which the caller uses as a cheap sanity
+ * signal before it checks for the specific binaries it needs.
  */
-export function extractZipMember(archive: Buffer, wantedName: string): Buffer | null {
-  const eocd = findEocd(archive);
-  if (eocd < 0) throw new Error("not a ZIP archive (no end-of-central-directory record)");
-
-  const entryCount = archive.readUInt16LE(eocd + 10);
-  let offset = archive.readUInt32LE(eocd + 16);
-
-  for (let i = 0; i < entryCount; i++) {
-    if (archive.readUInt32LE(offset) !== CENTRAL_SIGNATURE) break;
-    const method = archive.readUInt16LE(offset + 10);
-    const compressedSize = archive.readUInt32LE(offset + 20);
-    const nameLen = archive.readUInt16LE(offset + 28);
-    const extraLen = archive.readUInt16LE(offset + 30);
-    const commentLen = archive.readUInt16LE(offset + 32);
-    const localOffset = archive.readUInt32LE(offset + 42);
-    const name = archive.toString("utf8", offset + 46, offset + 46 + nameLen);
-    offset += 46 + nameLen + extraLen + commentLen;
-
-    // Compare on the BASENAME only: release archives wrap payloads in a version
-    // directory (`ollama-0.5.7/ollama.exe`), and hard-coding a full path would
-    // pin us to one publish layout that Ollama is free to change.
-    if (path.basename(name) !== wantedName) continue;
-
-    // Re-read the LOCAL header: its name/extra lengths are what actually position
-    // the payload, and they may differ from the central directory's.
-    const localNameLen = archive.readUInt16LE(localOffset + 26);
-    const localExtraLen = archive.readUInt16LE(localOffset + 28);
-    const dataStart = localOffset + 30 + localNameLen + localExtraLen;
-    const raw = archive.subarray(dataStart, dataStart + compressedSize);
-
-    if (method === 0) return Buffer.from(raw);
-    if (method === 8) return inflateRawSync(raw);
-    throw new Error(`unsupported ZIP compression method ${method} for "${name}"`);
-  }
-  return null;
-}
-/**
- * Extracts the bundled binary from a POSIX `.tar.zst` / `.tgz` release.
- *
- * Ollama publishes Linux and macOS as compressed tarballs rather than a loose
- * binary, so the "save it and chmod +x" shortcut in the original design does not
- * match what the releases actually contain. This walks the tar header chain and
- * returns the single member we want. Same path-traversal posture as
- * {@link extractZipMember}: the caller picks the member by basename.
- */
-export function extractTarMember(archive: Buffer, wantedName: string): Buffer | null {
-  let offset = 0;
-  while (offset + 512 <= archive.length) {
-    const header = archive.subarray(offset, offset + 512);
-    // A block of NULs is the end-of-archive marker.
-    if (header.every((byte) => byte === 0)) break;
-
-    const nameField = header.toString("utf8", 0, 100).replace(/\0.*$/, "");
-    const sizeField = header.toString("utf8", 124, 136).replace(/\0.*$/, "").trim();
-    const size = sizeField ? parseInt(sizeField, 8) || 0 : 0;
-    const typeFlag = String.fromCharCode(header[156]);
-    const dataStart = offset + 512;
-
-    // Regular files only. A directory entry has type '5', a symlink '2'; neither
-    // is the binary, and following a symlink out of the archive is exactly the
-    // kind of thing this reader refuses to do.
-    if ((typeFlag === "0" || typeFlag === "") && path.basename(nameField) === wantedName) {
-      return Buffer.from(archive.subarray(dataStart, dataStart + size));
-    }
-    // Payloads are padded up to a 512-byte boundary.
-    offset = dataStart + Math.ceil(size / 512) * 512;
-  }
-  return null;
+export async function extractZipTree(archivePath: string, destDir: string): Promise<number> {
+  let written = 0;
+  await extractZip(archivePath, {
+    dir: destDir,
+    onEntry: (entry) => {
+      if (entry.fileName.endsWith("/")) return;
+      written += 1;
+      if (written % 10 === 0) {
+        process.stdout.write(`\r[BundledOllama] extracting runtime: ${written} files   `);
+      }
+    },
+  });
+  if (written > 0) process.stdout.write("\n");
+  return written;
 }
 
 /**
- * Decompresses a downloaded release asset into a plain archive buffer.
+ * Unpacks a POSIX `.tar.zst` / `.tgz` release into `bin/`, preserving the tree.
  *
- * Windows zips need nothing; the POSIX assets are `.tar.zst` (Linux) or `.tgz`
- * (macOS). Detection is by magic bytes rather than by filename so a redirect that
- * renames the file still lands correctly.
+ * Same reasoning as {@link extractZipTree}: Linux and macOS releases carry the
+ * identical `lib/ollama/llama-server` payload, so a basename-only extraction
+ * produced the identical bug on every non-Windows platform. Symlinks (type `2`)
+ * and hard links (type `1`) are skipped rather than recreated - materialising a
+ * symlink an archive points at is how a tarball writes outside its destination.
+ *
+ * The container is stream-decompressed off disk rather than via
+ * `zstdDecompressSync` on a whole-file Buffer, because the Linux release is
+ * ~1.4 GB compressed and several GB raw.
  */
-export function decompressReleaseAsset(archive: Buffer): Buffer {
-  // gzip magic: 1f 8b
-  if (archive[0] === 0x1f && archive[1] === 0x8b) return gunzipSync(archive);
-  // zstd magic: 28 b5 2f fd
-  if (archive[0] === 0x28 && archive[1] === 0xb5 && archive[2] === 0x2f && archive[3] === 0xfd) {
-    // Node 22.15+/23+ exposes zstd on zlib. Older runtimes cannot read a .tar.zst
-    // at all, so this fails loudly rather than writing a corrupt binary.
-    if (typeof zstdDecompressSync !== "function") {
-      throw new Error(
-        "this Node runtime cannot decompress zstd (tar.zst). Ollama's Linux release is " +
-          "zstd-compressed; upgrade Node to 22.15+ or point OLLAMA_URL at a system Ollama.",
-      );
-    }
-    return zstdDecompressSync(archive);
-  }
-  return archive; // already a plain zip
-}
+export async function extractTarTree(archivePath: string, destDir: string): Promise<number> {
+  const magic = readMagicBytes(archivePath, 4);
+  const isGzip = magic[0] === 0x1f && magic[1] === 0x8b;
+  const isZstd = magic[0] === 0x28 && magic[1] === 0xb5 && magic[2] === 0x2f && magic[3] === 0xfd;
 
-/** Makes the extracted binary runnable. A no-op on Windows. */
-function makeExecutable(binaryPath: string): void {
-  if (process.platform === "win32") return;
+  // Node 22.15+/23+ exposes zstd on zlib. Older runtimes cannot read a .tar.zst at
+  // all, so this fails loudly rather than writing a corrupt runtime.
+  const zlib = await import("node:zlib");
+  if (isZstd && typeof zlib.createZstdDecompress !== "function") {
+    throw new Error(
+      "this Node runtime cannot decompress zstd (tar.zst). Ollama's Linux release is " +
+        "zstd-compressed; upgrade Node to 22.15+ or point OLLAMA_URL at a system Ollama.",
+    );
+  }
+
+  // Stage 1: stream the container down to a plain `.tar` on disk.
+  const tarPath = `${archivePath}.tar`;
+  let written = 0;
   try {
-    fs.chmodSync(binaryPath, 0o755);
-  } catch (error) {
-    console.warn(`[BundledOllama] chmod +x failed on ${binaryPath} â€” ${describeError(error)}`);
+    const source = fs.createReadStream(archivePath, { highWaterMark: 1024 * 1024 });
+    const plain: NodeJS.ReadWriteStream = isGzip
+      ? zlib.createGunzip()
+      : isZstd
+        ? zlib.createZstdDecompress()
+        : new PassThrough();
+    await pipeline(source, plain, fs.createWriteStream(tarPath));
+
+    // Stage 2: walk the plain tar, writing each member through the path guard.
+    const handle = fs.openSync(tarPath, "r");
+    try {
+      const header = Buffer.alloc(512);
+      for (;;) {
+        if (fs.readSync(handle, header, 0, 512, null) < 512) break;
+        if (header.every((byte) => byte === 0)) break; // end-of-archive marker
+
+        const nameField = header.toString("utf8", 0, 100).replace(/\0.*$/, "");
+        // The ustar `prefix` field carries long paths split across the header.
+        const prefixField = header.toString("utf8", 345, 500).replace(/\0.*$/, "").trim();
+        const entryName = prefixField ? `${prefixField}/${nameField}` : nameField;
+
+        const sizeField = header.toString("utf8", 124, 136).replace(/\0.*$/, "").trim();
+        const size = sizeField ? parseInt(sizeField, 8) || 0 : 0;
+        const typeFlag = String.fromCharCode(header[156]);
+
+        // '5' directory, '2' symlink, '1' hard link, 'L'/'K' GNU long-name/link.
+        const isDirectory = typeFlag === "5";
+        const isRegular = typeFlag === "0" || typeFlag === "" || typeFlag === "\0" || typeFlag === "7";
+
+        if (isDirectory) {
+          const destination = safeArchiveDestination(destDir, entryName.replace(/\/+$/, ""));
+          if (destination) fs.mkdirSync(destination, { recursive: true });
+        } else if (isRegular) {
+          const destination = safeArchiveDestination(destDir, entryName);
+          if (!destination) {
+            console.warn(`[BundledOllama] Skipped archive member with an unsafe path: ${entryName}`);
+          } else {
+            fs.mkdirSync(path.dirname(destination), { recursive: true });
+            copyTarMember(handle, destination, size);
+            written += 1;
+          }
+        }
+
+        // Payloads are padded up to a 512-byte boundary; skip the padding too.
+        const padded = Math.ceil(size / 512) * 512;
+        if (padded > size) {
+          const padding = Buffer.alloc(padded - size);
+          fs.readSync(handle, padding, 0, padding.length, null);
+        }
+      }
+    } finally {
+      fs.closeSync(handle);
+    }
+  } finally {
+    fs.rmSync(tarPath, { force: true });
+  }
+
+  return written;
+}
+
+/** Copies `size` bytes from an open tar handle to `destination`. */
+function copyTarMember(handle: number, destination: string, size: number): void {
+  if (size <= 0) {
+    fs.writeFileSync(destination, "");
+    return;
+  }
+  const out = fs.openSync(destination, "w");
+  try {
+    const chunk = Buffer.alloc(Math.min(size, 1024 * 1024));
+    let remaining = size;
+    while (remaining > 0) {
+      const want = Math.min(remaining, chunk.length);
+      const read = fs.readSync(handle, chunk, 0, want, null);
+      if (read <= 0) break;
+      fs.writeSync(out, chunk, 0, read);
+      remaining -= read;
+    }
+  } finally {
+    fs.closeSync(out);
+  }
+}
+
+/** Reads the first `count` bytes of a file without loading the whole thing. */
+function readMagicBytes(filePath: string, count: number): number[] {
+  const buffer = Buffer.alloc(count);
+  const handle = fs.openSync(filePath, "r");
+  try {
+    const read = fs.readSync(handle, buffer, 0, count, 0);
+    return [...buffer.subarray(0, Math.max(0, read))];
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+/**
+ * Makes every extracted executable runnable.
+ *
+ * Not just the top-level binary: `ollama serve` also execs `llama-server` and
+ * `llama-quantize` out of `lib/ollama/`, and a tarball does not carry the POSIX
+ * execute bit reliably, so all three are set.
+ */
+function makeExecutablesRunable(binDir: string): void {
+  if (process.platform === "win32") return;
+  const candidates = [
+    path.join(binDir, bundledBinaryName()),
+    path.join(bundledLibOllamaDir(), "llama-server"),
+    path.join(bundledLibOllamaDir(), "llama-quantize"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      fs.chmodSync(candidate, 0o755);
+    } catch (error) {
+      console.warn(`[BundledOllama] chmod +x failed on ${candidate} - ${describeError(error)}`);
+    }
   }
 }
 // MARK: - Release resolution
@@ -367,7 +566,7 @@ export interface ResolvedRelease {
 }
 
 /**
- * Resolves the newest release that actually publishes an asset for this platform.
+ * Resolves the newest release that actually publishes an archive for this platform.
  *
  * WHY IT READS THE FEED INSTEAD OF HARD-CODING `/releases/latest/download/<name>`:
  * the direct URL is simpler but fails opaquely when an asset is missing, and a
@@ -375,6 +574,14 @@ export interface ResolvedRelease {
  * Reading the feed lets us name the release we are installing and say why a
  * platform is unsupported, which is the difference between a supportable failure
  * and a mystery.
+ *
+ * BUT IT IS NOT THE ONLY PATH. `api.github.com` is aggressively rate limited for
+ * unauthenticated callers (60 requests/hour per IP), and a shared satellite
+ * NAT can exhaust that budget for every node behind it at once. When the feed
+ * cannot be read we fall back to the canonical "latest" download URL, which
+ * serves the same bytes from a different host. A node that installs an unnamed
+ * version is strictly better than a node with no runtime, and the fallback is
+ * clearly logged so the operator knows which path ran.
  */
 export async function resolveLatestRelease(): Promise<ResolvedRelease> {
   const assetName = bundledAssetName();
@@ -385,46 +592,62 @@ export async function resolveLatestRelease(): Promise<ResolvedRelease> {
     );
   }
 
-  const response = await axios.get<{
-    tag_name?: string;
-    assets?: { name?: string; browser_download_url?: string; size?: number }[];
-  }>(RELEASE_API, {
-    timeout: 30_000,
-    headers: {
-      Accept: "application/vnd.github+json",
-      // GitHub rejects API requests that carry no user agent.
-      "User-Agent": "rippa-node-bundled-ollama",
-    },
-  });
-  const tag = String(response.data?.tag_name ?? "").trim();
-  const assets = Array.isArray(response.data?.assets) ? response.data.assets : [];
-  const match = assets.find((asset) => asset?.name === assetName);
-  if (!tag || !match?.browser_download_url) {
-    throw new Error(
-      `Ollama ${tag || "(unknown)"} does not publish ${assetName} for ` +
-        `${process.platform}/${process.arch}.`,
+  try {
+    const response = await axios.get<{
+      tag_name?: string;
+      assets?: { name?: string; browser_download_url?: string; size?: number }[];
+    }>(RELEASE_API, {
+      timeout: 30_000,
+      headers: {
+        Accept: "application/vnd.github+json",
+        // GitHub rejects API requests that carry no user agent.
+        "User-Agent": "rippa-node-bundled-ollama",
+      },
+    });
+    const tag = String(response.data?.tag_name ?? "").trim();
+    const assets = Array.isArray(response.data?.assets) ? response.data.assets : [];
+    const match = assets.find((asset) => asset?.name === assetName);
+    if (!tag || !match?.browser_download_url) {
+      throw new Error(
+        `Ollama ${tag || "(unknown)"} does not publish ${assetName} for ` +
+          `${process.platform}/${process.arch}.`,
+      );
+    }
+    return {
+      tag,
+      assetName,
+      downloadUrl: match.browser_download_url,
+      sizeBytes: Number(match.size ?? 0),
+    };
+  } catch (error) {
+    const reason = describeError(error);
+    console.warn(
+      `[BundledOllama] Could not read the Ollama release feed (${reason}). ` +
+        `Falling back to the latest-download URL for ${assetName}.`,
     );
+    return {
+      // Unknown version on purpose: the fallback cannot tell us the tag without
+      // the feed, and inventing one would be a lie in the version stamp.
+      tag: "latest",
+      assetName,
+      downloadUrl: `${RELEASE_LATEST_DOWNLOAD}/${assetName}`,
+      sizeBytes: 0,
+    };
   }
-  return {
-    tag,
-    assetName,
-    downloadUrl: match.browser_download_url,
-    sizeBytes: Number(match.size ?? 0),
-  };
 }
 // MARK: - Download & install
 
 /**
- * Streams an asset to disk and returns the bytes written.
+ * Streams a release ARCHIVE to disk and returns the bytes written.
  *
  * Downloads to a `.part` file and renames only after the stream finishes, for the
- * same reason the OTA updater does it: a half-written executable that looks
- * complete is worse than no executable, because the next boot will happily spawn
- * a truncated file and report the crash as "Ollama is broken".
+ * same reason the OTA updater does it: a half-written file that looks complete is
+ * worse than no file, because the next boot will happily extract from a truncated
+ * archive and report the result as "Ollama is broken".
  *
- * Progress is reported as whole percentages only. Ollama's Windows asset is
- * hundreds of MB and a satellite link is slow; a per-chunk log would emit
- * thousands of lines and bury everything else.
+ * Progress is reported as whole percentages only. Ollama's Windows archive is
+ * ~1.4 GB and a satellite link is slow; a per-chunk log would emit thousands of
+ * lines and bury everything else.
  */
 async function downloadAsset(url: string, destination: string): Promise<number> {
   const partial = `${destination}.part`;
@@ -445,33 +668,53 @@ async function downloadAsset(url: string, destination: string): Promise<number> 
       const percent = Math.floor((received / total) * 100);
       if (percent !== lastPercent) {
         lastPercent = percent;
-        process.stdout.write(`\r[BundledOllama] downloading Ollamaâ€¦ ${percent}%   `);
+        process.stdout.write(`\r[BundledOllama] downloading Ollama: ${percent}%   `);
       }
     }
   });
 
-  await pipeline(stream, fs.createWriteStream(partial));
-  if (total > 0) process.stdout.write("\n");
+  // Any failure past this point MUST remove the partial file. Without this a
+  // failed 1.4 GB download leaves a 1.4 GB `.part` sitting in `bin/`, and the
+  // next attempt starts by re-downloading on top of a full disk. `finally`
+  // covers every exit including the aborted-transfer case that `pipeline`
+  // reports as a throw, and is a no-op once the rename has moved the file away.
+  try {
+    await pipeline(stream, fs.createWriteStream(partial));
+    if (total > 0) process.stdout.write("\n");
 
-  const size = fs.statSync(partial).size;
-  // Refuse a truncated transfer BEFORE it is renamed into place.
-  if (size < MIN_BINARY_BYTES || size > MAX_BINARY_BYTES) {
+    const size = fs.statSync(partial).size;
+    // Refuse a truncated transfer BEFORE it is renamed into place. An HTML error
+    // page from a captive portal is ~10 KB and would otherwise extract as garbage.
+    if (size < MIN_ARCHIVE_BYTES || size > MAX_ARCHIVE_BYTES) {
+      throw new Error(
+        `downloaded ${size} bytes for ${url}, which is outside the plausible range ` +
+          `(${MIN_ARCHIVE_BYTES}-${MAX_ARCHIVE_BYTES}). Treating it as a failed transfer.`,
+      );
+    }
+    fs.renameSync(partial, destination);
+    return size;
+  } finally {
     fs.rmSync(partial, { force: true });
-    throw new Error(
-      `downloaded ${size} bytes for ${url}, which is outside the plausible range ` +
-        `(${MIN_BINARY_BYTES}â€“${MAX_BINARY_BYTES}). Treating it as a failed transfer.`,
-    );
   }
-  fs.renameSync(partial, destination);
-  return size;
 }
 /**
- * Makes sure a usable binary exists in the node's own `bin` folder, downloading
- * the official standalone build when it is missing.
+ * Makes sure a COMPLETE, USABLE runtime exists in the node's own `bin` folder,
+ * downloading and unpacking the official release archive when it is not.
  *
- * `force` re-downloads even when the stamped version already matches, which is
- * what the repair path needs after a corrupted install. Returns the absolute path
- * of the binary now in place.
+ * Returns the absolute path of the supervisor binary now in place.
+ *
+ * THE INVARIANT THIS FUNCTION ESTABLISHES, and everything below exists to
+ * protect it: after this returns, `bin/` contains `ollama.exe` AND
+ * `lib/ollama/llama-server.exe` (plus the ~1.8 GB of ggml/CUDA DLLs beside it).
+ * It is checked on entry, checked again after extraction, and checked again by
+ * every caller before spawning - because the failure mode of getting it wrong is
+ * a node that appears healthy and then fails every single inference.
+ *
+ * `force` re-downloads even when the stamped version already matches. That is
+ * what the repair path needs after a corrupted install, and it is ALSO what
+ * triggers when the completeness check fails on a folder that has a version
+ * stamp: a stamp is evidence about what we installed, not evidence that the
+ * files are still all there.
  */
 export async function ensureBundledBinary(
   options: { force?: boolean; release?: ResolvedRelease } = {},
@@ -479,30 +722,50 @@ export async function ensureBundledBinary(
   const binaryPath = bundledBinaryPath();
   const installed = installedBundledVersion();
 
-  if (bundledBinaryPresent() && installed && !options.force) return binaryPath;
+  // 1. Complete and current? Nothing to do.
+  if (bundledRuntimeComplete() && installed && !options.force) return binaryPath;
 
-  // A binary with no stamp is treated as present-but-unknown rather than as a
-  // reason to re-download: the operator may have placed it there deliberately,
-  // and silently replacing someone's hand-provisioned binary is worse than
-  // leaving it alone.
-  if (bundledBinaryPresent() && !options.force) {
+  // 2. `bin/` holds a binary but NOT the runtime tree around it. This is the
+  //    half-install left behind by the bug this module was rewritten to fix: a
+  //    correctly sized `ollama.exe` sitting alone in `bin/`, with no `lib/ollama/`
+  //    beside it, which starts happily and dies on every model load.
+  //
+  //    It is deleted rather than trusted. The old code's "present-but-unknown,
+  //    assume the operator meant it" courtesy is only defensible for a hand-placed
+  //    COMPLETE runtime; for an incomplete one the only two options are to do
+  //    nothing (the node stays broken forever) or rebuild (the operator gets the
+  //    thing they asked for), and rebuilding is the obvious answer.
+  if (bundledBinaryPresent() && !bundledLlamaServerPresent() && !options.force) {
+    console.warn(
+      `[BundledOllama] ${bundledLlamaServerPath()} is missing - the runtime is only ` +
+        `partly installed. Discarding ${bundledBinDir()} and re-installing.`,
+    );
+    purgeBundledRuntime();
+  } else if (bundledBinaryPresent() && !options.force) {
     console.log(`[BundledOllama] Using the existing bundled runtime at ${binaryPath}.`);
     return binaryPath;
   }
 
   const release = options.release ?? (await resolveLatestRelease());
-  console.log(`[BundledOllama] Installing Ollama ${release.tag} (${release.assetName})â€¦`);
-  publishLine("cmd", `downloading bundled Ollama ${release.tag} â€” no global install required`);
+  console.log(`[BundledOllama] Installing Ollama ${release.tag} (${release.assetName}).`);
+  publishLine("cmd", `downloading bundled Ollama ${release.tag} - no global install required`);
 
+  // The archive is staged INSIDE `bin/` so a failed install cannot leave a
+  // multi-gigabyte `.part` file scattered elsewhere in the data directory, and so
+  // `purgeBundledRuntime()` cleans up an abandoned download along with everything
+  // else. It is removed as soon as extraction finishes - keeping a second copy of
+  // 1.4 GB on a satellite-appliance disk would be indefensible.
   const archivePath = path.join(bundledBinDir(), path.basename(release.assetName));
   try {
     await downloadAsset(release.downloadUrl, archivePath);
   } catch (error) {
     // A failed upgrade must not DELETE a working older runtime. Falling back keeps
-    // the node's brain available while the operator is offline.
-    if (bundledBinaryPresent()) {
+    // the node's brain available while the operator is offline - but ONLY when the
+    // older runtime is actually complete. Falling back to a half-install would
+    // just relocate the failure from install time to inference time.
+    if (bundledRuntimeComplete()) {
       console.warn(
-        `[BundledOllama] Upgrade to ${release.tag} failed (${describeError(error)}) â€” ` +
+        `[BundledOllama] Upgrade to ${release.tag} failed (${describeError(error)}) - ` +
           `keeping the existing runtime.`,
       );
       return binaryPath;
@@ -510,37 +773,92 @@ export async function ensureBundledBinary(
     throw error;
   }
 
-  const archive = fs.readFileSync(archivePath);
-  const payload =
-    process.platform === "win32"
-      ? extractZipMember(archive, bundledBinaryName())
-      : extractTarMember(decompressReleaseAsset(archive), bundledBinaryName());
+  // Extraction goes to a scratch folder first and is only promoted into `bin/`
+  // once it has been proved complete. Extracting straight into the live folder
+  // means an interrupted run leaves the previous version's files interleaved with
+  // the new version's, which is a state no version check can ever validate.
+  //
+  // IT IS A SIBLING OF `bin/`, NOT A CHILD OF IT. The promote step empties `bin/`
+  // wholesale, so a staging folder inside it would be deleted by its own cleanup;
+  // putting it beside `bin/` keeps the two lifecycles independent and means
+  // `purgeBundledRuntime()` cannot delete a half-extracted tree out from under
+  // the rename that is about to promote it.
+  const staging = path.join(dataFilePath(), ".bin-staging");
+  fs.rmSync(staging, { recursive: true, force: true });
+  fs.mkdirSync(staging, { recursive: true });
 
-  fs.rmSync(archivePath, { force: true });
-  if (!payload || payload.length < MIN_BINARY_BYTES) {
-    throw new Error(
-      `${release.assetName} did not contain a usable ${bundledBinaryName()} ` +
-        `(got ${payload ? payload.length : 0} bytes).`,
+  try {
+    const files = process.platform === "win32"
+      ? await extractZipTree(archivePath, staging)
+      : await extractTarTree(archivePath, staging);
+    console.log(`[BundledOllama] Extracted ${files} files from ${path.basename(release.assetName)}.`);
+
+    // 3. VERIFY BEFORE PROMOTING. Both checks are against the staging tree, so a
+    //    failure costs one re-download rather than a destroyed working runtime.
+    if (!fs.existsSync(path.join(staging, bundledBinaryName()))) {
+      throw new Error(`the archive did not contain ${bundledBinaryName()}`);
+    }
+    const stagedServer = path.join(
+      staging,
+      ...(process.platform === "win32"
+        ? `${LLAMA_SERVER_RELATIVE_PATH}.exe`
+        : LLAMA_SERVER_RELATIVE_PATH).split("/"),
     );
+    if (!fs.existsSync(stagedServer)) {
+      // This is the check whose absence caused the reported bug. Stating it as a
+      // hard failure rather than a warning is deliberate: a runtime without
+      // llama-server cannot load a single model, so "installed" would be a lie.
+      throw new Error(
+        `the archive did not contain ${process.platform === "win32" ? `${LLAMA_SERVER_RELATIVE_PATH}.exe` : LLAMA_SERVER_RELATIVE_PATH}` +
+          ` - an Ollama release without it cannot load a model, so there is no point installing it`,
+      );
+    }
+
+    // 4. Promote. `bin/` is emptied first so an upgrade cannot leave stale DLLs
+    //    that the newer runtime would still find and load.
+    const live = bundledBinDir();
+    for (const entry of fs.readdirSync(live)) {
+      if (entry === "ollama.version") continue; // survives an upgrade on purpose
+      fs.rmSync(path.join(live, entry), { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    }
+    for (const entry of fs.readdirSync(staging)) {
+      fs.renameSync(path.join(staging, entry), path.join(live, entry));
+    }
+  } catch (error) {
+    // The extraction failed. Leave NOTHING half-written behind: an incomplete
+    // `bin/` is precisely the state this module exists to detect, and creating one
+    // deliberately while trying to escape one would be absurd.
+    //
+    // `bin/` is purged ONLY when it is not already known-good. If this was an
+    // upgrade over a working runtime and the new archive failed to unpack, the
+    // old one is still on disk and still works - destroying it would turn a
+    // failed upgrade into a node with no brain at all.
+    if (!bundledRuntimeComplete()) purgeBundledRuntime();
+    throw error;
+  } finally {
+    fs.rmSync(staging, { recursive: true, force: true });
+    fs.rmSync(archivePath, { force: true });
+    fs.rmSync(`${archivePath}.part`, { force: true });
   }
 
-  fs.writeFileSync(binaryPath, payload);
-  makeExecutable(binaryPath);
+  makeExecutablesRunable(bundledBinDir());
   fs.writeFileSync(bundledVersionStampPath(), release.tag, "utf8");
 
   console.log(
-    `[BundledOllama] Ollama ${release.tag} installed â†’ ${binaryPath} ` +
-      `(${(payload.length / (1024 * 1024)).toFixed(1)} MB, contained in the node's own directory).`,
+    `[BundledOllama] Ollama ${release.tag} installed into ${bundledBinDir()} ` +
+      `(ollama.exe + ${path.relative(bundledBinDir(), bundledLlamaServerPath())} + runtime DLLs, ` +
+      `contained in the node's own directory).`,
   );
   publishNodeEvent({
     kind: "info",
     title: "Bundled Ollama installed",
     detail:
-      `Ollama ${release.tag} downloaded into the node's own bin folder â€” ` +
+      `Ollama ${release.tag} downloaded and unpacked into the node's own bin folder - ` +
       `nothing was installed system-wide.`,
   });
-  return binaryPath;
+  return bundledBinaryPath();
 }
+
 // MARK: - Isolated server probe
 
 /**
@@ -628,8 +946,17 @@ export async function pullBundledModel(
 ): Promise<{ ok: boolean; message: string }> {
   const say = onProgress ?? ((line: string) => publishLine("out", line));
 
-  if (!bundledBinaryPresent()) {
-    return { ok: false, message: "the bundled Ollama binary is not installed yet" };
+  // Requires the WHOLE runtime, not just the supervisor. `ollama pull` against a
+  // binary with no `lib/ollama/` beside it cannot pull anything, and reporting
+  // that as "the binary is not installed yet" would send the operator looking in
+  // the wrong place; this says precisely which file is missing.
+  if (!bundledRuntimeComplete()) {
+    return {
+      ok: false,
+      message: bundledBinaryPresent()
+        ? `the bundled Ollama runtime is incomplete - ${bundledLlamaServerPath()} is missing`
+        : "the bundled Ollama binary is not installed yet",
+    };
   }
 
   say(`pulling ${model} into ${bundledModelsDir()} â€¦`);
@@ -750,6 +1077,10 @@ export interface BundledStatus {
   pid: number | null;
   restartCount: number;
   lastError: string | null;
+  /** True when BOTH `ollama.exe` and `lib/ollama/llama-server[.exe]` are on disk. */
+  runtimeComplete: boolean;
+  /** Absolute path of the llama.cpp server binary, or "" when it is not installed. */
+  llamaServerPath: string;
 }
 /**
  * THE SUPERVISOR â€” owns the bundled child's whole life.
@@ -794,6 +1125,11 @@ export class BundledOllamaManager {
       pid: this.child?.pid ?? null,
       restartCount: this.restartCount,
       lastError: this.lastError,
+      // Surfaced separately from `binaryPresent` because the two genuinely differ,
+      // and the difference is the whole bug: a supervisor on disk with no
+      // llama-server beside it cannot load a model.
+      runtimeComplete: bundledRuntimeComplete(),
+      llamaServerPath: bundledLlamaServerPresent() ? bundledLlamaServerPath() : "",
     };
   }
 
@@ -843,19 +1179,61 @@ export class BundledOllamaManager {
     } catch (error) {
       this.lastError = describeError(error);
       this.state = "crashed";
-      console.warn(`[BundledOllama] Startup failed â€” ${this.lastError}`);
+      console.warn(`[BundledOllama] Startup failed - ${this.lastError}`);
     }
   }
-/**
+
+  /**
    * Spawns `<bin>/ollama serve` with the isolation env injected.
    *
-   * THE ENV MERGE ORDER IS LOAD-BEARING: `{...process.env, ...bundledOllamaEnv()}`
+   * PRE-SPAWN COMPLETENESS GATE. Before the child is created we re-check the
+   * filesystem for `lib/ollama/llama-server[.exe]` and refuse to spawn without
+   * it. `ensureBundledBinary()` already establishes this invariant, so on the
+   * happy path the check costs one `stat` and changes nothing; it exists because
+   * the guarantee can be broken between install and launch by things this module
+   * does not control:
+   *
+   *   - antivirus quarantining a DLL out of `lib/ollama/`;
+   *   - an operator (or a cleanup script) emptying `bin/` while the node runs;
+   *   - a disk that filled up mid-extraction on a previous boot;
+   *   - a hand-edited `bin/` that kept the version stamp but not the files.
+   *
+   * Spawning anyway produces the worst possible outcome: the server binds the
+   * port, `/api/tags` answers, the dashboard shows a healthy runtime, and then
+   * every extraction fails with "llama-server binary not found". Failing here
+   * turns a silent, confusing runtime failure into one loud, self-healing
+   * download.
+   *
+   * THE ENV MERGE ORDER IS ALSO LOAD-BEARING: `{...process.env, ...bundledOllamaEnv()}`
    * applies the isolation variables LAST so they win. The child still inherits
    * PATH/HOME (it cannot run without them), but a stray `OLLAMA_HOST` already
    * present in the node's own environment can no longer redirect the server onto
-   * the host's personal install â€” exactly the bug this isolation exists to stop.
+   * the host's personal install.
    */
   private async spawnServer(binary: string): Promise<void> {
+    // `fs.existsSync` is deliberate here rather than a `statSync` in a try: this
+    // runs on every (re)start, including the cheap crash-restart loop, and the
+    // question being asked is literally "does this path exist".
+    if (!fs.existsSync(bundledLlamaServerPath())) {
+      console.warn(
+        `[BundledOllama] ${bundledLlamaServerPath()} is missing, so ollama serve could not ` +
+          `load a model. Deleting ${bundledBinDir()} and re-installing from scratch.`,
+      );
+      publishLine("err", "bundled Ollama runtime incomplete (no llama-server) - reinstalling");
+      // Nuke first: whatever is in `bin/` is now known-bad, and re-extracting
+      // over it would leave a mix of old and new DLLs that no check can validate.
+      purgeBundledRuntime();
+      await ensureBundledBinary({ force: true });
+      if (!fs.existsSync(bundledLlamaServerPath())) {
+        throw new Error(
+          `re-installing Ollama did not produce ${bundledLlamaServerPath()}. ` +
+            `The published archive is missing its llama-server runtime, so this node ` +
+            `cannot run models without an external Ollama (set OLLAMA_URL).`,
+        );
+      }
+      binary = bundledBinaryPath();
+    }
+
     const child = spawn(binary, ["serve"], {
       env: { ...process.env, ...bundledOllamaEnv() },
       stdio: ["ignore", "pipe", "pipe"],
@@ -1007,6 +1385,11 @@ export class BundledOllamaManager {
     this.lastError = null;
     try {
       const release = await resolveLatestRelease();
+      // Delete `bin/` up front rather than relying on the install to overwrite it.
+      // "Reinstall" that extracts over a poisoned folder can leave a mix of old
+      // and new DLLs, and the operator who clicked Reinstall is asking for the
+      // thing to be gone, not for the bad parts to be overwritten in place.
+      purgeBundledRuntime();
       await ensureBundledBinary({ force: true, release });
       this.enabled = true;
       await this.start();
