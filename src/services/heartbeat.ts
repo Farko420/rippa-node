@@ -1,6 +1,7 @@
 import { getSystemVitals, type SystemVitals } from "./telemetry";
 import { publishNodeEvent } from "./nodeEvents";
 import { ollamaManager } from "./ollamaManager";
+import { getCurrentVersion, getLastUpdatedAt } from "../update/updateStamp";
 
 /**
  * HEARTBEAT TELEMETRY & REMOTE COMMAND EXECUTION.
@@ -183,6 +184,29 @@ export interface HeartbeatTelemetry extends SystemVitals {
   efficiency_score: number;
   connected_satellites: string[];
   ollama: OllamaTelemetry;
+  /**
+   * The build this node is RUNNING, e.g. "1.0.23".
+   *
+   * Named `current_version` rather than reusing the pre-existing top-level
+   * `version` field because the Mothership's Swarm Grid reads this exact key
+   * for its per-node version column. Both are sent: `version` predates this
+   * work and is what the `FORCE_UPDATE` downgrade pre-check consumes, so
+   * dropping or renaming it would break a shipped contract.
+   *
+   * Always a string — `updateStamp.getCurrentVersion()` degrades to "unknown"
+   * rather than `undefined`, so a broken manifest cannot void the payload.
+   */
+  current_version: string;
+  /**
+   * ISO-8601 instant this build last changed hands, or null when genuinely
+   * unknowable. Sits next to `current_version` so the cloud can render "stale
+   * by N days" without inferring it from uptime — uptime says the node is
+   * alive, never when its bytes changed.
+   *
+   * null is a real value, not a placeholder: the Mothership must be able to
+   * tell "no update on record" from "updated just now".
+   */
+  last_updated_at: string | null;
 }
 
 /**
@@ -323,6 +347,20 @@ export function buildHeartbeatTelemetry(
       ? connectedSatellites.map(String).filter(Boolean)
       : [],
     ollama: buildOllamaTelemetry(),
+    /*
+      GRANULAR VERSION TRACKING.
+
+      Appended LAST, and deliberately so: `getSystemVitals()` and the block
+      above are the long-standing payload, and spreading these two in front of
+      them would let a future rename of a vitals key silently mask them. They
+      are the last thing the Mothership reads, and being last keeps them last.
+
+      `getLastUpdatedAt()` is read per beat rather than cached at boot, because
+      a long-running node is exactly the one whose stamp was written by a
+      DIFFERENT process (the watchdog) after this one started.
+    */
+    current_version: getCurrentVersion(),
+    last_updated_at: getLastUpdatedAt(),
   };
 }
 

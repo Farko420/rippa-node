@@ -21,6 +21,7 @@ import {
   isPackagedExe,
   stagingDir,
 } from "./swapHandoff";
+import { recordUpdateApplied } from "./updateStamp";
 
 /**
  * OVER-THE-AIR SWARM AUTO-UPDATER.
@@ -369,6 +370,21 @@ export class OtaUpdater {
       fs.renameSync(partialPath, updatePath);
       const { size } = fs.statSync(updatePath);
       console.log(`[OTA] Download complete — ${TEMP_UPDATE_FILE} (${formatMb(size)}).`);
+
+      /*
+        STAMP THE INSTALL BEFORE HANDING OFF.
+
+        Recorded with the INCOMING version, not the running one: after the swap
+        the new binary reads this file as "stamped by me" (see
+        `getLastUpdatedAt`), so writing v1.0.22 here for a v1.0.23 install would
+        make every heartbeat fall through to the mtime fallback.
+
+        This is an INTENT stamp, not proof — the watchdog re-stamps on the
+        successful rename, and boot reconciliation catches anything this misses.
+        Writing it here at all matters for the standalone (no-watchdog) path,
+        where nothing else survives to do it.
+      */
+      recordUpdateApplied(latest.version);
 
       /*
         THE HANDOFF IS NOW A SUPERVISOR DECISION, NOT A LOCAL ONE.

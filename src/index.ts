@@ -1,6 +1,7 @@
 import { ensureConfiguration, isConfigComplete, openDashboard } from "./config/configManager";
 import { ensureDataDir, migrateLegacyData } from "./utils/paths";
 import { APP_VERSION } from "./version";
+import { reconcileUpdateStamp } from "./update/updateStamp";
 import { startVitalsSampler } from "./services/telemetry";
 import { describeRuntime, supportsBrowserScraping } from "./platform";
 import { ollamaManager } from "./services/ollamaManager";
@@ -32,6 +33,17 @@ async function main(): Promise<void> {
   const dataDir = ensureDataDir();
   console.log(`[Boot] Persistent data directory: ${dataDir}`);
   migrateLegacyData();
+
+  /*
+    Reconcile the update stamp against the binary that is actually running.
+
+    Runs HERE, after `ensureDataDir()` and before anything can send a heartbeat,
+    because a stamp written by a previous build describes THAT build's install,
+    not this one's. Any update path that did not stamp itself — a manual file
+    copy, an operator replacing the exe, or a release predating this feature —
+    is corrected to the truth on first boot instead of being reported forever.
+  */
+  reconcileUpdateStamp();
 
   // --- 0b. Non-blocking config load (GUI collects settings when missing) ---
   const boot = await ensureConfiguration();

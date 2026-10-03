@@ -81,6 +81,15 @@ export interface HeartbeatPayload {
    * command on every heartbeat.
    */
   version: string;
+  /**
+   * Granular version tracking for the Mothership's Swarm Grid, which renders a
+   * per-node version column. Sourced by the same `buildHeartbeatTelemetry()`
+   * spread that fills the CPU/RAM/uptime fields, and typed off it rather than
+   * restated, so the interface cannot drift from what is actually sent.
+   */
+  current_version: ReturnType<typeof buildHeartbeatTelemetry>["current_version"];
+  /** ISO-8601 install instant for the running build, or null when unknowable. */
+  last_updated_at: ReturnType<typeof buildHeartbeatTelemetry>["last_updated_at"];
   /** Embedded Ollama AI status — server state, model, port, active task. */
   ollama: OllamaTelemetry;
 }
@@ -1036,57 +1045,6 @@ export class SwarmClient {
     }
   }
 
-  /**
- * EXTRACTS ONE TASK FROM A `/api/fleet/tasks` RESPONSE.
- *
- * Returns `null` for "nothing queued" AND for "the response made no sense", which
- * are treated alike on purpose: in both cases the correct action is to do nothing
- * and try again, and neither is worth an operator's attention. Anything WITH a
- * usable id and URL is real work, whatever else is missing — `focus` and
- * `maxFacts` are conveniences with honest defaults, because a task dispatched
- * without them is still worth doing.
- *
- * `maxFacts` is CLAMPED rather than trusted. It arrives over the network from a
- * queue an admin fills in, and an unbounded value would let one document push
- * thousands of facts into the central brain in a single push.
- */
-function parseFleetTask(raw: unknown): FleetTask | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const root = raw as Record<string, unknown>;
-
-  // Accept a bare task, or an envelope under `task` / `data`.
-  const candidate =
-    root["task"] && typeof root["task"] === "object"
-      ? (root["task"] as Record<string, unknown>)
-      : Array.isArray(root["tasks"])
-        ? (root["tasks"] as unknown[])[0]
-        : root;
-  if (!candidate || typeof candidate !== "object") return null;
-
-  const record = candidate as Record<string, unknown>;
-  const id = firstString(record, ["id", "taskId", "task_id"]);
-  const url = firstString(record, ["url", "target", "source_url"]);
-  if (!id || !url) return null;
-
-  const requestedMax = Number(record["maxFacts"] ?? record["max_facts"]);
-  const maxFacts = Number.isFinite(requestedMax) && requestedMax > 0
-    ? Math.min(Math.floor(requestedMax), MAX_FACTS_PER_TASK)
-    : DEFAULT_MAX_FACTS_PER_TASK;
-
-  return {
-    id,
-    kind: firstString(record, ["kind", "type", "taskType", "task_type"]) ?? "page_digest",
-    url,
-    focus: firstString(record, ["focus", "instruction", "subject", "goal"]) ?? "",
-    maxFacts,
-    attempts: Number(record["attempts"]) > 0 ? Number(record["attempts"]) : 1,
-  };
-}
-
-/** Ceiling on facts per research task — see `parseFleetTask`. */
-const MAX_FACTS_PER_TASK = 25;
-/** Used when the queue does not say. Deliberately modest for a first run. */
-const DEFAULT_MAX_FACTS_PER_TASK = 8;
 
 /**
  * Index into {@link BRAIN_DELTA_ROUTES} of the route that last worked, so a
@@ -1168,11 +1126,23 @@ const DEFAULT_MAX_FACTS_PER_TASK = 8;
       discoveredAt: new Date().toISOString(),
     };
 
+    /*
+      START AT THE ROUTE THAT LAST WORKED.
+
+      `brainIngestRouteIndex` was previously written on success and never read,
+      so every ingest re-probed a 404ing fallback before reaching the live
+      route. Rotating the start offset by the remembered attempt makes the field
+      do what its own comment claims, and mirrors `fetchBrainDelta`, which
+      already walks `BRAIN_DELTA_ROUTES` from its remembered index. At the
+      default of 0 the order is unchanged, so nothing behaves differently until
+      a route has actually been found missing.
+    */
     for (let attempt = 0; attempt < BRAIN_INGEST_ROUTES.length; attempt += 1) {
-      const route = BRAIN_INGEST_ROUTES[attempt];
+      const index = (this.brainIngestRouteIndex + attempt) % BRAIN_INGEST_ROUTES.length;
+      const route = BRAIN_INGEST_ROUTES[index];
       try {
         await this.client.post(route, body, { timeout: 30_000 });
-        this.brainIngestRouteIndex = attempt;
+        this.brainIngestRouteIndex = index;
         console.log(`[Fleet] Ingested ${payload.facts.length} fact(s) to ${route}.`);
         return true;
       } catch (error) {
@@ -1351,6 +1321,59 @@ const DEFAULT_MAX_FACTS_PER_TASK = 8;
     return false;
   }
 }
+
+// --- fleet task parsing (moved out of the class body; see git history) ---
+  /**
+ * EXTRACTS ONE TASK FROM A `/api/fleet/tasks` RESPONSE.
+ *
+ * Returns `null` for "nothing queued" AND for "the response made no sense", which
+ * are treated alike on purpose: in both cases the correct action is to do nothing
+ * and try again, and neither is worth an operator's attention. Anything WITH a
+ * usable id and URL is real work, whatever else is missing — `focus` and
+ * `maxFacts` are conveniences with honest defaults, because a task dispatched
+ * without them is still worth doing.
+ *
+ * `maxFacts` is CLAMPED rather than trusted. It arrives over the network from a
+ * queue an admin fills in, and an unbounded value would let one document push
+ * thousands of facts into the central brain in a single push.
+ */
+function parseFleetTask(raw: unknown): FleetTask | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const root = raw as Record<string, unknown>;
+
+  // Accept a bare task, or an envelope under `task` / `data`.
+  const candidate =
+    root["task"] && typeof root["task"] === "object"
+      ? (root["task"] as Record<string, unknown>)
+      : Array.isArray(root["tasks"])
+        ? (root["tasks"] as unknown[])[0]
+        : root;
+  if (!candidate || typeof candidate !== "object") return null;
+
+  const record = candidate as Record<string, unknown>;
+  const id = firstString(record, ["id", "taskId", "task_id"]);
+  const url = firstString(record, ["url", "target", "source_url"]);
+  if (!id || !url) return null;
+
+  const requestedMax = Number(record["maxFacts"] ?? record["max_facts"]);
+  const maxFacts = Number.isFinite(requestedMax) && requestedMax > 0
+    ? Math.min(Math.floor(requestedMax), MAX_FACTS_PER_TASK)
+    : DEFAULT_MAX_FACTS_PER_TASK;
+
+  return {
+    id,
+    kind: firstString(record, ["kind", "type", "taskType", "task_type"]) ?? "page_digest",
+    url,
+    focus: firstString(record, ["focus", "instruction", "subject", "goal"]) ?? "",
+    maxFacts,
+    attempts: Number(record["attempts"]) > 0 ? Number(record["attempts"]) : 1,
+  };
+}
+
+/** Ceiling on facts per research task — see `parseFleetTask`. */
+const MAX_FACTS_PER_TASK = 25;
+/** Used when the queue does not say. Deliberately modest for a first run. */
+const DEFAULT_MAX_FACTS_PER_TASK = 8;
 
 function describeError(error: unknown): string {
   if (axios.isAxiosError(error)) {

@@ -19,6 +19,7 @@ import {
   releaseHandoffClaim,
   stagingDir,
 } from "./update/swapHandoff";
+import { recordUpdateApplied } from "./update/updateStamp";
 
 /**
  * RIPPA WATCHDOG — the background manager that owns the node's lifetime.
@@ -489,6 +490,18 @@ export async function applyStagedUpdate(targetExe: string): Promise<boolean> {
       // Success: the previous build has served its purpose.
       if (renamed) fs.rmSync(backup, { force: true });
       log(`applied the staged update to ${targetExe}.`);
+
+      /*
+        STAMP THE SUCCESSFUL INSTALL.
+
+        This is the only place in the whole pipeline that KNOWS the swap worked
+        — the node that requested it is already exiting, and the script path may
+        not survive either. The watchdog's own `version.ts` reads the same
+        package.json the swapped binary was built from, so it stamps the version
+        the node is about to boot, and the new binary finds a stamp that matches
+        the `APP_VERSION` it reports on its first heartbeat.
+      */
+      recordUpdateApplied();
       return true;
     } catch (error) {
       // Put the working binary back before trying again, so a failure part-way
