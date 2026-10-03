@@ -51,6 +51,16 @@ export interface AdminCommandDeps {
    */
   restartNode: () => Promise<void> | void;
   /**
+   * Stop every service and exit with the STOP exit code (0) — a deliberate stop.
+   *
+   * Separate from {@link restartNode} for the same reason it is separate in
+   * `CommandHandlers`: the exit code is the entire handoff. Restart exits 42 and
+   * the watchdog relaunches at once; stop exits 0 and the watchdog waits in Ghost
+   * Mode for a `start`. Sharing one handler would make the dashboard's Stop button
+   * reboot the node it was asked to stop.
+   */
+  stopNode: () => Promise<void> | void;
+  /**
    * Fetch, verify and swap to the latest published release.
    *
    * @param options.allowDowngrade permits installing a build OLDER than the one
@@ -336,6 +346,7 @@ export class Orchestrator {
       ],
       {
         restartNode: () => this.admin.restartNode(),
+        stopNode: () => this.admin.stopNode(),
         forceUpdate: (options) => this.admin.forceUpdate(options),
         setP2pEnabled: (enabled) => this.admin.setP2pEnabled(enabled),
         isP2pEnabled: () => this.admin.isP2pEnabled(),

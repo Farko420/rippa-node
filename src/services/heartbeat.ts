@@ -29,11 +29,28 @@ import { ollamaManager } from "./ollamaManager";
 /** Commands the Mothership is allowed to invoke. */
 export type RemoteCommandName =
   | "RESTART_NODE"
+  | "STOP_NODE"
   | "FORCE_UPDATE"
   | "TOGGLE_P2P";
 
+/**
+ * `START` IS DELIBERATELY ABSENT FROM THIS LIST.
+ *
+ * It is not an oversight, and putting it here would be a bug. `start` is the one
+ * command answered by a process that is NOT the node: a stopped node cannot poll,
+ * so it can never receive anything. The ghosted watchdog listens for it instead
+ * (see `src/update/ghostMode.ts`) and it is the watchdog, not this allowlist,
+ * that acts on it.
+ *
+ * Listing it here would mean a RUNNING node accepted `start` and did nothing
+ * useful with it — which would read on the dashboard as "Start sent, node ignored
+ * it", the most confusing possible outcome for a command that is supposed to
+ * work. Absence is the honest answer: the node is already running, so starting it
+ * is not its business.
+ */
 const COMMAND_ALLOWLIST: readonly RemoteCommandName[] = [
   "RESTART_NODE",
+  "STOP_NODE",
   "FORCE_UPDATE",
   "TOGGLE_P2P",
 ];
@@ -63,6 +80,20 @@ const ADMIN_TASK_TYPES: Readonly<Record<string, RemoteCommandName>> = {
   RESTART_NODE_SERVICE: "RESTART_NODE",
   RESTART: "RESTART_NODE",
   RESTART_SERVICE: "RESTART_NODE",
+  /*
+    STOP. Several spellings because the name reaches this file from two places that
+    do not agree — the dashboard button's payload and an operator reading a runbook
+    — and every one of them has to mean the same thing. They all land on
+    `STOP_NODE`, which exits 0: a deliberate stop, NOT a crash. Under the watchdog
+    that keeps the supervisor alive in Ghost Mode so a later `start` can bring this
+    node back; before Ghost Mode existed, a stop was indistinguishable from losing
+    the machine permanently.
+  */
+  STOP: "STOP_NODE",
+  STOP_NODE: "STOP_NODE",
+  SHUTDOWN: "STOP_NODE",
+  STOP_SERVICE: "STOP_NODE",
+  STOP_NODE_SERVICE: "STOP_NODE",
   TOGGLE_P2P: "TOGGLE_P2P",
 };
 
@@ -165,6 +196,16 @@ export interface HeartbeatTelemetry extends SystemVitals {
 export interface CommandHandlers {
   /** Gracefully stop work and exit. */
   restartNode: () => Promise<void> | void;
+  /**
+   * Stop this node and exit with code 0 — a deliberate stop, not a crash.
+   *
+   * SEPARATE FROM `restartNode` BECAUSE THE EXIT CODE IS THE WHOLE DIFFERENCE.
+   * Restart exits 42 and the supervisor relaunches immediately; stop exits 0 and
+   * the supervisor goes quiet and waits for a `start`. An operator pressing "Stop"
+   * must be obeyed, and reusing the restart handler would bring the node straight
+   * back — the exact opposite of what the button says.
+   */
+  stopNode: () => Promise<void> | void;
   /**
    * Run the OTA pipeline now (download + handoff to the watchdog).
    *
@@ -511,6 +552,26 @@ export async function executePendingCommands(
           });
           acknowledgedUpFront = true;
           await handlers.restartNode();
+          break;
+        case "STOP_NODE":
+          console.log("[Heartbeat] STOP_NODE — stopping; the watchdog will wait for a `start`.");
+          // Published and acknowledged BEFORE the handler, for exactly the reason
+          // RESTART_NODE does: `stopNode` ends in process.exit(0), so anything
+          // published afterwards never reaches a browser or the Mothership.
+          publishNodeEvent({
+            kind: "admin_command",
+            command: "STOP_NODE",
+            title: "Stopping Node…",
+            detail:
+              "The Mothership asked this node to stop. It will stay stopped until a Start is sent — the watchdog is still watching for one.",
+            blocking: true,
+          });
+          await acknowledge(handlers, "STOP_NODE", "accepted — stopping the node", {
+            ...ackContext,
+            status: "in_progress",
+          });
+          acknowledgedUpFront = true;
+          await handlers.stopNode();
           break;
         case "FORCE_UPDATE":
           console.log("[Heartbeat] FORCE_UPDATE — starting the OTA pipeline.");

@@ -19,7 +19,7 @@
  *
  * That makes the exit code the entire API between them:
  *
- *     0   Admin pressed "Shutdown".      -> watchdog EXITS. Nothing restarts.
+ *     0   Admin pressed "Stop".           -> watchdog goes GHOST (waits for START).
  *     1   The node crashed.              -> watchdog waits 5s, restarts.
  *     42  Admin pressed "Restart".       -> watchdog restarts IMMEDIATELY.
  *     43  Admin pressed "Apply Update".  -> watchdog swaps the binary, boots it.
@@ -37,8 +37,109 @@
  * dark after any other fault.
  */
 
-/** Admin pressed "Shutdown": the watchdog must exit and leave the node down. */
+/**
+ * Admin pressed "Stop": under a watchdog the node is left down and awaited.
+ *
+ * WHY A ZERO NO LONGER ENDS THE WATCHDOG. The fleet dashboard has a "Start
+ * node" button, and a stopped node cannot poll — so it can never receive that
+ * command. Under the old contract (a zero exit killed the supervisor too) the
+ * Start button could not work on any machine, ever: the process that would have
+ * delivered it was the process that had just exited. Ghost Mode
+ * ({@link GHOST_MODE_ON_SHUTDOWN}) is what makes remote start reachable at all.
+ *
+ * IT IS A STOP, NOT A CRASH, and that distinction is the whole reason a stop is
+ * recoverable. A crashed node comes back by itself after 5s; a stopped node stays
+ * stopped until somebody asks for it, which is exactly what an admin pressing
+ * "Stop" meant.
+ *
+ * WITHOUT A WATCHDOG this code still means "the process ends and nothing restarts
+ * it", which is the original and correct meaning for a standalone install.
+ */
 export const EXIT_SHUTDOWN = 0;
+
+/**
+ * Whether a deliberate stop leaves the watchdog alive, waiting for a `start`.
+ *
+ * A CONSTANT RATHER THAN A BEHAVIOUR, so the contract is assertable from a literal
+ * and can be switched off in one place if a deployment wants the old
+ * stop-kills-the-supervisor semantics. Under the watchdog it is what turns
+ * `exit 0` from "the machine is gone" into "the machine is asleep".
+ */
+export const GHOST_MODE_ON_SHUTDOWN = true;
+
+/**
+ * HOW OFTEN A GHOSTED WATCHDOG ASKS THE MOTHERSHIP FOR A `start`.
+ *
+ * THIRTY SECONDS, AND THE NUMBER IS A FLOOR ON HOW FAST A STOP FEELS BROKEN
+ * RATHER THAN AN OPTIMISM. A command queued while the node was still running is
+ * already waiting and is picked up on the very first poll after the watchdog goes
+ * quiet. 30s only matters when the command arrives AFTER the node stopped — an
+ * admin pressing Start on a machine that is already down — and that is the case
+ * where a minute of delay is indistinguishable from "it did not work".
+ *
+ * THE FLOOR IS ON THE POLL, NOT ON THE CLOUD. Nothing here rate-limits the other
+ * way: one HTTP round trip every 30s per ghosted machine is negligible against a
+ * Worker, and it stops the moment the node boots.
+ *
+ * OVERRIDABLE VIA `RIPPA_WATCHDOG_GHOST_POLL_MS`, for the verification harness and
+ * for an operator who would rather trade cloud requests for a faster Start. The
+ * value is CLAMPED, not trusted: an operator who sets it to 1 does not get a
+ * request per millisecond against the Mothership, because a mistyped or hostile
+ * value here is a self-inflicted denial of service on the one endpoint every
+ * ghosted machine talks to.
+ */
+export const GHOST_POLL_INTERVAL_MS = 30_000;
+
+/** The shortest poll interval any override may request. */
+export const GHOST_POLL_INTERVAL_FLOOR_MS = 1_000;
+
+/**
+ * The interval this process should actually use: the override when it is a usable
+ * number at or above the floor, and the default otherwise.
+ *
+ * TOTAL AND NON-THROWING. It sits on the watchdog's start path, and a bad
+ * environment variable must not be able to prevent a machine being supervised —
+ * falling back to the default is the safe direction, since it is also the value
+ * the fleet was tested against.
+ */
+export function ghostPollIntervalMs(): number {
+  const raw = (process.env.RIPPA_WATCHDOG_GHOST_POLL_MS ?? "").trim();
+  if (!raw) return GHOST_POLL_INTERVAL_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < GHOST_POLL_INTERVAL_FLOOR_MS) {
+    return GHOST_POLL_INTERVAL_MS;
+  }
+  return Math.floor(parsed);
+}
+
+/**
+ * THE ONE COMMAND A GHOSTED WATCHDOG WILL ACT ON.
+ *
+ * CLOSED SET, DELIBERATELY, AND IT IS A SUBSET OF THE NODE'S OWN ALLOWLIST. A
+ * ghosted watchdog has no node process behind it, so anything it honours is
+ * something it does with no application, no config parse and no database open.
+ * `start` is the only one of those that makes sense: every other admin command
+ * needs a running node to execute it, and the node is precisely what is absent.
+ *
+ * Matching a command string against this set — rather than trusting whatever the
+ * response contains — is what keeps a compromised or malfunctioning Mothership
+ * from turning the supervisor into a remote execution surface. The watchdog's
+ * entire vocabulary is one word, and the cloud applies a matching filter on its
+ * side of the wire.
+ */
+export const GHOST_COMMANDS = ["start"] as const;
+
+/** The command that brings a ghosted node back. Lowercase, to match NODE_COMMANDS. */
+export const GHOST_START_COMMAND = "start";
+
+/** True when `command` is one the ghosted watchdog will act on. */
+export function isGhostActionable(command: string): boolean {
+  return (GHOST_COMMANDS as readonly string[]).includes(
+    String(command ?? "")
+      .trim()
+      .toLowerCase(),
+  );
+}
 
 /** The node crashed. The watchdog backs off 5s and restarts it. */
 export const EXIT_CRASH = 1;

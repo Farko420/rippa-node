@@ -221,6 +221,20 @@ async function main(): Promise<void> {
       */
       restartNode: () => shutdown("REMOTE_COMMAND", EXIT_RESTART),
       /*
+        STOP EXITS 0 — A DELIBERATE STOP, NOT A RESTART.
+
+        The default `shutdown` exit code is already `EXIT_SHUTDOWN`, so this is
+        `shutdown(signal)` with no override, and that omission is the whole point:
+        under the watchdog, exit 0 means "the node is stopped, keep the supervisor
+        alive and wait for a `start`" (Ghost Mode). Passing `EXIT_RESTART` here
+        would make the Stop button relaunch the node immediately, which is the one
+        thing an operator pressing Stop is asking us not to do.
+
+        The graceful teardown is identical to a restart's — services, Ollama, SQLite
+        and the listener are all closed — so a stop is a clean stop, not a kill.
+      */
+      stopNode: () => shutdown("REMOTE_STOP"),
+      /*
         `FORCE_UPDATE` IS ANSWERED BY THE MOTHERSHIP-PAYLOAD UPDATER.
 
         This handler used to call `swarmUpdater.forceUpdate()`, which resolved the
@@ -319,6 +333,7 @@ async function main(): Promise<void> {
           a lookalike: the same reference, so the two channels cannot drift again.
         */
         restartNode: adminCommands.restartNode,
+        stopNode: adminCommands.stopNode,
         forceUpdate: adminCommands.forceUpdate,
         setP2pEnabled: adminCommands.setP2pEnabled,
         isP2pEnabled: adminCommands.isP2pEnabled,

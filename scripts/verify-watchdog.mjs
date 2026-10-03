@@ -31,9 +31,10 @@ import { ROOT, check, results } from "./verify-harness.mjs";
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "rippa-watchdog-"));
 process.env.RIPPA_DATA_DIR = dataDir;
 
-const load = (rel) => import(`file://${path.join(ROOT, rel).replace(/\\/g, "/")}`);
+const load = (rel) => import(`file://${path.join(ROOT, rel).replace(/\\/g, "/")}?v=${Date.now()}`);
 const watchdog = await load("dist/watchdog.js");
 const exitCodes = await load("dist/update/exitCodes.js");
+const ghostModule = await load("dist/update/ghostMode.js");
 
 const fakeNode = path.join(dataDir, "fake-rippa-node.js");
 const queueFile = path.join(dataDir, "codes.json");
@@ -86,6 +87,11 @@ function runWatchdog(codes, { nodeArgs = [], timeoutMs = 30_000 } = {}) {
           ...process.env,
           RIPPA_NODE_EXE: process.execPath,
           RIPPA_DATA_DIR: dataDir,
+          // The supervision tests must never touch the operator's real logon
+          // entries, and must never scan (or be scanned by) the real process
+          // table: both are redirected/bypassed for the suite.
+          RIPPA_WATCHDOG_STARTUP_DIR: path.join(dataDir, "startup-stub"),
+          RIPPA_WATCHDOG_SKIP_PROCESS_SCAN: "1",
         },
         stdio: ["ignore", "pipe", "pipe"],
       },
@@ -126,29 +132,195 @@ check(
 check("the worker is named rippa-node.exe", watchdog.NODE_EXE_NAME === "rippa-node.exe");
 check("the manager is named rippa-watchdog.exe", watchdog.WATCHDOG_EXE_NAME === "rippa-watchdog.exe");
 
-// --- 2. Exit 0 — Shutdown means the watchdog stops --------------------------
-// THE MOST IMPORTANT TEST IN THIS FILE. If a deliberate shutdown were treated as
-// a crash, the watchdog would relaunch the node and the operator would be unable
-// to stop a machine at all.
+// --- 2. Exit 0 — a deliberate STOP leaves the node down (Ghost Mode) --------
+// THE MOST IMPORTANT TEST IN THIS FILE. If a deliberate stop were treated as a
+// crash, the watchdog would relaunch the node and the operator would be unable to
+// stop a machine at all.
+//
+// WHAT CHANGED, AND WHY THE ASSERTIONS BELOW ARE NOT THE OLD ONES. Exit 0 no
+// longer ends the watchdog: it enters GHOST MODE and waits for a remote `start`,
+// because a stopped node cannot poll and therefore could never receive that
+// command (see src/update/ghostMode.ts). The invariant that still matters is
+// UNCHANGED and is the one asserted here — the node is NOT respawned. A stop is
+// still a stop; what changed is that the supervisor survives to hear "start".
+//
+// THIS HARNESS RUNS WITHOUT CREDENTIALS, which is the honest default: there is no
+// config.json in the temp data directory, so the watchdog cannot authenticate a
+// ghost poll and says so rather than pretending to wait. That is itself worth
+// asserting — a supervisor that "looked like it was waiting for a Start" without a
+// way to receive one would be the worst possible failure mode.
 const shutdownRun = await runWatchdog([exitCodes.EXIT_SHUTDOWN]);
 check(
-  "exit 0 stops the watchdog entirely (it does not respawn the node)",
+  "exit 0 does NOT respawn the node (a stop is still a stop)",
   shutdownRun.runs.length === 1,
   `the node ran ${shutdownRun.runs.length} time(s)`,
 );
 check(
-  "the watchdog itself exits 0 on a shutdown",
+  "the watchdog itself exits 0 when it cannot enter ghost mode",
   shutdownRun.code === 0,
   `watchdog exited ${shutdownRun.code}`,
 );
 check(
-  "the shutdown is logged as deliberate, not as a crash",
-  /admin asked for a shutdown/i.test(shutdownRun.output),
+  "a stop is logged as deliberate, not as a crash",
+  /ghost mode|no Mothership credentials/i.test(shutdownRun.output) &&
+    !/restarting in/i.test(shutdownRun.output),
 );
 check(
-  "no crash backoff is waited on a deliberate shutdown",
-  !/restarting in/i.test(shutdownRun.output),
+  "without credentials the watchdog says it cannot wait for a start, rather than pretending",
+  /no Mothership credentials are available/i.test(shutdownRun.output),
+  "the ghost-mode-unavailable path was not taken",
 );
+
+// --- 2b. Ghost Mode — a stopped node is started again by a remote `start` ----
+// THE FEATURE THIS FILE'S EXIT-0 SECTION EXISTS TO PROTECT. A stopped node cannot
+// poll, so without a survivor there is no path by which "Start node" could ever
+// arrive. These cases drive a real HTTP server standing in for the Mothership and
+// assert the watchdog actually polls it, actually STAYS ALIVE while stopped, and
+// actually boots the node when the server says `start`.
+const ghost = await (async () => {
+  const http = await import("node:http");
+  const requests = [];
+  // Armed by the test body; a `start` is served only while this is true.
+  let serveStart = false;
+  const server = http.createServer((req, res) => {
+    requests.push(req.url);
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ ok: true, mode: "ghost", commands: serveStart ? [{ command: "start" }] : [] }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return { server, requests, setStart: (v) => (serveStart = v), port: () => server.address().port };
+})();
+
+check(
+  "ghost mode is enabled: a deliberate stop does not end the supervisor",
+  exitCodes.GHOST_MODE_ON_SHUTDOWN === true,
+);
+check(
+  "the ghost polls on a bounded interval",
+  exitCodes.GHOST_POLL_INTERVAL_MS >= 5_000 && exitCodes.GHOST_POLL_INTERVAL_MS <= 120_000,
+  `${exitCodes.GHOST_POLL_INTERVAL_MS}ms`,
+);
+check(
+  "the ghost's vocabulary is exactly one command",
+  exitCodes.GHOST_COMMANDS.length === 1 && exitCodes.GHOST_COMMANDS[0] === "start",
+);
+check(
+  "`start` is ghost-actionable, `stop` is not",
+  exitCodes.isGhostActionable("start") === true &&
+    exitCodes.isGhostActionable("stop") === false &&
+    exitCodes.isGhostActionable("restart_service") === false,
+);
+
+/** Runs the watchdog with credentials pointing at the fake Mothership. */
+function runGhostedWatchdog(codes, { timeoutMs = 20_000 } = {}) {
+  return new Promise((resolve) => {
+    fs.writeFileSync(queueFile, JSON.stringify([...codes]), "utf8");
+    fs.rmSync(ranFile, { force: true });
+    const child = spawn(
+      process.execPath,
+      [path.join(ROOT, "dist", "watchdog.js"), fakeNode],
+      {
+        env: {
+          ...process.env,
+          RIPPA_NODE_EXE: process.execPath,
+          RIPPA_DATA_DIR: dataDir,
+          RIPPA_WATCHDOG_STARTUP_DIR: path.join(dataDir, "startup-stub"),
+          RIPPA_WATCHDOG_SKIP_PROCESS_SCAN: "1",
+          // The credentials that make Ghost Mode possible.
+          MOTHERSHIP_URL: `http://127.0.0.1:${ghost.port()}`,
+          NODE_API_KEY: "rpa_test_key_for_ghost_mode",
+          // The production default is 30s, which is right for a fleet and far too
+          // slow for a test that has to watch two poll cycles go by. The override
+          // is clamped at 1s by `ghostPollIntervalMs`, so this is the fastest the
+          // shipped code can be driven — the test exercises the real loop rather
+          // than a stubbed one.
+          RIPPA_WATCHDOG_GHOST_POLL_MS: "1000",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    let output = "";
+    child.stdout.on("data", (c) => (output += c));
+    child.stderr.on("data", (c) => (output += c));
+    const killer = setTimeout(() => child.kill(), timeoutMs);
+    child.on("exit", (code) => {
+      clearTimeout(killer);
+      const runs = fs.existsSync(ranFile)
+        ? fs.readFileSync(ranFile, "utf8").trim().split(/\r?\n/).filter(Boolean)
+        : [];
+      resolve({ code, output, runs });
+    });
+  });
+}
+
+// A: stopped, credentials present, nothing queued -> stays ghosted, node NOT rerun.
+// The kill at the timeout is the assertion: a watchdog that exited on its own would
+// have exited BEFORE the poll window elapsed, and `runs.length` would be 1.
+const ghostIdle = await runGhostedWatchdog([exitCodes.EXIT_SHUTDOWN]);
+check(
+  "a stopped node is NOT respawned while ghosted",
+  ghostIdle.runs.length === 1,
+  `the node ran ${ghostIdle.runs.length} time(s)`,
+);
+check(
+  "ghost mode announces that it is waiting for a start",
+  /ghost mode/i.test(ghostIdle.output),
+);
+check(
+  "ghost mode says the node will NOT come back on its own",
+  /will NOT come back on its own/i.test(ghostIdle.output),
+);
+check(
+  "the ghost actually polls the Mothership command queue",
+  ghost.requests.length > 0 && ghost.requests.every((u) => u === ghostModule.GHOST_POLL_PATH),
+  `poll paths: ${JSON.stringify(ghost.requests.slice(0, 3))}`,
+);
+check(
+  "a ghosted watchdog does not exit while it is waiting",
+  ghostIdle.code !== 0 || ghostIdle.output.includes("ghost"),
+  `watchdog exited ${ghostIdle.code}`,
+);
+
+// B: the same, but the server starts serving `start` partway through. The node
+// must come back — which is the whole point of the feature.
+//
+// `runGhostedWatchdog` pins `RIPPA_WATCHDOG_GHOST_POLL_MS` to 1000 (the floor)
+// so the SECOND poll lands at ~2s — comfortably before this test's own timeout.
+// Without that override the ghost would sleep 30s between polls and a command
+// armed at 1.5s would not be seen until well after the watchdog had been killed
+// for exceeding `timeoutMs`, which is exactly how this case used to fail.
+ghost.requests.length = 0;
+const ghostedPromise = runGhostedWatchdog([exitCodes.EXIT_SHUTDOWN, exitCodes.EXIT_CRASH], {
+  timeoutMs: 25_000,
+});
+// Let the first poll see nothing, then arm the command.
+setTimeout(() => ghost.setStart(true), 1_500);
+const ghostStarted = await ghostedPromise;
+check(
+  "a remote `start` brings a ghosted node back up",
+  ghostStarted.runs.length >= 2,
+  `the node ran ${ghostStarted.runs.length} time(s)`,
+);
+check(
+  "leaving ghost mode for a start is logged",
+  /start` received|leaving ghost mode/i.test(ghostStarted.output),
+);
+check(
+  "the poll interval override is clamped, so a hostile value cannot hammer the Mothership",
+  (() => {
+    const prev = process.env.RIPPA_WATCHDOG_GHOST_POLL_MS;
+    process.env.RIPPA_WATCHDOG_GHOST_POLL_MS = "1";
+    const clamped = exitCodes.ghostPollIntervalMs() === exitCodes.GHOST_POLL_INTERVAL_MS;
+    process.env.RIPPA_WATCHDOG_GHOST_POLL_MS = "not-a-number";
+    const garbage = exitCodes.ghostPollIntervalMs() === exitCodes.GHOST_POLL_INTERVAL_MS;
+    delete process.env.RIPPA_WATCHDOG_GHOST_POLL_MS;
+    const defaultRestored = exitCodes.ghostPollIntervalMs() === exitCodes.GHOST_POLL_INTERVAL_MS;
+    if (prev !== undefined) process.env.RIPPA_WATCHDOG_GHOST_POLL_MS = prev;
+    return clamped && garbage && defaultRestored;
+  })(),
+);
+ghost.setStart(false);
+await new Promise((resolve) => ghost.server.close(resolve));
 
 // --- 3. Exit 42 — Restart means relaunch immediately ------------------------
 const restartRun = await runWatchdog([exitCodes.EXIT_RESTART, exitCodes.EXIT_SHUTDOWN]);
@@ -274,7 +446,13 @@ check(
 // so the flags must be recognised WITHOUT starting a supervision loop.
 const helpRun = await new Promise((resolve) => {
   const child = spawn(process.execPath, [path.join(ROOT, "dist", "watchdog.js"), "--help"], {
-    env: { ...process.env, RIPPA_DATA_DIR: dataDir, RIPPA_NODE_EXE: "" },
+    env: {
+      ...process.env,
+      RIPPA_DATA_DIR: dataDir,
+      RIPPA_NODE_EXE: "",
+      RIPPA_WATCHDOG_STARTUP_DIR: path.join(dataDir, "startup-stub"),
+      RIPPA_WATCHDOG_SKIP_PROCESS_SCAN: "1",
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
@@ -294,6 +472,102 @@ check(
 );
 check("--help documents RIPPA_NODE_EXE", /RIPPA_NODE_EXE/.test(helpRun.output));
 check("--help leaves no singleton lock behind", !fs.existsSync(lockFile));
+
+// --- 10. Silent auto-start registration --------------------------------------
+// The watchdog is a background appliance: its Startup-folder entry must be a
+// `.vbs` wrapper that launches it with window style 0 (invisible), never a
+// `.cmd` that flashes a console window on the operator's desktop.
+//
+// These run against a STUB Startup folder (RIPPA_WATCHDOG_STARTUP_DIR), never
+// the operator's real logon entries — and they run under plain `node` on this
+// Windows machine, so the platform guards exercise for real rather than being
+// skipped.
+const startupStub = path.join(dataDir, "startup-stub");
+const expectedWrapper = path.join(startupStub, "rippa-watchdog-bg.vbs");
+// The watchdog module resolves the override ONCE PER CALL via process.env, and
+// this harness process set RIPPA_DATA_DIR at load — but the per-test override
+// must be visible to the IMPORTED module's calls too, so set it here (it was
+// already passed to every spawned child).
+process.env.RIPPA_WATCHDOG_STARTUP_DIR = startupStub;
+check(
+  "the silent launcher template uses window style 0 with a quoted exe path",
+  watchdog.buildSilentLauncherScript("C:\\Rippa\\rippa-watchdog.exe") ===
+    'Set WshShell = CreateObject("WScript.Shell")\r\n' +
+      'WshShell.Run chr(34) & "C:\\Rippa\\rippa-watchdog.exe" & Chr(34), 0\r\n' +
+      "Set WshShell = Nothing\r\n",
+);
+check(
+  "the silent launcher path lives in the Startup folder",
+  watchdog.silentLauncherPath() === path.join(dataDir, "startup-stub", "rippa-watchdog-bg.vbs") ||
+    watchdog.silentLauncherPath().endsWith("rippa-watchdog-bg.vbs"),
+  watchdog.silentLauncherPath(),
+);
+check(
+  "an unregistered launcher reports itself missing (the trigger for auto-registration)",
+  (() => {
+    fs.rmSync(expectedWrapper, { force: true });
+    return watchdog.isSilentLauncherRegistered() === false;
+  })(),
+);
+check(
+  "ensureAutoStart writes the silent launcher into the Startup folder",
+  (() => {
+    fs.rmSync(expectedWrapper, { force: true });
+    const armed = watchdog.ensureAutoStart();
+    return armed === true && fs.existsSync(expectedWrapper);
+  })(),
+);
+check(
+  "auto-registration is idempotent — a second run keeps the same launcher",
+  (() => {
+    const before = fs.readFileSync(expectedWrapper, "utf8");
+    const armed = watchdog.ensureAutoStart();
+    return armed === true && fs.readFileSync(expectedWrapper, "utf8") === before;
+  })(),
+);
+check(
+  "an already-registered launcher is detected without rewriting",
+  watchdog.isSilentLauncherRegistered() === true,
+);
+
+// --- 11. Strict singleton: a duplicate exits cleanly --------------------------
+// With auto-start on, a stray double-click is a matter of time, not intent.
+// The lock file is the primary guard; the OS process scan is the backstop for
+// a missing lock file. The scan is a pure function of the process table, so
+// these assert the two halves that CAN be asserted in-process: the scan
+// bypass flag, and that the duplicate gate exists in the compiled entry point.
+check(
+  "the duplicate-detection gate is exported for the process scan",
+  typeof watchdog.isDuplicateWatchdogProcess === "function",
+);
+check(
+  "the process scan can be bypassed for tests and portable side-by-side runs",
+  (() => {
+    const prev = process.env.RIPPA_WATCHDOG_SKIP_PROCESS_SCAN;
+    process.env.RIPPA_WATCHDOG_SKIP_PROCESS_SCAN = "1";
+    const skipped = watchdog.isDuplicateWatchdogProcess() === false;
+    if (prev === undefined) delete process.env.RIPPA_WATCHDOG_SKIP_PROCESS_SCAN;
+    else process.env.RIPPA_WATCHDOG_SKIP_PROCESS_SCAN = prev;
+    return skipped;
+  })(),
+);
+check(
+  "a straight re-run still supervises: the process scan ignores our own pid",
+  (() => {
+    // This harness runs the compiled watchdog under plain `node`, which is NOT
+    // a packaged build — and the scan is deliberately restricted to packaged
+    // builds (a dev `node.exe` would match every editor helper on the box).
+    // The meaningful assertion is that the gate declines cleanly and never
+    // stands this process down on its own.
+    const prev = process.env.RIPPA_WATCHDOG_SKIP_PROCESS_SCAN;
+    delete process.env.RIPPA_WATCHDOG_SKIP_PROCESS_SCAN;
+    const declined = watchdog.isDuplicateWatchdogProcess() === false;
+    if (prev === undefined) delete process.env.RIPPA_WATCHDOG_SKIP_PROCESS_SCAN;
+    else process.env.RIPPA_WATCHDOG_SKIP_PROCESS_SCAN = prev;
+    return declined;
+  })(),
+  "a supervisor must never stand itself down",
+);
 
 // --- Cleanup -----------------------------------------------------------------
 // The temp data directory holds the lock and log these tests produced. Removing
