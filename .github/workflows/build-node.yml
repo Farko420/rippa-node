@@ -61,6 +61,31 @@ jobs:
     name: Build rippa-node.exe and publish release
     runs-on: windows-latest
 
+    # -------------------------------------------------------------------------
+    # THE HANG GUARD. This job once sat for 3+ hours on the pkg step "Fetching
+    # base Node.js binaries to PKG_CACHE_PATH" and only ended when someone
+    # cancelled it by hand.
+    #
+    # pkg's own fetch path has NO timeout: @yao-pkg/pkg-fetch's `downloadUrl`
+    # awaits an `undici.fetch` that is never aborted, so a stalled TLS
+    # connection or a proxy that accepts and never delivers parks the step
+    # indefinitely rather than failing. With no job-level timeout the runner
+    # is simply occupied until GitHub's 6-hour ceiling — which is exactly the
+    # "burned 6 hours of runner time" failure.
+    #
+    # 15 minutes is comfortably above a healthy run (checkout + npm ci + tsc +
+    # two pkg bundles + a ~100 MB binary fetch) and far below the point where
+    # a stall costs anything worth protecting. Raising it to absorb a genuine
+    # stall would only re-create the problem this exists to stop: if this job
+    # ever needs more than 15 minutes, the fix is to find out why, not to widen
+    # the window.
+    #
+    # Deliberately NOT applied to `build-apk`: that job runs a full Gradle
+    # assemble plus bundling, which legitimately exceeds 15 minutes on a cold
+    # cache. Timing it out would fail builds that are working correctly.
+    # -------------------------------------------------------------------------
+    timeout-minutes: 15
+
     # THE RELEASE LOOP GUARD, and it is an `if:` on the JOB rather than on the
     # publish step for one reason: the version-bump step COMMITS BACK to the
     # branch, and that push is itself a trigger. Guarding only the publish step
@@ -144,6 +169,56 @@ jobs:
           Write-Host "Building version $newVersion"
           "version=$newVersion" >> $env:GITHUB_OUTPUT
 
+      # -------------------------------------------------------------------------
+      # PKG BINARY CACHE.
+      #
+      # `pkg` downloads a ~100 MB base Node.js binary per (target, platform)
+      # from the yao-pkg/pkg-fetch GitHub release on EVERY build, because the
+      # runner's home directory is wiped between jobs. This cache is what makes
+      # a retry after a transient stall cheap instead of a second full download
+      # that can stall again.
+      #
+      # `~/.pkg-cache` is not a guess — it is pkg-fetch's own default, read
+      # straight out of its source: `places.js` does
+      # `cachePath = PKG_CACHE_PATH || path.join(os.homedir(), '.pkg-cache')`.
+      # `PKG_CACHE_PATH` is deliberately NOT set anywhere in this workflow, so
+      # that default is what applies and `~` expands to the runner's real home.
+      # If a future change sets PKG_CACHE_PATH, this path must follow it or the
+      # cache will silently save nothing while reporting a cache hit.
+      #
+      # The key pins the pkg-fetch VERSION, read from the INSTALLED package in
+      # node_modules rather than from package.json. pkg resolves `node22` to a
+      # concrete patch (v22.23.2 via pkg-fetch's patches.json), and that mapping
+      # changes on every pkg-fetch upgrade — so the version is the one input that
+      # actually determines which binary is cached. Hashing the whole lockfile
+      # instead would throw the cache away for unrelated dependency bumps.
+      #
+      # No `lookup-only` here. pkg only ever READS the cache, so the entry is worth
+      # saving exactly once: the first run populates it, and from then on the
+      # key matches and actions/cache skips the save itself. `lookup-only: true`
+      # would suppress the save on EVERY run and the cache would never be
+      # created at all — reporting a permanent, silent miss.
+      # -------------------------------------------------------------------------
+      - name: Resolve pkg-fetch version
+        id: pkgver
+        shell: pwsh
+        run: |
+          $v = (Get-Content 'node_modules/@yao-pkg/pkg-fetch/package.json' -Raw | ConvertFrom-Json).version
+          if (-not $v) { throw "Could not read @yao-pkg/pkg-fetch version from node_modules" }
+          Write-Host "pkg-fetch version: $v"
+          "version=$v" >> "$env:GITHUB_OUTPUT"
+
+      - name: Cache pkg base binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.pkg-cache
+          key: pkg-${{ runner.os }}-${{ steps.pkgver.outputs.version }}
+          restore-keys: |
+            pkg-${{ runner.os }}-
+
+      # -------------------------------------------------------------------------
+      # THE BUILD.
+      # -------------------------------------------------------------------------
       - name: Build the portable .exe
         shell: pwsh
         run: npm run package

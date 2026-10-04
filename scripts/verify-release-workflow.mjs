@@ -61,6 +61,134 @@ const check = (name, ok, detail = "") => {
 
 const job = doc.jobs["build-and-release"];
 
+/*
+  THE HANG GUARD.
+
+  This job sat for 3+ hours on pkg's "Fetching base Node.js binaries to
+  PKG_CACHE_PATH" step. The fetch inside @yao-pkg/pkg-fetch awaits an
+  `undici.fetch` that is never aborted, so a stalled connection parks the step
+  forever and, with no job timeout, holds the runner until GitHub's 6-hour
+  ceiling.
+
+  The timeout is asserted with an upper bound as well as a value, because
+  "there is a timeout" is only half the property: a `timeout-minutes: 360`
+  would satisfy a bare existence check while reintroducing the exact failure.
+*/
+check(
+  "the release job has a timeout, so a pkg stall cannot burn the runner",
+  typeof job["timeout-minutes"] === "number" && job["timeout-minutes"] > 0,
+  `timeout-minutes is ${JSON.stringify(job["timeout-minutes"])}`,
+);
+check(
+  "the release job's timeout is short enough to actually fail fast",
+  job["timeout-minutes"] <= 30,
+  `timeout-minutes is ${job["timeout-minutes"]}; anything above ~30 stops being a hang guard`,
+);
+
+/*
+  THE PKG BINARY CACHE.
+
+  `~/.pkg-cache` is pkg-fetch's own default — `places.js` computes
+  `cachePath = PKG_CACHE_PATH || path.join(os.homedir(), '.pkg-cache')` — so
+  caching that path is what makes the ~100 MB base binary survive between runs
+  instead of being re-downloaded (and re-stalled) every time.
+
+  It must also come BEFORE the build step, and the ordering is asserted rather
+  than assumed: a cache step placed after the build is a cache step that has
+  already missed its only opportunity to help.
+*/
+const pkgCache = (job.steps ?? []).find((s) => s.uses?.startsWith("actions/cache"));
+const buildStep = (job.steps ?? []).find((s) => /npm run package/.test(s.run ?? ""));
+
+check("the pkg base-binary cache exists", Boolean(pkgCache));
+check(
+  "it caches pkg's real cache directory (~/.pkg-cache)",
+  (pkgCache?.with?.path ?? "").trim() === "~/.pkg-cache",
+  `path is ${JSON.stringify(pkgCache?.with?.path)}`,
+);
+check(
+  "the cache key is scoped to the runner OS",
+  /^pkg-\$\{\{ runner\.os \}\}-/.test(pkgCache?.with?.key ?? ""),
+  `key is ${JSON.stringify(pkgCache?.with?.key)}`,
+);
+check(
+  "the cache is restored before the build, not after it",
+  Boolean(pkgCache && buildStep) &&
+    job.steps.indexOf(pkgCache) < job.steps.indexOf(buildStep),
+  "a cache step after the build never helps the build",
+);
+
+/*
+  THE CACHE KEY MUST PIN THE pkg-fetch VERSION.
+
+  pkg resolves the `node22` target to a concrete patch version (v22.23.2) via
+  pkg-fetch's patches.json, and that mapping moves on every pkg-fetch upgrade.
+  A key that omits the version keeps serving a binary whose hash no longer
+  matches, which pkg reports as "Binary hash does NOT match. Re-fetching..." —
+  and then re-stalls. Asserted because this is silent in the Actions log when
+  the restore itself "succeeds".
+*/
+check(
+  "the cache key pins the installed pkg-fetch version",
+  /steps\.pkgver\.outputs\.version/.test(pkgCache?.with?.key ?? ""),
+  `key is ${JSON.stringify(pkgCache?.with?.key)}`,
+);
+check(
+  "the pkg-fetch version is resolved from the INSTALLED package, not the manifest",
+  /node_modules\/@yao-pkg\/pkg-fetch\/package\.json/.test(
+    (job.steps ?? []).find((s) => s.id === "pkgver")?.run ?? "",
+  ),
+  "reading package.json instead cannot see a resolved/overridden install",
+);
+
+/*
+  THE TARGET MUST HAVE A PREBUILT BINARY — THIS IS THE EXPENSIVE ONE TO LEARN.
+
+  This is asserted as a hard rule because the inverse was actually proposed as
+  a fix for the hang above: "downgrade node22 to node20 to guarantee a prebuilt
+  binary exists". For the pinned @yao-pkg/pkg-fetch (v3.6) that is exactly
+  backwards. pkg-fetch's `need()` downloads the release asset and, on failure,
+  falls through to `Building base binary from source:` — and the v3.6 release
+  ships NO node20 win-x64 asset:
+
+      node-v20.20.2-win-x64  -> HTTP 404  (absent from the v3.6 release)
+      node-v22.23.2-win-x64  -> HTTP 206  (present)
+
+  So switching to node20 would not have avoided the multi-hour stall, it would
+  have CAUSED one on every single run — a Node source build on a Windows
+  runner that needs a full toolchain and hours of CPU.
+
+  node22 is therefore load-bearing and must stay: better-sqlite3 13.x declares
+  `engines: node >=22` and its prebuilds are N-API, and @yao-pkg/pkg itself
+  requires `>=22.0.0`. Node 20 is not a safe fallback for this dependency set.
+*/
+const pkgScript = readFileSync(path.join(ROOT, "scripts/package.mjs"), "utf8");
+const targets = [...pkgScript.matchAll(/--targets",?\s*\n?\s*"([^"]+)"/g)].map((m) => m[1]);
+check(
+  "the bundler targets node22, which HAS a prebuilt win-x64 binary",
+  targets.length > 0 && targets.every((t) => t === "node22-win-x64"),
+  `found targets ${JSON.stringify(targets)}; node20-win-x64 404s on pkg-fetch v3.6 and falls back to a source build`,
+);
+check(
+  "the worker and the watchdog share one target (no runtime skew)",
+  new Set(targets).size === 1,
+  `targets ${JSON.stringify(targets)} would put the supervisor on a different Node than the worker`,
+);
+/*
+  Asserted against the steps' real `env:` values, not against the raw file text.
+  Scanning the text would match the comment above that documents this very
+  rule — a check that fails the moment someone explains it is a check that
+  teaches the wrong lesson.
+*/
+const setsPkgCachePath = (job.steps ?? []).some((s) =>
+  Object.values(s.env ?? {}).some((v) => /PKG_CACHE_PATH/.test(String(v))),
+);
+check(
+  "no step overrides PKG_CACHE_PATH away from the cached path",
+  !setsPkgCachePath,
+  "PKG_CACHE_PATH overrides ~/.pkg-cache, so the cache step would save nothing while reporting a hit",
+);
+
 check("the workflow parses as YAML", Boolean(doc.jobs), "no jobs found");
 check("push triggers on the default branches", JSON.stringify(doc.on.push?.branches) === '["main","master"]', JSON.stringify(doc.on.push?.branches));
 
