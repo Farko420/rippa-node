@@ -47,6 +47,11 @@ function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: root,
     stdio: "inherit",
+    // Windows gives a console app's children their own visible console window
+    // unless told otherwise, which flashes a black box over the developer's
+    // screen for every step of the build. `inherit` still routes the output
+    // here; only the extra window is suppressed.
+    windowsHide: true,
     ...options,
   });
   if (result.error) {

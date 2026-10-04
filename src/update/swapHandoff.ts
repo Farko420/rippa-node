@@ -240,7 +240,15 @@ export function spawnDetached(scriptPath: string, cwd: string): number | undefin
           windowsHide: true,
           cwd,
         })
-      : spawn("/bin/sh", [scriptPath], { detached: true, stdio: "ignore", cwd });
+      // `windowsHide` is meaningless on POSIX (Node ignores it there) but is kept
+      // so the two branches state the same intent: the swap must relaunch the
+      // exe silently, never over the top of whatever the user is doing.
+      : spawn("/bin/sh", [scriptPath], {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true,
+          cwd,
+        });
 
   child.unref();
   return child.pid;

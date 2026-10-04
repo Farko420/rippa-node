@@ -93,6 +93,9 @@ function runWatchdog(codes, { nodeArgs = [], timeoutMs = 30_000 } = {}) {
           RIPPA_WATCHDOG_STARTUP_DIR: path.join(dataDir, "startup-stub"),
           RIPPA_WATCHDOG_SKIP_PROCESS_SCAN: "1",
         },
+        // Each supervised restart in these tests would otherwise open its own
+        // console window on Windows and steal the operator's focus.
+        windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
@@ -237,6 +240,7 @@ function runGhostedWatchdog(codes, { timeoutMs = 20_000 } = {}) {
           RIPPA_WATCHDOG_GHOST_POLL_MS: "1000",
         },
         stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
       },
     );
     let output = "";
@@ -454,6 +458,7 @@ const helpRun = await new Promise((resolve) => {
       RIPPA_WATCHDOG_SKIP_PROCESS_SCAN: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
   });
   let output = "";
   child.stdout.on("data", (c) => {

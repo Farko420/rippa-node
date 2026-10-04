@@ -37,7 +37,7 @@ if (!fs.existsSync(watchdogExe)) {
 const flag = uninstall ? "--uninstall" : "--install";
 console.log(`[Watchdog] Running ${path.basename(watchdogExe)} ${flag} ...`);
 
-const result = spawnSync(watchdogExe, [flag], { stdio: "inherit" });
+const result = spawnSync(watchdogExe, [flag], { stdio: "inherit", windowsHide: true });
 if (result.error) {
   console.error(`[Watchdog] Could not start the watchdog: ${result.error.message}`);
   process.exit(1);

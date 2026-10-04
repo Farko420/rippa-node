@@ -52,6 +52,9 @@ export function spawnNode(configRoot) {
     cwd: ROOT,
     env: { ...process.env, RIPPA_CONFIG_ROOT: configRoot, PORT: String(PORT) },
     stdio: ["ignore", "pipe", "pipe"],
+    // Without this, every suite that boots a node flashed a console window over
+    // the operator's screen on Windows and stole focus.
+    windowsHide: true,
   });
   child.stdout.on("data", (d) => (log.text += d));
   child.stderr.on("data", (d) => (log.text += d));

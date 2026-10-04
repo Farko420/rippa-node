@@ -379,6 +379,19 @@ export class ScraperService {
   /**
    * Launches (or returns the already-running) headless Chromium instance.
    * The browser is reused across scrapes and torn down via `close()`.
+   *
+   * HEADLESS IS NOT A DEFAULT HERE, IT IS A CONSTRAINT. This node forages and
+   * scrapes unattended, often overnight, while the operator is doing something
+   * else on the same machine. A headed Chromium is a foreground GUI window: it
+   * appears over whatever was on screen and takes the caret, which is the exact
+   * failure this whole file's launch options exist to prevent. Do NOT switch
+   * `headless` to false, do NOT pass `--headless=false`, `--start-maximized`,
+   * `--kiosk` or `--app=` to "see what it is doing" — use
+   * `captureViewport()` below, which reports the rendered page as a JPEG on the
+   * dashboard with no window at all.
+   *
+   * Playwright's own Chromium launcher already passes `windowsHide` on Windows,
+   * so no console flashes here even though the binary is spawned for us.
    */
   private async getBrowser(): Promise<Browser> {
     if (this.browser && this.browser.isConnected()) {
@@ -390,6 +403,9 @@ export class ScraperService {
 
     this.browser = await loadChromium().chromium.launch({
       headless: true,
+      // Deliberately minimal. `--disable-blink-features=AutomationControlled`
+      // is the only flag, and it is anti-bot-detection, not window control.
+      // Anything that turns this into a visible window must not be added here.
       args: ["--disable-blink-features=AutomationControlled"],
     });
 

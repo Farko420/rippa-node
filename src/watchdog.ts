@@ -545,12 +545,24 @@ export async function applyStagedUpdate(targetExe: string): Promise<boolean> {
  * `rippa-node.exe --config D:\fleet\config.json` comes back the same way. The
  * watchdog also marks the child with {@link WATCHDOG_ENV_FLAG}, which is how
  * the node knows not to spawn its own detached swap script.
+ *
+ * `windowsHide: true` IS THE ANTI-FOCUS-STEALING FIX, and it used to be
+ * explicitly `false`. A Windows console app creates its children with a NEW
+ * visible console window unless told otherwise, so every supervised restart —
+ * including the silent ones the watchdog performs on a crash, on an OTA swap and
+ * on a Ghost Mode `start` — popped a console over the user's screen and took
+ * the caret. That is exactly what a background service must never do.
+ *
+ * It does not cost the operator the node's log output: `stdio: "inherit"`
+ * attaches the child to the watchdog's EXISTING console handles, so when the
+ * watchdog was started from a terminal the logs still stream to that terminal.
+ * What is suppressed is only the creation of a second, focus-stealing window.
  */
 function launchNode(nodeExe: string, args: string[]): ChildProcess {
   log(`starting ${nodeExe} ${args.join(" ")}`.trim());
   const child = spawn(nodeExe, args, {
     stdio: "inherit",
-    windowsHide: false,
+    windowsHide: true,
     env: { ...process.env, [WATCHDOG_ENV_FLAG]: "1" },
   });
   child.on("error", (error) => log(`could not start ${nodeExe}: ${describeError(error)}`));

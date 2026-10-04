@@ -205,12 +205,15 @@ writeFileSync(path.join(ROOT, "ps-check.ps1"), out, "utf8");
 const { spawnSync } = await import("node:child_process");
 const script = path.join(ROOT, "ps-check.ps1");
 for (const shell of ["pwsh", "powershell"]) {
-  const probe = spawnSync(shell, ["-NoProfile", "-Command", ""], { stdio: "ignore" });
+  const probe = spawnSync(shell, ["-NoProfile", "-Command", ""], {
+    stdio: "ignore",
+    windowsHide: true,
+  });
   if (probe.error) continue;
   const result = spawnSync(
     shell,
     ["-NoProfile", "-Command", `$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile('${script}',[ref]$null,[ref]$e);if($e -and $e.Count){$e|%{Write-Host ("  line {0}: {1}" -f $_.Extent.StartLineNumber,$_.Message)};exit 1}else{Write-Host '  ok  every pwsh step parses'}`],
-    { encoding: "utf8" },
+    { encoding: "utf8", windowsHide: true },
   );
   const out = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
   console.log(out || `  ${result.status === 0 ? "ok" : "FAIL"}  pwsh parse check via ${shell}`);

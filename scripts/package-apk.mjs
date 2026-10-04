@@ -73,7 +73,14 @@ const appVersionCode = major * 10000 + minor * 100 + patch;
 
 /** Runs a command, inheriting stdio; exits the build on failure. */
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, { cwd: root, stdio: "inherit", ...options });
+  // `windowsHide: true` — see package.mjs. Stops each build step from flashing
+  // a console window over the operator's screen on Windows.
+  const result = spawnSync(command, args, {
+    cwd: root,
+    stdio: "inherit",
+    windowsHide: true,
+    ...options,
+  });
   if (result.error) {
     console.error(`[APK] Failed to start ${command}: ${result.error.message}`);
     process.exit(1);
@@ -86,7 +93,12 @@ function run(command, args, options = {}) {
 
 /** Best-effort: returns true on success without ever exiting. */
 function tryRun(command, args, options = {}) {
-  const result = spawnSync(command, args, { cwd: root, stdio: "inherit", ...options });
+  const result = spawnSync(command, args, {
+    cwd: root,
+    stdio: "inherit",
+    windowsHide: true,
+    ...options,
+  });
   return !result.error && result.status === 0;
 }
 
@@ -1596,7 +1608,9 @@ if (!hasSdk) {
 /** True when a JDK is reachable, via JAVA_HOME or java on PATH. */
 function hasJdk() {
   if (process.env.JAVA_HOME && fs.existsSync(process.env.JAVA_HOME)) return true;
-  const probe = isWindows ? spawnSync("where", ["java"]) : spawnSync("which", ["java"]);
+  const probe = isWindows
+    ? spawnSync("where", ["java"], { stdio: "ignore", windowsHide: true })
+    : spawnSync("which", ["java"], { stdio: "ignore", windowsHide: true });
   return probe.status === 0;
 }
 

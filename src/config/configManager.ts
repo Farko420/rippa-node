@@ -823,6 +823,13 @@ export function resolvePublicDir(): string | null {
  *
  * NOTE: Do NOT reintroduce the `open` NPM package here — its dynamic ESM
  * import breaks inside the `pkg` bundle (rippa-node.exe).
+ *
+ * `windowsHide: true` is REQUIRED, not cosmetic. On Windows a console app's
+ * children are created with a visible console window by default, so shelling
+ * out to `start` flashed a black console box over the dashboard every time the
+ * boot opened the browser, and stole focus from whatever the user was doing.
+ * The flag hides that console host only — the browser the command launches is a
+ * GUI process and still appears normally.
  */
 export async function openDashboard(url: string): Promise<void> {
   const startCommand =
@@ -831,7 +838,7 @@ export async function openDashboard(url: string): Promise<void> {
     process.platform === "win32" ? `${startCommand} "" "${url}"` : `${startCommand} "${url}"`;
   return new Promise<void>((resolve) => {
     try {
-      exec(cmd, (error) => {
+      exec(cmd, { windowsHide: true }, (error) => {
         if (error) {
           console.warn(`[Boot] Could not auto-launch browser — ${error.message}`);
           console.warn(`[Boot] Open this URL manually: ${url}`);
