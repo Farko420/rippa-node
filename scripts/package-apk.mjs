@@ -837,7 +837,7 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
       // Never throws by contract, but the catch keeps a bug in the worker from
       // leaving the button permanently disabled.
       /*
-         `force: true` — AN EXPLICIT TAP OVERRIDES THE VERSION GATE.
+         'force: true' — AN EXPLICIT TAP OVERRIDES THE VERSION GATE.
 
          The feed's advertised version is unreliable (see above), and comparing it
          against this device is what produced the permanent 'you are on the latest
