@@ -348,6 +348,15 @@ export function buildHeartbeatTelemetry(
       : [],
     ollama: buildOllamaTelemetry(),
     /*
+      EMBEDDED AI TELEMETRY FOR THE FLEET DASHBOARD.
+
+      `normaliseMeshTelemetry` on the Mothership looks for these fields under
+      `embedded_ai`, `embeddedAi`, or `ai` keys, OR at the root level. Nesting
+      them here keeps the heartbeat shape manageable while staying compatible
+      with the cloud's parsing rules.
+    */
+    embedded_ai: buildEmbeddedAiTelemetry(),
+    /*
       GRANULAR VERSION TRACKING.
 
       Appended LAST, and deliberately so: `getSystemVitals()` and the block
@@ -374,6 +383,29 @@ function buildOllamaTelemetry(): OllamaTelemetry {
     model: status.model,
     port: status.port,
     task: status.task,
+  };
+}
+
+/**
+ * Extracts the Mothership-compatible AI telemetry from the Ollama status.
+ * Maps the node's local Ollama state to the fields the fleet dashboard expects.
+ *
+ * This is read by `normaliseMeshTelemetry` on the Mothership and written to
+ * the rippa_nodes table, so a mismatch here is what produces the "no AI status"
+ * symptom on the fleet screen even though the node clearly reports it.
+ */
+function buildEmbeddedAiTelemetry(): Record<string, unknown> {
+  const activeTask = getCurrentProcess();
+  const status = ollamaManager.getStatus(activeTask?.task ?? null);
+  return {
+    // Mapped from ollama.running, ollama.managed, ollama.port status
+    ai_status: status.state === "running" ? "running" : status.managed ? "idle" : null,
+    // Hardware tier is not known from Ollama alone; null means "not reported"
+    hardware_tier: null,
+    // The model that is currently loaded or active
+    active_model: status.model || null,
+    // Ollama doesn't report embedding support directly; null means "not reported"
+    supports_embedding: null,
   };
 }
 

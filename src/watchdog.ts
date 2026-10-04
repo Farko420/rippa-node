@@ -487,8 +487,23 @@ export async function applyStagedUpdate(targetExe: string): Promise<boolean> {
         renamed = true;
       }
       fs.renameSync(staged, targetExe);
-      // Success: the previous build has served its purpose.
-      if (renamed) fs.rmSync(backup, { force: true });
+      // Success: the previous build has served its purpose. Windows can keep
+      // `.old` locked for a moment after the rename above (AV scan, lingering
+      // handle, indexing service), and that lock throwing EPERM/EBUSY here must
+      // NOT be mistaken for a failed swap — the new binary is already in place
+      // and about to boot. Swallow the cleanup failure, log a warning, and leave
+      // the stray `.old` file for the NEXT successful swap's `rmSync(backup, ..)`
+      // (same call, next time around) to clear instead.
+      if (renamed) {
+        try {
+          fs.rmSync(backup, { force: true });
+        } catch (cleanupError) {
+          log(
+            `could not remove ${backup} (${describeError(cleanupError)}) — ` +
+              "leaving it on disk and continuing; the swap itself succeeded.",
+          );
+        }
+      }
       log(`applied the staged update to ${targetExe}.`);
 
       /*
