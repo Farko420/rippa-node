@@ -65,18 +65,24 @@ public class RippaNodeTileService extends TileService {
             refreshTile();
             // Asks the platform to call us back once the start/stop has actually
             // landed, so the tile settles on the truth rather than on intent.
-            requestListeningState();
+            //
+            // The two-argument form is the public API. The no-argument form that
+            // reads like a natural `this.requestListeningState()` does not exist:
+            // it takes the Context to bind as and the ComponentName of the tile,
+            // and `null` for the latter means "whichever tile this call came from",
+            // which is exactly what a TileService wants.
+            requestListeningState(this, null);
         }
     }
 
     /**
      * Repaints the tile from the service's live state.
      *
-     * `getQSTile()` returns null before the user has added the tile, which is
+     * `getQsTile()` returns null before the user has added the tile, which is
      * not an error and must not throw.
      */
     private void refreshTile() {
-        Tile tile = getQSTile();
+        Tile tile = getQsTile();
         if (tile == null) {
             return;
         }

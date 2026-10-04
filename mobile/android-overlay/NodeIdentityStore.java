@@ -127,6 +127,10 @@ public final class NodeIdentityStore {
         } catch (Exception error) {
             // A mirror that cannot be written is a degraded node, not a broken
             // one. Throwing here would take down pairing, which still succeeds
+            // through localStorage.
+            android.util.Log.w("RippaNode", "Could not mirror node identity: " + error.getMessage());
+        }
+    }
 
     /**
      * The stored identity, or null when this device has never been paired.
@@ -182,9 +186,4 @@ public final class NodeIdentityStore {
         return value == null ? "" : value;
     }
 }
-
-            // through localStorage.
-            android.util.Log.w("RippaNode", "Could not mirror node identity: " + error.getMessage());
-        }
-    }
 
