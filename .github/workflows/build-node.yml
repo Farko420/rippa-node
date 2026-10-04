@@ -580,7 +580,7 @@ jobs:
       # 17 is what Capacitor 6 / AGP 8.x / Gradle 8 target. The build fails
       # cryptically on 11, so this pin is load-bearing, not cosmetic.
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'

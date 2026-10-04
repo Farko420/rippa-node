@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import axios from "axios";
-import { env } from "../config";
+import { env, reloadEnv } from "../config";
 import {
   OllamaClient,
   PRIMARY_MODEL,
@@ -18,8 +18,6 @@ import {
   type EngineHealth,
 } from "./engineTelemetry";
 import {
-  BUNDLED_OLLAMA_ORIGIN,
-  BUNDLED_OLLAMA_PORT,
   bundledBinaryPath,
   bundledBinaryPresent,
   bundledOllamaOrigin,
@@ -187,6 +185,71 @@ interface PullFrame {
   total?: number;
   completed?: number;
   error?: string;
+}
+
+/**
+ * PUBLISHES THE MANAGED ORIGIN TO EVERY OTHER MODULE IN THIS PROCESS.
+ *
+ * WHY THIS IS A FUNCTION AND NOT AN INLINE ASSIGNMENT. The obvious fix at the
+ * call site is `process.env.OLLAMA_URL = origin`, and that is the bug that made
+ * the engine look dead on a node that was serving perfectly. `env` in
+ * `src/config.ts` is NOT a view of `process.env` — it is a plain object zod
+ * produced once at module load and exported as a const. Every importer holds
+ * that same object reference, so mutating `process.env` afterwards is invisible
+ * to all of them.
+ *
+ * `reloadEnv()` is what makes the write take effect: it re-reads `process.env`
+ * INTO that exported object, in place, so the ~8 modules that do `env.OLLAMA_URL`
+ * at call time start resolving the managed port without a process restart. That
+ * in-place mutation is also why the value must be read as `env.X` rather than
+ * destructured at module scope by importers — a destructured copy is a snapshot
+ * and would keep the stale port forever.
+ *
+ * WHY IT IS SAFE TO CALL REPEATEDLY. `start()` runs again on every managed
+ * restart, so this must be idempotent: it is a no-op once the managed origin is
+ * already published, and it never resets an operator's own `OLLAMA_URL` on a node
+ * that never enabled supervision (this only ever runs on the managed path).
+ *
+ * WHY THE ORIGIN COMES FROM `bundledOllamaOrigin()`. That helper resolves the
+ * SAME port the child is about to be bound to, so the port we advertise cannot
+ * drift from the port we bind. The bare `BUNDLED_OLLAMA_PORT`/`BUNDLED_OLLAMA_ORIGIN`
+ * constants are deliberately NOT used here: they are the un-overridden defaults
+ * and would ignore `RIPPA_BUNDLED_OLLAMA_PORT`, reintroducing the exact
+ * "binds one port, is asked about another" split this resolver exists to prevent.
+ * `port` is the already-resolved value from the call site and is asserted against
+ * the origin rather than re-derived, so a divergence is logged instead of hidden.
+ */
+function publishManagedOllamaOrigin(port: number): void {
+  const origin = bundledOllamaOrigin();
+
+  // Cheap drift guard. `origin` is machine-built and always well-formed, so
+  // extractPort cannot realistically fail here — the check exists to catch a
+  // future edit to the resolver, not to handle bad input.
+  const originPort = extractPort(origin);
+  if (originPort !== port) {
+    console.warn(
+      `[OllamaManager] Managed origin ${origin} does not match resolved port ${port} — ` +
+        `publishing the origin, which is what the child will bind.`,
+    );
+  }
+
+  // Read through `env` (the live object), not a bare process.env peek, so an
+  // already-published value is detected even if something else wrote it.
+  if (env.OLLAMA_URL === origin) {
+    return;
+  }
+
+  const previous = env.OLLAMA_URL;
+  process.env.OLLAMA_URL = origin;
+  // The load-bearing half. Without this the write above is decoration.
+  reloadEnv();
+
+  console.log(`[OllamaManager] Managed Ollama origin published: ${previous} → ${origin}.`);
+  publishNodeEvent({
+    kind: "info",
+    title: "Ollama origin updated",
+    detail: `Local engine is now served at ${origin}.`,
+  });
 }
 
 class OllamaManager {
