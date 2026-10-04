@@ -58,6 +58,39 @@
 .badge.relay { border-color:var(--warn); color:var(--warn); }
 .badge.busy { border-color:var(--acc); color:var(--acc); }
 
+/*
+  ROLE BADGES (Epic 1).
+
+  The colour language here is load-bearing and deliberately NOT decorative:
+  green = serves inference, amber = confirmed scraper, grey = never reported.
+  Using a warning colour for a node that is working exactly as configured is what
+  made the old fleet view read as though the Galaxy S26s were broken.
+
+  `role-telemetry` is muted on purpose even when it carries real text — it
+  replaces a model slot, so it must sit visually below the role badge rather than
+  competing with it for attention.
+*/
+.badge.role-ai { border-color:var(--ok); color:var(--ok); font-weight:600; }
+.badge.role-scraper { border-color:var(--warn); color:var(--warn); }
+.badge.role-unknown { border-style:dashed; color:var(--mut); }
+.badge.role-telemetry { color:var(--mut); border-color:transparent; padding-left:0; }
+.badge.role-model { border-color:var(--acc); color:var(--acc); max-width:150px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+/* AI MESH HEALTH (Epic 2) — AI nodes at full strength, scrapers muted. */
+.ai-mesh-list { display:flex; flex-direction:column; gap:10px; margin-top:14px; }
+.ai-mesh-row { border:1px solid var(--line); border-left:3px solid var(--ok);
+  border-radius:10px; padding:10px 12px; background:#0d1117; }
+.ai-mesh-row.scraper { border-left-color:var(--warn); opacity:.62; }
+.ai-mesh-row.unknown { border-left-color:var(--mut); border-left-style:dashed; opacity:.55; }
+.ai-mesh-row.offline { border-style:dashed; }
+.ai-mesh-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.ai-mesh-name { font-weight:600; font-size:13px; }
+.ai-mesh-state { font-size:11px; color:var(--mut); margin-left:auto; }
+.ai-mesh-row.ai .ai-mesh-state { color:var(--ok); }
+.ai-mesh-detail { font-size:12px; color:var(--mut); margin-top:4px; }
+.ai-mesh-row .ai-test { margin-top:8px; font-size:11px; padding:4px 10px; }
+
 /* Active processes — grouped shared tasks with connecting links */
 .cc-proc-list { display:flex; flex-direction:column; gap:12px; }
 .proc { border:1px solid var(--line); border-radius:12px; padding:12px; background:#0d1117; }

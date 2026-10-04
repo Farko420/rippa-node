@@ -11,6 +11,7 @@
     "test": "npm run typecheck",
     "test:brain-parity": "tsx scripts/brain-parity-check.ts .parity/bundle.json",
     "test:verify": "npm run build && node scripts/verify-units.mjs && node scripts/verify-fixes.mjs && node scripts/verify-watchdog.mjs",
+    "test:fleet": "npm run build && node scripts/verify-fleet-roles.mjs",
     "test:paths": "tsx scripts/verify-paths.mts",
     "test:mobile": "npm run build && node scripts/verify-mobile.mjs",
     "test:mobile:bundle": "node scripts/build-mobile-worker.mjs && node scripts/verify-mobile-bundle.mjs",

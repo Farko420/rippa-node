@@ -110,6 +110,24 @@ export interface RippaNodeConfig {
    * fleet membership.
    */
   SATELLITE_REGISTRY?: unknown;
+  /*
+    AI FALLBACK PROVIDER SETTINGS.
+
+    Carried through `normalizeConfig` for exactly the reason SATELLITE_REGISTRY
+    is: `writeConfig` writes whatever this function returns and is NOT a merge,
+    so any field not named here is DELETED on the next GUI save. An operator who
+    enabled the fallback provider, then changed an unrelated setting in Setup,
+    would silently lose the endpoint — and the mesh panel would go back to
+    reporting the node as a non-provider with no obvious cause.
+
+    The value types are nullable by DESIGN, not by accident. `null` means "not
+    configured" and is the ONLY correct representation of a cleared field; see
+    src/services/aiEndpointSettings.ts for why "" is a bug rather than a synonym.
+  */
+  ai_enabled?: boolean;
+  ai_endpoint?: string | null;
+  active_model?: string | null;
+  ai_model?: string | null;
 }
 
 export type NodeRole = "master" | "satellite";
@@ -273,7 +291,32 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
     SATELLITE_REGISTRY: Array.isArray(record["SATELLITE_REGISTRY"])
       ? record["SATELLITE_REGISTRY"]
       : [],
+    /*
+      AI FALLBACK PROVIDER — see the interface note. Normalised to null rather
+      than "" so a cleared field survives a round-trip through config.json as the
+      absence of a value.
+
+      `pickString` is deliberately NOT used for the URL: it returns "" for a
+      missing key, and "" is precisely the value this feature must never store.
+    */
+    ai_enabled: record["ai_enabled"] === true,
+    ai_endpoint: nullableString(record["ai_endpoint"]),
+    active_model: nullableString(record["active_model"]),
+    ai_model: nullableString(record["ai_model"]),
   };
+}
+
+/**
+ * A config string field that is either a non-empty string or null.
+ *
+ * Whitespace-only collapses to null: a field of spaces is what a half-cleared
+ * value looks like after a hand edit, and preserving it would produce a URL
+ * that is present but unusable.
+ */
+function nullableString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 /** Keeps only well-formed peer entries when normalising config.json. */

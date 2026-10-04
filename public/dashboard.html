@@ -120,6 +120,40 @@
       <div id="processes" class="cc-proc-list"></div>
       <p id="processesEmpty" class="cc-empty">No shared tasks running.</p>
     </section>
+
+    <!--
+      AI MESH HEALTH (Epic 2).
+
+      A separate panel from the grid above, and the separation is the feature. The
+      grid answers "what is my fleet"; this one answers "which nodes can actually
+      serve inference", which is a different question with a different denominator.
+
+      Non-AI nodes are NOT hidden from here — they are rendered in an explicitly
+      muted state labelled "Dedicated Scraper Node - AI Disabled". Filtering them
+      out entirely would make this panel's count silently disagree with the grid's
+      above, and an operator comparing the two would have no way to tell whether a
+      phone had been deleted or simply does not serve models. Shown-but-muted keeps
+      the two views reconcilable, which is the property that matters.
+    -->
+    <section class="cc-panel" id="aiMeshPanel">
+      <div class="ollama-head">
+        <h2>AI Mesh Health</h2>
+        <span id="aiMeshBadge" class="status-badge status-idle">Unknown</span>
+      </div>
+      <p class="hint">
+        Nodes that can serve local inference, and the dedicated scrapers that
+        deliberately cannot. A scraper is not unhealthy &mdash; it is doing a
+        different job.
+      </p>
+      <div class="cc-stats ollama-stats">
+        <div class="tile"><span class="tile-label">AI Nodes</span><strong id="aiMeshAiCount">&mdash;</strong></div>
+        <div class="tile"><span class="tile-label">Scrapers</span><strong id="aiMeshScraperCount">&mdash;</strong></div>
+        <div class="tile"><span class="tile-label">Unreported</span><strong id="aiMeshUnknownCount">&mdash;</strong></div>
+        <div class="tile"><span class="tile-label">Fallback</span><strong id="aiMeshFallback">&mdash;</strong></div>
+      </div>
+      <div id="aiMeshList" class="ai-mesh-list"></div>
+      <p id="aiMeshEmpty" class="hint" hidden>No nodes have reported their capabilities yet.</p>
+    </section>
   </main>
   </div>
 
@@ -155,6 +189,23 @@
         <div class="tile"><span class="tile-label">Embedding Model</span><strong id="ollamaEmbed">—</strong></div>
       </div>
       <p id="ollamaError" class="hint" hidden></p>
+
+      <!--
+        ENTRY POINT FOR THE AI ENDPOINT SETTINGS MODAL (Epic 3).
+
+        It lives in the Embedded AI view because that is where an operator
+        already goes to reason about this node's brain, and the fallback toggle
+        is a statement about that brain's availability to the rest of the fleet.
+      -->
+      <div class="row2" style="margin:14px 0 4px;">
+        <button id="aiSettingsOpen" type="button" class="ghost">
+          AI Endpoint Settings&hellip;
+        </button>
+        <p class="hint" style="flex:1;min-width:180px;margin:0;">
+          Let other mesh nodes fall back to this node for inference when their own
+          brain is unavailable.
+        </p>
+      </div>
 
         <!--
           THE LIVE TERMINAL.
@@ -286,6 +337,69 @@
   </div>
 </div>
 
+<!--
+    AI ENDPOINT SETTINGS (Epic 3).
+
+    THE BUG THIS MODAL HAD. Validation ran unconditionally, so clearing a
+    previously saved `ai_endpoint` raised a client-side error demanding a URL, a
+    model name and an inference test — for a feature the operator was turning
+    OFF. There was no way to reach the intended state.
+
+    TWO PIECES OF THIS ARE LOAD-BEARING AND EASY TO BREAK:
+
+      1. `#aiFallbackToggle` drives BOTH the field visibility and the submit
+         button's LABEL ("Save & Test Inference" when ON, "Save Settings" when
+         OFF). The label is the honest answer to "what is this button about to
+         do?" — promising an inference test that is then skipped is the original
+         complaint in a new form.
+
+      2. `syncAiToggle()` is the single place that decides whether validation
+         applies. See `submitAiSettings()` in dashboard.js: when the toggle is
+         OFF the URL and model fields are not merely optional, they are IGNORED
+         entirely and a blank form is submitted and accepted.
+  -->
+  <div id="aiSettingsModal" class="lock" hidden role="dialog" aria-modal="true"
+       aria-labelledby="aiSettingsTitle">
+    <div class="lock-card cc-modal-card">
+      <button id="aiSettingsClose" type="button" class="cc-modal-x" title="Close">&#10005;</button>
+      <h1 id="aiSettingsTitle">AI Endpoint Settings</h1>
+      <p class="sub">Let other nodes fall back to this node for inference.</p>
+
+      <div class="cc-modal-body">
+        <div class="opt">
+          <input type="checkbox" id="aiFallbackToggle" />
+          <label for="aiFallbackToggle">Enable as AI Fallback Provider
+            <span class="desc">When on, this node answers inference for any mesh
+            node whose own brain is unavailable. When off, the endpoint and model
+            fields below are ignored and saved as cleared.</span></label>
+        </div>
+
+        <div id="aiEndpointFields">
+          <div class="field">
+            <label for="aiEndpointUrl">Endpoint URL</label>
+            <input id="aiEndpointUrl" type="text" inputmode="url" spellcheck="false"
+                   autocomplete="off" placeholder="http://127.0.0.1:11434" />
+          </div>
+          <div class="field">
+            <label for="aiActiveModel">Active Model</label>
+            <input id="aiActiveModel" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="qwen2.5:1.5b" />
+          </div>
+          <div class="field">
+            <label for="aiEmbeddingModel">Embedding Model</label>
+            <input id="aiEmbeddingModel" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="nomic-embed-text" />
+          </div>
+        </div>
+
+        <p id="aiSettingsMessage" class="hint" hidden></p>
+        <button id="aiSettingsSave" type="button" class="save" style="width:auto;padding:11px 20px;">
+          Save Settings
+        </button>
+      </div>
+    </div>
+  </div>
+
 <!-- ADMIN COMMAND OVERLAY — unclosable by design. See the note in index.html. -->
 <div id="adminOverlay" class="admin-overlay" hidden role="alertdialog" aria-live="assertive"
      aria-labelledby="adminOverlayTitle">
@@ -336,6 +450,26 @@
         <h3>Problem Solving Rate</h3>
         <p class="metric-line"><strong id="mPsa">0%</strong></p>
         <p id="mPsaNote" class="hint">Captcha / retry loops resolved without failing the task.</p>
+      </div>
+
+      <!-- Role & AI capabilities (Epic 1 / Epic 2) -->
+      <div class="metric-block">
+        <h3>Role &amp; Capabilities</h3>
+        <p class="metric-line" id="mRole">—</p>
+        <p id="mModels" class="hint">—</p>
+        <p id="mRoleNote" class="hint" hidden></p>
+        <!--
+          SHOWN ONLY WHEN THE NODE CONFIRMS ai_enabled === true.
+
+          This button is not merely disabled for non-AI nodes — it is not rendered.
+          A permanently greyed-out "Test Local Inference" on a Galaxy S26 tells the
+          operator the button is broken; an absent one tells them the node has no
+          local brain, which is the truth. See renderSatelliteDetail().
+        -->
+        <button id="mTestInference" type="button" class="ghost cc-restore" hidden>
+          Test Local Inference
+        </button>
+        <p id="mInferenceResult" class="hint" hidden></p>
       </div>
 
       <!-- Networking -->

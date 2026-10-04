@@ -31,6 +31,14 @@ import {
   type PersistedSatelliteRecord,
 } from "../config/nodeAuth";
 import { publishNodeEvent } from "./nodeEvents";
+import {
+  describeAiCapabilities,
+  describeCapabilities,
+  emptyCapabilities,
+  mergeCapabilities,
+  normaliseAiEnabled,
+  type NodeCapabilities,
+} from "./nodeCapabilities";
 import type { MeshKeySyncDirective } from "./meshKeySync";
 
 /**
@@ -174,6 +182,15 @@ export interface NodeMetrics {
   lastStatus: "idle" | "busy";
   lastSeenAt: string;
   registeredAt: string;
+  /**
+   * What this node says it can do — AI or scraper, and on what runtime.
+   *
+   * Optional because an older build never sends it, and its ABSENCE is itself
+   * meaningful: a node that reports nothing is `aiEnabled: null` ("unknown"),
+   * which the UI must not render as a confirmed scraper. See
+   * ./nodeCapabilities.ts for the tri-state rules.
+   */
+  capabilities?: NodeCapabilities;
 }
 
 /** A satellite as known by the Master. */
@@ -950,6 +967,12 @@ export class SwarmDispatcher {
     cloudLinkUrl?: string;
     metrics?: Partial<NodeMetrics>;
     p2pEnabled?: boolean;
+    /**
+     * Role flags from the node itself. The Master never infers these: an AI
+     * brain and a Galaxy S26 scraper arrive as the same protocol message, and
+     * only the node knows which it is.
+     */
+    capabilities?: NodeCapabilities;
   }): { task: SwarmAssignment | null; siblings: PeerEndpoint[]; p2pEnabled: boolean; meshKey: string } {
     const { record, meshKey } = this.registerSatellite(input);
     if (input.metrics) {
@@ -961,6 +984,25 @@ export class SwarmDispatcher {
         registeredAt: record.metrics.registeredAt,
         lastSeenAt: new Date().toISOString(),
       };
+    }
+    /*
+      CAPABILITIES ARE MERGED, NOT OVERWRITTEN.
+
+      A heartbeat that omits the block (an older satellite build still paired to
+      a new Master) must NOT clear what a previous heartbeat established —
+      otherwise every poll from a pre-Epic-1 node would flip the whole fleet
+      back to "AI unknown" ten seconds after it was correctly identified.
+
+      The converse also matters: when the toggle is turned OFF on the node, the
+      node sends `aiEnabled: false`, which is an explicit `false` and so DOES
+      overwrite a previously-true value. `??` on a boolean only falls through on
+      null/undefined, so `false` is preserved correctly.
+    */
+    if (input.capabilities) {
+      record.metrics.capabilities = mergeCapabilities(
+        record.metrics.capabilities ?? emptyCapabilities(),
+        input.capabilities,
+      );
     }
     const task = record.currentTask;
     // CRITICAL: siblings must NOT be returned once P2P is revoked. The satellite
@@ -1467,6 +1509,24 @@ export class SwarmDispatcher {
         // efficiency in its own right, so both are kept distinct here.
         uptimeSeconds: record.metrics.systemUptimeSeconds ?? null,
         swarmUptimeSeconds: record.metrics.uptimeSeconds ?? 0,
+        /*
+          ROLE FLAGS, FLATTENED FOR THE UI (see ./nodeCapabilities.ts).
+
+          `aiEnabled` is tri-state and is passed through UNCHANGED. It is
+          deliberately not collapsed with `Boolean(...)`, which would turn
+          "this node has not told us yet" into "this node has no AI" — the exact
+          misreading Epic 2 asks us to avoid. Consumers test `=== true` before
+          offering any inference action.
+
+          The runtime/scraping fields are the replacement for the empty model
+          slot: a scraper node fills those with what it actually does
+          ("Runtime: Android WebView", "Scraping: Lightweight Fetch") instead of
+          leaving a blank where a model name would go.
+        */
+        aiEnabled: normaliseAiEnabled(record.metrics.capabilities?.aiEnabled),
+        aiModels: record.metrics.capabilities?.aiModels ?? [],
+        runtime: record.metrics.capabilities?.runtime ?? "",
+        scrapingMode: record.metrics.capabilities?.scrapingMode ?? "",
       };
     });
 
@@ -1510,6 +1570,17 @@ export class SwarmDispatcher {
         busy: satellites.filter((s) => s.currentTask).length,
         p2pRevoked: satellites.filter((s) => s.p2pRevoked).length,
         avgEfficiency,
+        /*
+          AI vs scraper split, for the "AI Mesh Health" panel header.
+
+          Counted from an EXPLICIT `true`/`false`, and the unknown bucket is
+          surfaced rather than hidden: a node that has never reported its role is
+          not the same as a node that reported "not an AI brain", and folding the
+          two together would make the panel quietly under-report the fleet.
+        */
+        aiNodes: satellites.filter((s) => s.aiEnabled === true).length,
+        scraperNodes: satellites.filter((s) => s.aiEnabled === false).length,
+        unknownRoleNodes: satellites.filter((s) => s.aiEnabled === null).length,
       },
     };
   }
@@ -1601,6 +1672,38 @@ export class SwarmDispatcher {
 
     console.log(`[Swarm] Paired with Master at ${base} — zero-config networking is now managed remotely.`);
     return { meshKey, masterEndpoint, masterCode };
+  }
+
+  /**
+   * SATELLITE: what this node reports about itself on each heartbeat.
+   *
+   * AI IS CLAIMED ONLY WHEN THE RUNTIME IS ACTUALLY COMPLETE. This checks
+   * `bundledRuntimeComplete` rather than merely "Ollama is installed", because a
+   * half-install boots, binds the port, answers `/api/tags`, and then fails every
+   * single inference with "llama-server binary not found". A node that claimed
+   * "AI Brain" in that state would be sent real inference work and would fail
+   * every request — strictly worse than the phone that honestly reports it is a
+   * scraper.
+   *
+   * The Ollama manager is reached through a lazily-required reference so that
+   * this file stays importable from the WebView bundle, which must not pull in
+   * `node:child_process` (see scripts/build-mobile-worker.mjs).
+   */
+  private localCapabilities(): NodeCapabilities {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const manager = require("./ollamaManager") as {
+        ollamaManager?: { getStatus(task: null): { bundledRuntimeComplete: boolean; model: string } };
+      };
+      const status = manager.ollamaManager?.getStatus(null);
+      if (status?.bundledRuntimeComplete) {
+        return describeAiCapabilities([status.model]);
+      }
+    } catch {
+      // No Ollama manager in this runtime (the WebView case). Fall through to
+      // the scraper payload — which is the truth for a tablet.
+    }
+    return describeCapabilities();
   }
 
   /** Satellite cycle: poll the Master for work and report local activity. */
@@ -1764,6 +1867,7 @@ async recoverFromSyncReset(
           cloudLinkUrl: self.cloudLinkUrl,
           metrics: this.localMetrics,
           p2pEnabled: p2pEnabled(),
+          capabilities: this.localCapabilities(),
         },
         {
           timeout: MESH_HTTP_TIMEOUT_MS,

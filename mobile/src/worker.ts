@@ -35,6 +35,18 @@ import {
   type PowerLimits,
   type PowerSnapshot,
 } from "../../src/agent/DevicePower";
+import {
+  DataUsageTracker,
+  DEFAULT_NETWORK_POLICY,
+  evaluateNetwork,
+  formatBytes,
+  normaliseNetworkPolicy,
+  readNetworkSnapshot,
+  type DataUsage,
+  type NetworkKind,
+  type NetworkPolicy,
+  type NetworkSnapshot,
+} from "../../src/agent/DeviceNetwork";
 
 /** How often the Mothership heartbeat is sent (matches the desktop 30s). */
 const HEARTBEAT_MS = 30_000;
@@ -51,6 +63,18 @@ const CONFIG_KEY = "rippa_node_mobile_config";
 /** How often power limits are re-evaluated. */
 const POWER_CHECK_MS = 20_000;
 
+/**
+ * How often the network policy is re-evaluated.
+ *
+ * FASTER THAN THE POWER CHECK, and that is not an oversight. The thing being
+ * detected here — walking out of Wi-Fi range — happens in the time it takes to
+ * walk past a doorway, whereas a battery drains over hours. At the 20s power
+ * cadence a node could start a scrape on cellular and keep it running for most
+ * of a minute, which is exactly the spend the operator asked to avoid. 5s is
+ * cheap: it reads one cached property and touches no network.
+ */
+const NETWORK_CHECK_MS = 5_000;
+
 interface MobileConfig {
   nodeName: string;
   nodeCode: string;
@@ -60,6 +84,14 @@ interface MobileConfig {
   dashboardPin: string;
   /** Operator-set battery/power limits. Absent => defaults. */
   powerLimits?: PowerLimits;
+  /**
+   * Operator-set network policy. Absent => defaults (cellular allowed).
+   *
+   * Separate from `powerLimits` on purpose: a flat battery is a hard stop and a
+   * cellular link is a cost stop, and an operator who paused for the second does
+   * not want the node to look dead. See src/agent/DeviceNetwork.ts.
+   */
+  networkPolicy?: NetworkPolicy;
 }
 
 const DEFAULT_CONFIG: MobileConfig = {
@@ -208,6 +240,53 @@ let powerReason = "";
 /** Current poll-interval multiplier from the throttle setting. */
 let powerThrottle = 1;
 
+/*
+  NETWORK STATE — the current transport, the operator's policy, and the rolling
+  data accounting shown on the telemetry dashboard.
+
+  Same caching rationale as the power snapshot above: the UI polls
+  `workerStatus()` every two seconds, and each of these would otherwise cost a
+  bridge call or a Resource Timing walk per poll.
+
+  `networkSuspended` is tracked SEPARATELY from `powerSuspended` even though both
+  pause the same loops, because the two reasons are not interchangeable to an
+  operator: one means "flat battery", the other means "I told you not to use my
+  data". Collapsing them into one boolean is how a tablet that is merely on
+  cellular ends up reported as having a battery problem.
+*/
+let networkSnapshot: NetworkSnapshot = {
+  kind: "unknown",
+  metered: false,
+  downlinkMbps: null,
+  source: "unavailable",
+};
+let networkSuspended = false;
+let networkReason = "";
+let dataUsage: DataUsage = { sent1h: 0, received1h: 0, sent24h: 0, received24h: 0 };
+/** Rolling transfer accounting. Module state, like the other telemetry. */
+const usageTracker = new DataUsageTracker();
+
+/**
+ * Recent finished tasks, newest first, for the dashboard's history feed.
+ *
+ * Capped because this is an unattended 24/7 device: an unbounded feed would grow
+ * in localStorage forever and eventually fail to save config at all. 25 entries
+ * is roughly a full day of a busy node, which is what an operator scrolling back
+ * actually reads.
+ */
+const MAX_TASK_HISTORY = 25;
+let taskHistory: TaskHistoryEntry[] = [];
+
+/** One completed task, as rendered in the dashboard feed. */
+interface TaskHistoryEntry {
+  /** ISO timestamp of completion. */
+  at: string;
+  /** Short human description, e.g. "12 POI extractions". */
+  label: string;
+  /** Outcome, mirroring TaskResult's statuses. */
+  status: "success" | "failed" | "timeout";
+}
+
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -263,6 +342,128 @@ export function saveConfig(next: Partial<MobileConfig>): MobileConfig {
     // refusing to work at all.
   }
   return config;
+}
+
+/**
+ * Persists the operator's network policy and re-evaluates immediately.
+ *
+ * Mirrors `setPowerLimits`: re-evaluating on save is what makes ticking
+ * "Wi-Fi Only" visibly pause a node that is already on cellular, instead of up
+ * to one check-interval later.
+ *
+ * Always returns the NORMALISED policy, so the UI renders exactly what will be
+ * enforced rather than what was selected.
+ */
+export function setNetworkPolicy(next: unknown): NetworkPolicy {
+  const policy = normaliseNetworkPolicy(next);
+  config = saveConfig({ networkPolicy: policy });
+  void checkNetwork();
+  publish({ type: "network_policy", policy, network: networkStatus() });
+  return policy;
+}
+
+/** The live transport plus the policy in force, for the settings panel. */
+export function networkStatus(): Record<string, unknown> {
+  const policy = normaliseNetworkPolicy(config.networkPolicy ?? DEFAULT_NETWORK_POLICY);
+  return {
+    kind: networkSnapshot.kind,
+    metered: networkSnapshot.metered,
+    source: networkSnapshot.source,
+    downlinkMbps: networkSnapshot.downlinkMbps,
+    wifiOnly: policy.wifiOnly,
+    suspended: networkSuspended,
+    reason: networkReason,
+    data: {
+      ...dataUsage,
+      // Pre-formatted alongside the raw bytes so the UI does not carry a second
+      // copy of this formatting logic that can drift from it.
+      sent1hLabel: formatBytes(dataUsage.sent1h),
+      received1hLabel: formatBytes(dataUsage.received1h),
+      sent24hLabel: formatBytes(dataUsage.sent24h),
+      received24hLabel: formatBytes(dataUsage.received24h),
+    },
+  };
+}
+
+/**
+ * Re-reads the transport and applies the operator's network policy.
+ *
+ * THE CELLULAR GATE. Like `checkPower`, this is the one place a suspension can
+ * originate, and it never throws out (see the note there) — it is called during
+ * boot before any poller starts.
+ *
+ * IT PAUSES INGESTION, NOT JUST EXECUTION. That is the part that matters for a
+ * mesh node: a Wi-Fi-only node that kept polling would keep claiming tasks off
+ * the Mothership queue and then refuse to run them, holding work that another
+ * node could have finished. Refusing to take the task is the whole point.
+ */
+export async function checkNetwork(): Promise<void> {
+  try {
+    const policy = normaliseNetworkPolicy(config.networkPolicy ?? DEFAULT_NETWORK_POLICY);
+    networkSnapshot = await readNetworkSnapshot();
+    dataUsage = usageTracker.record(Date.now(), ...transferTotals());
+    const verdict = evaluateNetwork(networkSnapshot, policy);
+
+    if (!verdict.allowed) {
+      const wasSuspended = networkSuspended;
+      networkSuspended = true;
+      networkReason = verdict.reason;
+      if (!wasSuspended) {
+        for (const timer of timers) window.clearInterval(timer);
+        timers = [];
+        satelliteWorker.setSuspended(true);
+        log(`Worker paused. ${verdict.reason}`);
+      }
+      publish({ type: "network", suspended: true, reason: networkReason, network: networkStatus() });
+      return;
+    }
+
+    if (networkSuspended) {
+      networkSuspended = false;
+      networkReason = "";
+      // Only resume if power is ALSO happy. The two gates are independent, and
+      // resuming here on a flat battery would leave the node suspended for power
+      // reasons while reporting that it had resumed for network reasons.
+      if (!powerSuspended) {
+        satelliteWorker.setSuspended(false);
+        log("Network policy satisfied — resuming.");
+      }
+    }
+    publish({ type: "network", suspended: false, reason: "", network: networkStatus() });
+  } catch (error) {
+    // Fail open, exactly as checkPower does: a network probe failure must degrade
+    // to "no policy enforced", never to "no node".
+    void error;
+  }
+}
+
+/**
+ * Cumulative bytes sent/received this session, from Resource Timing.
+ *
+ * Returns [sent, received]. Zeros when the API is absent, which is the desktop
+ * case — and zeros are the correct answer there, not a fabricated figure.
+ */
+function transferTotals(): [number, number] {
+  try {
+    const perf = (globalThis as {
+      performance?: { getEntriesByType?: (type: string) => Array<{ transferSize?: number }> };
+    }).performance;
+    const entries = perf?.getEntriesByType?.("resource");
+    if (!Array.isArray(entries)) return [0, 0];
+    let received = 0;
+    for (const entry of entries) {
+      if (typeof entry.transferSize === "number" && entry.transferSize > 0) {
+        received += entry.transferSize;
+      }
+    }
+    // `sent` is not separable from `received` in Resource Timing (transferSize is
+    // the sum of both). Reporting the same figure for sent would overstate what
+    // the node sent, so only the received side is measured and sent stays 0 —
+    // an honest zero rather than a confident wrong number.
+    return [0, received];
+  } catch {
+    return [0, 0];
+  }
 }
 
 /**
@@ -567,6 +768,20 @@ async function executeTask(
 /** One poll of the Mothership queue: claim, run, report. */
 async function pollForTasks(): Promise<void> {
   if (!pairingReady()) return;
+
+  /*
+    THE CELLULAR GATE, AT INGESTION.
+
+    Checked here, before the queue is even fetched, so a Wi-Fi-only node on
+    cellular does not pull the task list at all. Checking after the fetch would
+    still leave the node claiming tasks it must then abandon, which holds work
+    that another node in the swarm could have finished.
+
+    `networkSuspended` is the value the timer gate maintains; reading it directly
+    keeps the two paths consistent with the timers that were torn down.
+  */
+  if (networkSuspended) return;
+
   try {
     const response = await fetch(`${base(config.mothershipUrl)}/api/swarm/tasks`, {
       method: "GET",
@@ -587,6 +802,14 @@ async function pollForTasks(): Promise<void> {
     if (outcome === "success") counters.tasksCompleted += 1;
     else if (outcome === "failure") counters.tasksFailed += 1;
     counters.lastRunAt = new Date().toISOString();
+
+    // Feed the dashboard's history tile. Recorded from the REAL completion path
+    // (not synthesised from a counter) so an entry always corresponds to a task
+    // that genuinely ran and reported, with the payload status it reported.
+    recordTaskCompletion(
+      describeTaskForHistory(task),
+      outcome === "success" ? "success" : outcome === "failure" ? "failed" : "timeout",
+    );
   } catch (error) {
     counters.lastError = describe(error);
   }
@@ -689,6 +912,7 @@ function installTimers(): void {
     window.setInterval(() => void pollForTasks(), TASK_POLL_MS * powerThrottle),
     window.setInterval(() => void pollMaster(), MESH_POLL_MS * powerThrottle),
     window.setInterval(() => void checkPower(), POWER_CHECK_MS),
+    window.setInterval(() => void checkNetwork(), NETWORK_CHECK_MS),
   ];
 }
 
@@ -810,9 +1034,13 @@ export async function startWorker(): Promise<void> {
     power limits are supposed to prevent.
   */
   powerThrottle = 1;
+  // BOTH gates are evaluated before any poller starts, in the same spirit as the
+  // note above: a node that is on cellular with Wi-Fi-only set must not send one
+  // heartbeat before it notices.
   await checkPower();
+  await checkNetwork();
 
-  if (!powerSuspended) {
+  if (!powerSuspended && !networkSuspended) {
     await sendHeartbeat();
     await pollMaster();
     await pollForTasks();
@@ -846,10 +1074,72 @@ export function workerStatus(): Record<string, unknown> {
     running: timers.length > 0,
     maxConcurrentTasks: MAX_CONCURRENT_TASKS,
     power: powerStatus(),
+    network: networkStatus(),
+    // Live task telemetry for the dashboard (Epic 5). `activeTask` is null when
+    // the node is idle, and the UI renders that as an explicit idle state rather
+    // than a blank row — "Idle - Waiting for swarm sweep" is information, an
+    // empty box is not.
+    activeTask: currentTaskLabel(),
+    taskHistory,
     // The setup card's badge, the telemetry row and the tests all read it from
     // here, so there is exactly one definition of "is this node paired".
     connection: connectionStatus(),
   };
+}
+
+/**
+ * A short description of what the node is doing right now.
+ *
+ * Returns the assignment label when there is one and an explicit idle string
+ * when there is not. Deliberately never an empty string: the dashboard's whole
+ * job here is to distinguish "working" from "waiting", and blank renders as a
+ * failed read rather than as an idle node.
+ */
+function currentTaskLabel(): string {
+  const active = satelliteWorker.getStatus()["currentTask"] as
+    | { label?: string; type?: string }
+    | null;
+  if (!active) return "Idle \u2014 Waiting for swarm sweep";
+  const label = String(active.label ?? "").trim();
+  if (label) return label;
+  const type = String(active.type ?? "").trim();
+  return type ? `Executing ${type}` : "Executing a dispatched task";
+}
+
+/** Records a finished task into the capped history feed, newest first. */
+function recordTaskCompletion(label: string, status: TaskHistoryEntry["status"]): void {
+  taskHistory = [
+    { at: new Date().toISOString(), label, status },
+    ...taskHistory,
+  ].slice(0, MAX_TASK_HISTORY);
+}
+
+/**
+ * A one-line description of a completed task, for the history feed.
+ *
+ * Prefers a real target from the payload — the URL for a scrape, the count for a
+ * batch — because "Completed scrape_data" is not something an operator scanning a
+ * feed can learn anything from. Falls back to the task type only when the
+ * payload genuinely carried nothing usable.
+ */
+function describeTaskForHistory(task: { type: string; payload?: Record<string, unknown> }): string {
+  const payload = task.payload ?? {};
+  const url = typeof payload["url"] === "string" ? payload["url"].trim() : "";
+  if (url) {
+    // Trimmed to the path: a full scraped URL carries query strings that wrap
+    // onto three lines in a narrow phone feed.
+    try {
+      const parsed = new URL(url);
+      return `Completed fetch: ${parsed.pathname || "/"}`;
+    } catch {
+      return `Completed fetch: ${url.slice(0, 40)}`;
+    }
+  }
+  const count = Number(payload["count"] ?? payload["items"] ?? payload["total"]);
+  if (Number.isFinite(count) && count > 0) {
+    return `Completed ${count} ${String(task.type).replace(/_/g, " ")}`;
+  }
+  return `Completed ${String(task.type).replace(/_/g, " ")}`;
 }
 
 // --- IN-APP APK UPDATE CHECK -------------------------------------------------

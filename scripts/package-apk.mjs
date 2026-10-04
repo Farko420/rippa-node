@@ -217,6 +217,44 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
              border-top-color:#0d1117; border-radius:50%;
              animation:spin .8s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* ---- POST-SETUP TELEMETRY DASHBOARD (Epic 5) ---- */
+  .dash { background:var(--card); border:1px solid var(--line); border-radius:14px;
+    padding:16px; margin-bottom:16px; }
+  .dash[hidden] { display:none; }
+  .dash-head { display:flex; align-items:center; justify-content:space-between;
+    margin-bottom:12px; }
+  .dash-head h2 { margin:0; font-size:15px; }
+  /* The edit affordance is an icon alone, so it carries a large enough hit area
+     to stay usable on a tablet in the dark. */
+  .dash-head .ghost { padding:8px 12px; font-size:16px; min-width:44px;
+    min-height:44px; }
+  .tile-block { border-top:1px solid var(--line); padding-top:10px; margin-top:10px; }
+  .dash-active { margin:4px 0 0; font-size:13px; line-height:1.5; color:var(--txt); }
+  .feed { max-height:190px; overflow-y:auto; margin-top:6px; }
+  .feed-row { display:flex; gap:8px; align-items:baseline; font-size:12px;
+    padding:6px 0; border-bottom:1px solid var(--line); }
+  .feed-row:last-child { border-bottom:none; }
+  .feed-ago { color:var(--mut); font-size:11px; white-space:nowrap;
+    margin-left:auto; }
+  .feed-ok { color:var(--ok); }
+  .feed-bad { color:var(--bad); }
+  .feed-warn { color:var(--warn); }
+  select.num { width:100%; margin-top:6px; padding:10px; font:inherit;
+    background:var(--bg); color:var(--txt); border:1px solid var(--line);
+    border-radius:8px; }
+
+  /* THE POST-SETUP COLLAPSE (Epic 5).
+     The pairing card reduces to its heading once the node is connected, rather
+     than disappearing. It has to stay reachable: an operator who changes networks
+     and needs to correct the Mothership URL must not have to clear app data to
+     get back to the form. The dashboard's pencil button re-opens it. */
+  .pair.collapsed .field,
+  .pair.collapsed .btn,
+  .pair.collapsed .hint { display:none; }
+  .pair.collapsed .pair-head { margin-bottom:0; }
+  .pair.collapsed::after { content:'Tap the pencil on Node Telemetry to edit these settings.';
+    display:block; font-size:11px; color:var(--mut); margin-top:8px; }
 </style>
 </head>
 <body>
@@ -269,7 +307,7 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
     NOTE: this whole block is inside a JS template literal, so it must not contain
     a backtick — one there silently truncates the page at build time.
   -->
-  <div class="pair">
+  <div class="pair" id="pairCard">
     <div class="pair-head">
       <h2>Node Connection Setup</h2>
       <span class="badge awaiting-setup" id="connBadge">Awaiting Setup</span>
@@ -303,6 +341,66 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   <div id="rows"></div>
 
   <!--
+    THE POST-SETUP NODE TELEMETRY DASHBOARD (Epic 5).
+
+    Hidden until the node authenticates, then swapped in for the setup card. The
+    setup card is not hidden - it collapses to a one-line summary with an edit
+    button, because an operator who needs to fix the Mothership URL after a
+    network change should never have to uninstall and start over.
+
+    Every value here comes from workerStatus() and is rendered as TEXT, never as
+    HTML: node names and task labels originate from a remote Mothership, and this
+    page also has the power to install an APK.
+-->
+<section class="dash" id="telemetryDash" hidden>
+  <div class="dash-head">
+    <h2>Node Telemetry</h2>
+    <button class="btn ghost" id="dashEdit" type="button" title="Re-open connection settings">&#9998;</button>
+  </div>
+
+  <div class="tile-block">
+    <span class="tile-label">Active Execution</span>
+    <p class="dash-active" id="dashActive">Idle &mdash; Waiting for swarm sweep</p>
+  </div>
+
+  <div class="tile-block">
+    <span class="tile-label">Task History</span>
+    <div class="feed" id="dashHistory"></div>
+  </div>
+
+  <div class="tile-block">
+    <span class="tile-label">Resources</span>
+    <div class="row"><span>Battery</span><span id="dashBattery">&mdash;</span></div>
+    <div class="row"><span>Connection</span><span id="dashNetwork">&mdash;</span></div>
+    <div class="row"><span>Data (1h)</span><span id="dashData1h">&mdash;</span></div>
+    <div class="row"><span>Data (24h)</span><span id="dashData24h">&mdash;</span></div>
+  </div>
+</section>
+
+<!--
+  NETWORK ACCESS POLICY (Epic 5). Deliberately a CHOICE, not a checkbox:
+  "Wi-Fi + Mobile Data" has to be selectable, and a checkbox cannot express a
+  two-option policy without the off-state being ambiguous.
+-->
+<details id="networkPanel" hidden>
+  <summary>Network Access Policy</summary>
+  <div class="settings-body">
+    <div class="opt">
+      <label for="nPolicy">Connection policy
+        <span class="desc">Choose whether this node may spend your mobile data.
+          With Wi-Fi Only, the node pauses itself and reports
+          "Paused (Cellular Restricted)" the moment it drops off Wi-Fi.</span></label>
+      <select class="num" id="nPolicy">
+        <option value="any">Wi-Fi + Mobile Data</option>
+        <option value="wifi-only">Wi-Fi Only</option>
+      </select>
+    </div>
+    <button class="btn" id="nSave" type="button">Save policy</button>
+    <div class="saved" id="nSaved"></div>
+  </div>
+</details>
+
+<!--
     BATTERY + POWER LIMITS.
 
     Hidden by default and revealed from render() only once a real power
@@ -628,6 +726,135 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
       button.disabled = false;
     });
   });
+  /**
+   * Paints the post-setup telemetry dashboard (Epic 5).
+   *
+   * THE STATE TRANSITION IS THE FEATURE. Before the node authenticates there is
+   * nothing to show but a form, so the setup card is all an operator sees. The
+   * moment the badge reads connected, the dashboard appears and the setup card
+   * collapses to a summary - rather than disappearing, because the operator must
+   * still be able to get back in to fix a Mothership URL after a network change.
+   *
+   * EVERY VALUE IS INSERTED AS TEXT. Task labels come from a remote Mothership
+   * and this same page can install an APK, so none of it may become markup.
+   */
+  function renderDash(status) {
+    var dash = document.getElementById('telemetryDash');
+    var pair = document.getElementById('pairCard');
+    var connected = (status.connection || {}).state === 'connected';
+    if (!dash) return;
+    dash.hidden = !connected;
+    if (pair) pair.classList.toggle('collapsed', connected);
+    if (!connected) return;
+
+    document.getElementById('dashActive').textContent =
+      status.activeTask || 'Idle \u2014 Waiting for swarm sweep';
+
+    var feed = document.getElementById('dashHistory');
+    var history = status.taskHistory || [];
+    feed.innerHTML = '';
+    if (!history.length) {
+      var empty = document.createElement('div');
+      empty.className = 'hint';
+      empty.textContent = 'No tasks completed yet.';
+      feed.appendChild(empty);
+    } else {
+      history.forEach(function (entry) {
+        var row = document.createElement('div');
+        row.className = 'feed-row';
+
+        var label = document.createElement('span');
+        label.textContent = entry.label || 'Task';
+        row.appendChild(label);
+
+        var ago = document.createElement('span');
+        ago.className = 'feed-ago ' +
+          (entry.status === 'success' ? 'feed-ok'
+            : entry.status === 'failed' ? 'feed-bad' : 'feed-warn');
+        ago.textContent = relativeTime(entry.at);
+        row.appendChild(ago);
+        feed.appendChild(row);
+      });
+    }
+
+    var power = status.power || {};
+    var level = power.level === null || power.level === undefined
+      ? 'unavailable' : power.level + '%';
+    var charging = power.charging ? 'charging' : 'on battery';
+    document.getElementById('dashBattery').textContent = level + ' \u00b7 ' + charging;
+
+    var net = status.network || {};
+    var netText = (net.kind || 'unknown') +
+      (net.wifiOnly ? ' \u00b7 Wi-Fi only' : ' \u00b7 mobile data allowed');
+    if (net.suspended) netText = 'Paused (Cellular Restricted)';
+    document.getElementById('dashNetwork').textContent = netText;
+
+    var data = net.data || {};
+    // Pre-formatted by the worker (see networkStatus) so this page carries no
+    // second copy of the byte formatting that could drift from it.
+    document.getElementById('dashData1h').textContent =
+      '\u2191 ' + (data.sent1hLabel || '0 B') +
+      '  \u2193 ' + (data.received1hLabel || '0 B');
+    document.getElementById('dashData24h').textContent =
+      '\u2191 ' + (data.sent24hLabel || '0 B') +
+      '  \u2193 ' + (data.received24hLabel || '0 B');
+  }
+
+  /** "2m ago" / "3h ago" / "5d ago", from an ISO timestamp. */
+  function relativeTime(iso) {
+    var then = Date.parse(iso || '');
+    if (!then) return 'unknown';
+    var seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (seconds < 60) return seconds + 's ago';
+    var minutes = Math.round(seconds / 60);
+    if (minutes < 60) return minutes + 'm ago';
+    var hours = Math.round(minutes / 60);
+    if (hours < 24) return hours + 'h ago';
+    return Math.round(hours / 24) + 'd ago';
+  }
+
+  /** Re-opens the connection settings from the dashboard's edit button. */
+  document.getElementById('dashEdit').addEventListener('click', function () {
+    var pair = document.getElementById('pairCard');
+    if (!pair) return;
+    pair.classList.remove('collapsed');
+    var url = document.getElementById('pUrl');
+    if (url) url.focus();
+  });
+
+  /**
+   * Network Access Policy (Epic 5) - Wi-Fi Only vs Wi-Fi + Mobile Data.
+   *
+   * Re-renders from the worker's NORMALISED policy rather than from the select,
+   * for the same reason the power form does: the UI must show what will actually
+   * be enforced, not what was picked.
+   */
+  function renderNetwork(net) {
+    var panel = document.getElementById('networkPanel');
+    if (!panel) return;
+    // Only meaningful once the platform can actually tell us the transport; a
+    // panel offering a Wi-Fi-only control on a device that cannot report its
+    // link would be a control that silently does nothing.
+    if (!net || net.source === 'unavailable') return;
+    panel.hidden = false;
+    var select = document.getElementById('nPolicy');
+    if (select) select.value = net.wifiOnly ? 'wifi-only' : 'any';
+  }
+
+  document.getElementById('nSave').addEventListener('click', function () {
+    if (!W || !W.setNetworkPolicy) return;
+    var select = document.getElementById('nPolicy');
+    var savedEl = document.getElementById('nSaved');
+    var applied = W.setNetworkPolicy({ wifiOnly: select.value === 'wifi-only' });
+    if (savedEl) {
+      savedEl.textContent = applied.wifiOnly
+        ? 'Wi-Fi only. The node will pause itself on mobile data.'
+        : 'The node may use mobile data.';
+      setTimeout(function () { savedEl.textContent = ''; }, 4000);
+    }
+    if (W.workerStatus) renderNetwork(W.workerStatus().network);
+  });
+
   function render(status) {
     var caps = status.capabilities || {};
     var conn = status.connection || {};
@@ -654,6 +881,12 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
     }).join('');
     renderPower(status.power);
     renderPairing(status);
+    // The dashboard and the network panel are driven from the SAME status object
+    // as the rows above, in the same tick. Reading workerStatus() twice would
+    // let the two disagree for one frame, and a dashboard that flickers between
+    // connected and not connected is worse than one that is merely stale.
+    renderDash(status);
+    renderNetwork(status.network || {});
   }
 
   /**

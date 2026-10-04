@@ -25,6 +25,11 @@ import { latestNodeEvent, publishNodeEvent, subscribeNodeEvents } from "./servic
 import { getDeepBrain } from "./db/database";
 import { ollamaManager } from "./services/ollamaManager";
 import {
+  getAiEndpointSettings,
+  saveAiEndpointSettings,
+  validateAiEndpointSettings,
+} from "./services/aiEndpointSettings";
+import {
   RELEASE_ASSET_NAME,
   SwarmUpdater,
   handleUpdateTrigger,
@@ -909,6 +914,10 @@ export function createApp(): Express {
         cloudLinkUrl: String(body["cloudLinkUrl"] ?? ""),
         metrics: (body["metrics"] ?? undefined) as never,
         p2pEnabled: body["p2pEnabled"] !== false,
+        // Role flags ride the heartbeat. Passed straight through rather than
+        // reconstructed here: the Master has no way to tell an AI brain from a
+        // phone except what the node says about itself.
+        capabilities: (body["capabilities"] ?? undefined) as never,
       });
       res.json({ success: true, ...result });
     } catch (error) {
@@ -1243,6 +1252,76 @@ export function createApp(): Express {
       return;
     }
     res.json({ success: true, satellite: detail });
+  });
+
+  // ── AI FALLBACK PROVIDER SETTINGS ───────────────────────────────────────────
+
+  /*
+    THE MODAL THAT HAD NO ENDPOINT. "AI Endpoint Settings" was a client-only form
+    with nothing behind it, which is why clearing the URL could not be saved: the
+    client validated the blank as an error and there was no server-side path that
+    would have accepted it anyway.
+
+    These two routes are that path, and they encode the asymmetry that fixes the
+    bug — validation is applied ONLY when the fallback is being turned ON. When
+    it is being turned OFF, a blank submission is the whole point and is stored
+    as NULL (see services/aiEndpointSettings.ts).
+  */
+
+  app.get("/api/ai/endpoint", requireDashboardAuth, (_req: Request, res: Response) => {
+    res.json({ success: true, settings: getAiEndpointSettings() });
+  });
+
+  app.post("/api/ai/endpoint", requireDashboardAuth, (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const enabled = body["ai_enabled"] === true;
+
+    /*
+      VALIDATION IS CONDITIONAL, AND THE CONDITION IS THE WHOLE FIX.
+
+      The client already skips validation when the toggle is off, but the server
+      cannot trust that: it is the only place that can guarantee a blank
+      submission is never rejected, whatever the client does or a future
+      revision forgets to do. Enabling still demands a real endpoint and model,
+      because a fallback provider with no endpoint is a node that will be routed
+      inference and fail every request.
+    */
+    if (enabled) {
+      const problem = validateAiEndpointSettings(body);
+      if (problem) {
+        res.status(400).json({ success: false, message: problem });
+        return;
+      }
+    }
+
+    /*
+      Values arrive as `unknown` from an untyped JSON body, so they are cast at
+      the boundary rather than asserted upstream. `saveAiEndpointSettings` takes
+      `unknown` for exactly this reason and re-validates each one — a cast here
+      would only move the unsoundness, not remove it.
+    */
+    const saved = saveAiEndpointSettings({
+      ai_enabled: enabled,
+      ai_endpoint: body["ai_endpoint"] as string | null,
+      active_model: body["active_model"] as string | null,
+      ai_model: body["ai_model"] as string | null,
+    });
+
+    publishNodeEvent({
+      kind: "info",
+      title: enabled ? "AI Fallback Provider Enabled" : "AI Fallback Provider Disabled",
+      detail: enabled
+        ? `Serving inference at ${saved.ai_endpoint} using ${saved.active_model}.`
+        : "Endpoint and model fields cleared.",
+    });
+
+    res.json({
+      success: true,
+      settings: saved,
+      message: enabled
+        ? "Fallback provider saved."
+        : "Fallback provider disabled. The endpoint and model fields have been cleared.",
+    });
   });
 
   // POST /api/mesh/task — Master assigns a shared task (auto-provisions P2P).

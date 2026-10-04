@@ -398,6 +398,171 @@ function vitalsRow(kind, label, percent, value) {
   );
 }
 
+/**
+ * The role badge row for one node, per Epic 1.
+ *
+ * THE THREE-WAY TEST IS THE WHOLE POINT, and it is written as strict comparisons
+ * on purpose. `aiEnabled` arrives as `true`, `false` or `null`:
+ *
+ *   true  -> "AI Brain", plus the models it serves.
+ *   false -> "Mobile Scraper" / "Network Scout" — a CONFIRMED non-AI node, and
+ *            the place where the empty model slot gets replaced with what the
+ *            node actually does (runtime + scraping mode).
+ *   null  -> the node has not reported a role. It is labelled as unknown and is
+ *            NOT dressed up as a scraper, because "nobody asked yet" and "asked,
+ *            and the answer was no" are different facts and only one of them is
+ *            a reason to hide a node from the AI panel.
+ *
+ * `runtime`/`scrapingMode` fall back to a neutral string rather than an em dash
+ * for a confirmed scraper: an empty slot here is the exact presentation bug this
+ * replaces, so a second kind of blank would defeat it.
+ */
+function roleBadges(satellite) {
+  const models = Array.isArray(satellite.aiModels) ? satellite.aiModels : [];
+  if (satellite.aiEnabled === true) {
+    return (
+      '<div class="node-badges">' +
+        '<span class="badge role-ai">&#129504; AI Brain</span>' +
+        (models.length
+          ? '<span class="badge role-model" title="Models this node can serve">' +
+              esc(models.join(", ")) +
+            "</span>"
+          : '<span class="badge role-model">no model resident</span>') +
+      "</div>"
+    );
+  }
+
+  if (satellite.aiEnabled === false) {
+    const runtime = satellite.runtime || "Mobile WebView";
+    const scraping = satellite.scrapingMode || "Lightweight Fetch";
+    // The scraper badge reads "Mobile Scraper" for a phone and "Network Scout"
+    // for anything else, chosen from the runtime the node reported about itself
+    // rather than guessed from its name.
+    const label = /android|mobile|webview/i.test(runtime) ? "Mobile Scraper" : "Network Scout";
+    return (
+      '<div class="node-badges">' +
+        '<span class="badge role-scraper">&#128101; ' + esc(label) + "</span>" +
+        '<span class="badge role-telemetry" title="Runtime: ' + esc(runtime) + '">Runtime: ' +
+          esc(runtime) + "</span>" +
+        '<span class="badge role-telemetry" title="Scraping: ' + esc(scraping) + '">Scraping: ' +
+          esc(scraping) + "</span>" +
+      "</div>"
+    );
+  }
+
+  return (
+    '<div class="node-badges">' +
+      '<span class="badge role-unknown" title="This node has not reported whether it runs a local model">Role not reported</span>' +
+    "</div>"
+  );
+}
+
+/**
+ * "AI Mesh Health" (Epic 2) — which nodes can actually serve inference.
+ *
+ * THE MUTED-NOT-HIDDEN RULE. Non-AI nodes are rendered, greyed, with the explicit
+ * label "Dedicated Scraper Node — AI Disabled". They are not filtered out, because
+ * a filtered panel's total silently stops matching the fleet grid above it, and an
+ * operator who notices 4 nodes in the grid and 2 in the AI panel has no way to tell
+ * a scraper from a deleted satellite.
+ *
+ * `aiEnabled === null` gets its OWN state rather than being folded into either
+ * bucket: a node that has never reported is not a scraper, and labelling it "AI
+ * Disabled" would state as fact something nobody has established.
+ *
+ * The "Test Local Inference" control appears on AI rows ONLY, and for the same
+ * reason it is absent from a scraper's detail modal.
+ */
+function renderAiMesh(satellites) {
+  const list = $("aiMeshList");
+  if (!list) return;
+  list.innerHTML = "";
+
+  const nodes = satellites || [];
+  const ai = nodes.filter((s) => s.aiEnabled === true);
+  const scrapers = nodes.filter((s) => s.aiEnabled === false);
+  const unknown = nodes.filter((s) => s.aiEnabled !== true && s.aiEnabled !== false);
+
+  const set = (id, value) => {
+    const el = $(id);
+    if (el) el.textContent = String(value);
+  };
+  // Counts are derived here from the SAME list that is rendered, so the tiles and
+  // the rows can never disagree — a mismatch would reintroduce the very
+  // reconciliation problem this panel exists to solve.
+  set("aiMeshAiCount", ai.length);
+  set("aiMeshScraperCount", scrapers.length);
+  set("aiMeshUnknownCount", unknown.length);
+  set("aiMeshFallback", ai.some((s) => s.aiEnabled === true) ? "Available" : "None");
+
+  const empty = $("aiMeshEmpty");
+  if (empty) empty.hidden = nodes.length > 0;
+
+  const badge = $("aiMeshBadge");
+  if (badge) {
+    badge.textContent = ai.length > 0 ? `${ai.length} AI node(s)` : "No AI nodes";
+    badge.className = "status-badge " + (ai.length > 0 ? "status-active" : "status-idle");
+  }
+
+  const row = (satellite, kind) => {
+    const wrapper = document.createElement("div");
+    // The `muted` class is what makes a scraper read as intentional rather than
+    // broken. It is applied by ROLE, not by reachability: an offline AI node still
+    // renders at full strength, because it still has a brain.
+    wrapper.className = "ai-mesh-row " + kind + (satellite.online ? "" : " offline");
+    const models = Array.isArray(satellite.aiModels) ? satellite.aiModels : [];
+
+    let detail;
+    let action = "";
+    if (kind === "ai") {
+      detail = models.length
+        ? "Models: " + models.join(", ")
+        : "AI enabled, but no model is resident yet.";
+      action =
+        '<button type="button" class="ghost ai-test" data-code="' + esc(satellite.nodeCode) + '">' +
+        "Test Local Inference</button>";
+    } else if (kind === "scraper") {
+      detail =
+        "Dedicated Scraper Node \u2014 AI Disabled \u00b7 Runtime: " +
+        (satellite.runtime || "Mobile WebView") +
+        " \u00b7 Scraping: " + (satellite.scrapingMode || "Lightweight Fetch");
+    } else {
+      detail = "Role not reported \u2014 this node has not said whether it runs a local model.";
+    }
+
+    wrapper.innerHTML =
+      '<div class="ai-mesh-head">' +
+        '<span class="node-dot' + (satellite.online ? " on" : "") + '"></span>' +
+        '<span class="ai-mesh-name">' + esc(satellite.nodeName) + "</span>" +
+        '<span class="ai-mesh-state">' +
+          (kind === "ai" ? "\u{1F9E0} AI Brain" : kind === "scraper" ? "\u{1F4F1} Scraper" : "? Unknown") +
+        "</span>" +
+      "</div>" +
+      '<div class="ai-mesh-detail">' + esc(detail) + "</div>" +
+      action;
+    return wrapper;
+  };
+
+  // AI nodes first: they are the reason to open this panel. Scrapers follow in a
+  // muted block rather than being interleaved, so the healthy nodes read as a
+  // contiguous group.
+  ai.forEach((s) => list.appendChild(row(s, "ai")));
+  scrapers.forEach((s) => list.appendChild(row(s, "scraper")));
+  unknown.forEach((s) => list.appendChild(row(s, "unknown")));
+}
+
+/** Opens the satellite modal for an AI Mesh row's Test button. */
+function wireAiMeshActions() {
+  const list = $("aiMeshList");
+  if (!list) return;
+  list.addEventListener("click", (event) => {
+    const btn = event.target.closest(".ai-test");
+    if (!btn) return;
+    const code = btn.getAttribute("data-code");
+    if (code) void openSatellite(code);
+  });
+}
+
 function renderTopology(satellites) {
   const grid = $("topology");
   const empty = $("topologyEmpty");
@@ -436,6 +601,9 @@ function renderTopology(satellites) {
           (satellite.p2pRevoked ? "master-relay" : "P2P") + "</span>" +
         '<span class="badge">' + (satellite.efficiency ?? 0) + "% eff</span>" +
       "</div>" +
+      // Role row (Epic 1): "AI Brain" + models, or a scraper badge with the
+      // runtime/scraping telemetry that used to be an empty model slot.
+      roleBadges(satellite) +
       // LIVE NODE METRICS — CPU, RAM and uptime, straight from the satellite's
       // own telemetry. These answer "is this machine healthy", which the swarm
       // counters above cannot.
@@ -609,6 +777,49 @@ function renderSatelliteDetail(satellite) {
       " captcha / retry loops resolved without failing the task.",
   );
 
+  // --- Role & AI capabilities (Epic 1 / Epic 2) ---
+  /*
+    THE GATE. "Test Local Inference" is rendered ONLY for `aiEnabled === true`.
+
+    Both `false` and `null` suppress it, because neither node can serve
+    inference — but they suppress it for different reasons, and the copy says
+    which. A confirmed scraper is described as such; a node that never reported
+    is described as not-yet-reported, so an operator can tell "this phone is not
+    an AI brain" apart from "we have not heard from this node yet".
+  */
+  const aiEnabled = satellite.aiEnabled;
+  const models = Array.isArray(satellite.aiModels) ? satellite.aiModels : [];
+  const roleNote = $("mRoleNote");
+  const testBtn = $("mTestInference");
+  const inferenceResult = $("mInferenceResult");
+
+  if (aiEnabled === true) {
+    setText("mRole", "\u{1F9E0} AI Brain");
+    setText("mModels", models.length ? "Models: " + models.join(", ") : "No model resident yet.");
+    if (roleNote) roleNote.hidden = true;
+    if (testBtn) testBtn.hidden = false;
+  } else if (aiEnabled === false) {
+    setText("mRole", satellite.runtime && /android|mobile|webview/i.test(satellite.runtime)
+      ? "\u{1F4F1} Mobile Scraper"
+      : "\u{1F9F0} Network Scout");
+    setText(
+      "mModels",
+      "Runtime: " + (satellite.runtime || "Mobile WebView") +
+        " \u00b7 Scraping: " + (satellite.scrapingMode || "Lightweight Fetch"),
+    );
+    // The muted, explicit state Epic 2 asks for, in the node's own detail view.
+    setText("mRoleNote", "Dedicated Scraper Node \u2014 AI Disabled. This node scrapes and forwards; it serves no model.");
+    if (roleNote) roleNote.hidden = false;
+    if (testBtn) testBtn.hidden = true;
+  } else {
+    setText("mRole", "Role not reported");
+    setText("mModels", "This node has not said whether it runs a local model.");
+    setText("mRoleNote", "Upgrade the node to report its capabilities, or wait for its next heartbeat.");
+    if (roleNote) roleNote.hidden = false;
+    if (testBtn) testBtn.hidden = true;
+  }
+  if (inferenceResult) inferenceResult.hidden = true;
+
   // --- Networking ---
   const endpoint = satellite.endpoint || {};
   setText(
@@ -691,6 +902,9 @@ async function refresh() {
     renderSummary(data.summary);
     renderTopology(data.satellites);
     renderProcesses(data.tasks, data.satellites);
+    // Same snapshot, same tick: the AI panel must never be a second behind the
+    // grid it sits beneath, or the two disagree about who is an AI node.
+    renderAiMesh(data.satellites);
 
     // Keep an open modal live while the fleet updates underneath it.
     if (openNodeCode) {
@@ -948,6 +1162,75 @@ if (closeBtn) closeBtn.addEventListener("click", closeSatellite);
 const restoreBtn = $("mRestoreP2p");
 if (restoreBtn) restoreBtn.addEventListener("click", () => void restoreP2p());
 
+/**
+ * "Test Local Inference" — runs the engine's diagnostic ping against one node.
+ *
+ * RE-CHECKS THE GATE AT CLICK TIME, even though the button is only rendered for
+ * an AI node. The button lives in a modal that outlives several 5s snapshot
+ * polls, so the node's role can change underneath it (a runtime removed, a
+ * satellite swapped) and the handler would otherwise POST a test at a phone with
+ * no model. Hiding is the presentation half of the rule; this is the enforcement
+ * half, and neither alone is sufficient.
+ */
+const testInferenceBtn = $("mTestInference");
+if (testInferenceBtn) {
+  testInferenceBtn.addEventListener("click", async () => {
+    const result = $("mInferenceResult");
+    const code = openNodeCode;
+    if (!code) return;
+
+    let satellite = null;
+    try {
+      const { response, data } = await api("/api/mesh/satellite/" + encodeURIComponent(code));
+      if (response.ok && data.success) satellite = data.satellite;
+    } catch (err) {
+      /* fall through to the cached snapshot */
+    }
+    if (!satellite && snapshot) {
+      satellite = (snapshot.satellites || []).find((s) => s.nodeCode === code) || null;
+    }
+
+    if (!satellite || satellite.aiEnabled !== true) {
+      if (result) {
+        result.hidden = false;
+        result.textContent = "This node does not report a local model, so there is nothing to test.";
+      }
+      return;
+    }
+
+    testInferenceBtn.disabled = true;
+    if (result) {
+      result.hidden = false;
+      result.textContent = "Contacting the node\u2026";
+    }
+    try {
+      /*
+        HONEST ABOUT WHAT IS BEING TESTED. This runs against the LOCAL node's own
+        engine, because that is the only engine this server can reach — it is not a
+        proxy to the remote satellite. For a paired satellite the truthful check of
+        that node's model is its own dashboard; what this proves here is that
+        inference works on the node you are actually looking at, which is the
+        question an operator clicking this on a Master has open.
+      */
+      const { response, data } = await api("/api/engine/exec", {
+        method: "POST",
+        body: JSON.stringify({ command: "test-infer" }),
+      });
+      if (result) {
+        result.hidden = false;
+        result.textContent = data.message || (response.ok ? "Inference OK." : "Inference failed.");
+      }
+    } catch (err) {
+      if (result) {
+        result.hidden = false;
+        result.textContent = "Could not reach the node: " + (err && err.message ? err.message : err);
+      }
+    } finally {
+      testInferenceBtn.disabled = false;
+    }
+  });
+}
+
 const otaBtn = $("otaPush");
 if (otaBtn) otaBtn.addEventListener("click", () => void pushUpdate());
 
@@ -959,11 +1242,208 @@ if (modal) {
   });
 }
 
-document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeSatellite();
-});
+// Escape is handled ONCE, further down, by a single layered handler that knows
+// about both modals. Registering a second handler here would close the satellite
+// modal underneath the AI settings dialog on the same keypress.
 
-// --- RESPONSIVE NAV + VIEW SWITCHING -----------------------------------------
+// --- AI ENDPOINT SETTINGS (Epic 3) ---------------------------------------------
+
+/*
+  THE BUG, AND WHY THE FIX IS STRUCTURAL RATHER THAN A RELAXED CHECK.
+
+  The reported failure was: "clearing a previously saved ai_endpoint triggers
+  validation errors and demands an inference test". The tempting fix is to make
+  the URL field `optional`, but that is not the same thing and does not work:
+  "optional" still validates the field when it HAS a value, so a half-deleted
+  URL ("http://12") would still be rejected, and the inference test would still
+  be demanded.
+
+  So validation is not relaxed — it is CONDITIONAL, keyed on one thing: is the
+  operator turning the feature ON or OFF? Enabling demands a real endpoint and
+  model. Disabling ignores those fields completely. The server applies the same
+  rule independently (see src/server.ts), because the client is not the only
+  thing that can be wrong.
+*/
+
+/** The label the submit button shows for a given toggle state. */
+const AI_SAVE_LABEL_ON = "Save & Test Inference";
+const AI_SAVE_LABEL_OFF = "Save Settings";
+
+/**
+ * Reflects the toggle state across the whole modal.
+ *
+ * One function, called on every toggle change, because the three things it
+ * controls MUST agree: the button's label, whether the fields are visible, and
+ * whether validation applies. Keeping them in one place is what stops the modal
+ * from reaching the original bug again through a different door — a button that
+ * says "Save & Test" while the fields are hidden, or a form that validates
+ * fields the operator cannot see.
+ *
+ * The fields are HIDDEN rather than merely disabled when the feature is off.
+ * Leaving an editable URL visible next to a disabled feature invites an
+ * operator to fill it in and wonder why nothing was saved.
+ */
+function syncAiToggle() {
+  const toggle = $("aiFallbackToggle");
+  const fields = $("aiEndpointFields");
+  const save = $("aiSettingsSave");
+  const on = Boolean(toggle && toggle.checked);
+  if (save) save.textContent = on ? AI_SAVE_LABEL_ON : AI_SAVE_LABEL_OFF;
+  if (fields) fields.hidden = !on;
+  const message = $("aiSettingsMessage");
+  if (message && !on) {
+    message.hidden = false;
+    message.style.color = "var(--mut)";
+    message.textContent =
+      "Saving with this OFF clears the endpoint and model settings. Nothing is required.";
+  } else if (message) {
+    message.hidden = true;
+  }
+}
+
+/** Opens the modal, seeding the form from the server's stored settings. */
+async function openAiSettings() {
+  const modal = $("aiSettingsModal");
+  if (!modal) return;
+  modal.hidden = false;
+  const toggle = $("aiFallbackToggle");
+  if (toggle) toggle.checked = false;
+  syncAiToggle();
+
+  try {
+    const { response, data } = await api("/api/ai/endpoint");
+    if (!response.ok || !data.success) return;
+    const s = data.settings || {};
+    if (toggle) toggle.checked = s.ai_enabled === true;
+    // `null` arrives here as an empty string: an input cannot hold null, and
+    // this is exactly the round-trip the bug fix has to survive.
+    if ($("aiEndpointUrl")) $("aiEndpointUrl").value = s.ai_endpoint || "";
+    if ($("aiActiveModel")) $("aiActiveModel").value = s.active_model || "";
+    if ($("aiEmbeddingModel")) $("aiEmbeddingModel").value = s.ai_model || "";
+    syncAiToggle();
+  } catch (err) {
+    /* the modal still works; it just opens empty */
+  }
+}
+
+function closeAiSettings() {
+  const modal = $("aiSettingsModal");
+  if (modal) modal.hidden = true;
+}
+
+/** Renders a message under the form. `isError` false means success styling. */
+function showAiMessage(text, isError = true) {
+  const message = $("aiSettingsMessage");
+  if (!message) return;
+  message.hidden = false;
+  message.textContent = text;
+  message.style.color = isError ? "var(--bad)" : "var(--ok)";
+}
+
+/**
+ * Submits the modal.
+ *
+ * THE FIX, IN ONE FUNCTION: `enabled ? validate() : skip`.
+ *
+ * When the toggle is OFF the URL and model fields are not merely unvalidated —
+ * they are not READ. They are submitted blank and the server stores them as
+ * NULL, so an operator who clears the field and turns the feature off reaches
+ * the state they intended, with no invented URL and no failed validation.
+ */
+async function submitAiSettings() {
+  const save = $("aiSettingsSave");
+  const toggle = $("aiFallbackToggle");
+  const enabled = Boolean(toggle && toggle.checked);
+
+  const url = (($("aiEndpointUrl") || {}).value) || "";
+  const model = (($("aiActiveModel") || {}).value) || "";
+  const embed = (($("aiEmbeddingModel") || {}).value) || "";
+
+  if (enabled) {
+    // ONLY when enabling. With the toggle OFF this block is unreachable, by
+    // construction — which is the entire point of the fix.
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl) {
+      showAiMessage("An endpoint URL is required while the fallback provider is enabled.");
+      return;
+    }
+    if (!/^https?:\/\/[^/\s]+/i.test(trimmedUrl)) {
+      showAiMessage("The endpoint must be an http(s) URL, for example http://127.0.0.1:11434.");
+      return;
+    }
+    if (!model.trim()) {
+      showAiMessage("An active model name is required while the fallback provider is enabled.");
+      return;
+    }
+  }
+
+  if (save) save.disabled = true;
+  try {
+    const { response, data } = await api("/api/ai/endpoint", {
+      method: "POST",
+      body: JSON.stringify({
+        ai_enabled: enabled,
+        // Sent blank when disabled on purpose: the server turns these into NULL,
+        // which is what "not configured" has to mean on disk.
+        ai_endpoint: enabled ? url.trim() : "",
+        active_model: enabled ? model.trim() : "",
+        ai_model: enabled ? embed.trim() : "",
+      }),
+    });
+    if (response.ok && data.success) {
+      // Re-seed from the SERVER's response rather than leaving the form as typed.
+      // After a disable-save the stored values are null, so this visibly empties
+      // the fields — without it the old URL would still be on screen and the save
+      // would look like it had silently failed.
+      const s = data.settings || {};
+      if ($("aiEndpointUrl")) $("aiEndpointUrl").value = s.ai_endpoint || "";
+      if ($("aiActiveModel")) $("aiActiveModel").value = s.active_model || "";
+      if ($("aiEmbeddingModel")) $("aiEmbeddingModel").value = s.ai_model || "";
+      if (toggle) toggle.checked = s.ai_enabled === true;
+      syncAiToggle();
+      showAiMessage(data.message || "Saved.", false);
+      setTimeout(closeAiSettings, 1400);
+    } else {
+      showAiMessage(data.message || "Could not save those settings.");
+    }
+  } catch (err) {
+    showAiMessage("Could not save: " + (err && err.message ? err.message : err));
+  } finally {
+    if (save) save.disabled = false;
+  }
+}
+
+const aiToggle = $("aiFallbackToggle");
+if (aiToggle) aiToggle.addEventListener("change", syncAiToggle);
+
+const aiSaveBtn = $("aiSettingsSave");
+if (aiSaveBtn) aiSaveBtn.addEventListener("click", () => void submitAiSettings());
+
+const aiCloseBtn = $("aiSettingsClose");
+if (aiCloseBtn) aiCloseBtn.addEventListener("click", closeAiSettings);
+
+const aiModalEl = $("aiSettingsModal");
+if (aiModalEl) {
+  aiModalEl.addEventListener("click", (event) => {
+    if (event.target === aiModalEl) closeAiSettings();
+  });
+}
+
+// Entry point from the Embedded AI view.
+const aiOpenBtn = $("aiSettingsOpen");
+if (aiOpenBtn) aiOpenBtn.addEventListener("click", () => void openAiSettings());
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  // Both modals share Escape. The AI one is checked first because it is layered
+  // over the satellite modal, so closing it must not also close the one beneath.
+  const aiModal = $("aiSettingsModal");
+  if (aiModal && !aiModal.hidden) {
+    closeAiSettings();
+    return;
+  }
+  closeSatellite();
+});
 
 function setText(id, value) {
   const el = $(id);
@@ -1621,6 +2101,15 @@ function startControlCenter() {
   // would be both wasteful and a way to end up with two drop handlers firing per
   // drop.
   wireBrainPanel();
+
+  /*
+    THE AI MESH LIST IS REBUILT ON EVERY 5s REFRESH (`renderAiMesh` sets
+    innerHTML), so its listeners cannot be attached per-render without
+    accumulating one handler per row per poll. It is delegated once, here, from
+    the stable container — the same reason the brain drop zone is wired outside
+    the poll loop.
+  */
+  wireAiMeshActions();
 
   /*
     THE EVENT STREAM IS OPENED HERE, NOT AT SCRIPT LOAD.
