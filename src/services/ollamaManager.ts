@@ -218,8 +218,14 @@ interface PullFrame {
  * "binds one port, is asked about another" split this resolver exists to prevent.
  * `port` is the already-resolved value from the call site and is asserted against
  * the origin rather than re-derived, so a divergence is logged instead of hidden.
+ * EXPORTED, NOT MERELY `function`. The whole point of this function is a
+ * property of MODULE-LOAD-TIME state — that writing `process.env` and calling
+ * `reloadEnv()` reaches the long-lived `env` object — and no amount of testing
+ * the spawn path proves it, because the spawn path downloads a multi-hundred-MB
+ * runtime and would take `start()` minutes on a CI runner. Exporting it lets a
+ * test drive the publish directly and assert the invariant in milliseconds.
  */
-function publishManagedOllamaOrigin(port: number): void {
+export function publishManagedOllamaOrigin(port: number): void {
   const origin = bundledOllamaOrigin();
 
   // Cheap drift guard. `origin` is machine-built and always well-formed, so
