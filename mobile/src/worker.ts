@@ -18,9 +18,12 @@
  * small enough to reason about, and it speaks the same wire format the desktop
  * node already uses (`/api/swarm/heartbeat`, `/api/swarm/tasks`, `/api/mesh/heartbeat`).
  *
- * THE PLATFORM BRIDGE. `globalThis.RippaNodePlugin` is the custom Capacitor
+ * THE PLATFORM BRIDGE. `Capacitor.Plugins.RippaNode` is the custom Capacitor
  * plugin in `android-overlay/`. It owns the FOREGROUND SERVICE, the WAKE_LOCK and
- * the persistent notification — the things that keep this alive with the screen off.
+ * the persistent notification — the things that keep this alive with the screen
+ * off. The plugin's id is fixed by its `@CapacitorPlugin(name = ...)` annotation
+ * and matched by `NATIVE_PLUGIN_ID` below; see the note there for why looking up
+ * the wrong global is what produced "Native bridge unavailable" on every device.
  */
 
 import { describeRuntime, runtimeCapabilities, supportsBrowserScraping } from "../../src/platform";
@@ -551,12 +554,85 @@ export async function configureNode(input: {
 interface NativePlugin {
   startForegroundService(options?: { title?: string; message?: string }): Promise<void>;
   stopForegroundService(): Promise<void>;
-  isForegroundServiceRunning(): Promise<{ running: boolean }>;
+  isForegroundServiceRunning(): Promise<{ running: boolean; available?: boolean }>;
 }
 
+/**
+ * THE PLUGIN ID, WHICH MUST MATCH `@CapacitorPlugin(name = ...)` IN
+ * mobile/android-overlay/RippaNodePlugin.java.
+ *
+ * Capacitor derives the JavaScript global from that annotation and publishes the
+ * plugin's methods at `window.Capacitor.Plugins.<id>`. The worker used to look for
+ * `globalThis.RippaNodePlugin` instead — a global that no part of Capacitor ever
+ * creates — so the bridge was unreachable on every device and every node logged
+ * "Native bridge unavailable". The id and the annotation are one contract and must
+ * be changed together; the build asserts the two agree (see package-apk.mjs).
+ */
+const NATIVE_PLUGIN_ID = "RippaNode";
+
+/**
+ * Resolves the native plugin, or null when there is no native shell.
+ *
+ * CHECKED IN THREE PLACES, IN ORDER, because each covers a real deployment:
+ *
+ *   1. `globalThis.RippaNodePlugin` — an explicit handle, if anything ever sets
+ *      one. Probed first so a future native-side alias keeps working.
+ *   2. `Capacitor.Plugins.RippaNode` — where Capacitor ACTUALLY puts it.
+ *   3. `Capacitor.Plugins.RippaNodePlugin` — the id Capacitor would derive from
+ *      the class name if the annotation were ever dropped.
+ *
+ * Every candidate is validated by requiring a real function, NOT merely a
+ * truthy object. `registerPlugin` returns a Proxy whose property access yields a
+ * wrapper function for ANY name, including ones the native side does not
+ * implement — so a truthiness test passes against a plugin that cannot start
+ * anything, and the failure then surfaces as a rejected promise instead of the
+ * honest "no bridge here" this function is meant to express.
+ */
 function native(): NativePlugin | null {
-  const plugin = (globalThis as { RippaNodePlugin?: NativePlugin }).RippaNodePlugin;
-  return plugin && typeof plugin.startForegroundService === "function" ? plugin : null;
+  try {
+    const scope = globalThis as {
+      RippaNodePlugin?: NativePlugin;
+      Capacitor?: { Plugins?: Record<string, unknown> };
+    };
+    const direct = scope.RippaNodePlugin;
+    if (direct && typeof direct.startForegroundService === "function") return direct;
+
+    const plugins = scope.Capacitor?.Plugins;
+    if (!plugins) return null;
+    for (const id of [NATIVE_PLUGIN_ID, `${NATIVE_PLUGIN_ID}Plugin`]) {
+      const candidate = plugins[id] as NativePlugin | undefined;
+      if (candidate && typeof candidate.startForegroundService === "function") {
+        return candidate;
+      }
+    }
+    return null;
+  } catch {
+    // A probe that throws must not take the worker down with it.
+    return null;
+  }
+}
+
+/**
+ * True when this build is running inside a shell that can protect the process.
+ *
+ * Separate from `native()` so the dashboard can say "this build cannot do that"
+ * as a stated fact, rather than leaving the operator to infer it from a switch
+ * that silently does nothing.
+ */
+export function isBackgroundServiceSupported(): boolean {
+  return native() !== null;
+}
+
+/** What the dashboard renders for the background toggle and the status row. */
+let backgroundService: { running: boolean; available: boolean; supported: boolean } = {
+  running: false,
+  available: false,
+  supported: false,
+};
+
+/** The background-service block for the UI. */
+export function backgroundServiceStatus(): Record<string, unknown> {
+  return { ...backgroundService };
 }
 
 /**
@@ -570,22 +646,110 @@ function native(): NativePlugin | null {
 async function ensureBackgroundService(): Promise<boolean> {
   const plugin = native();
   if (!plugin) {
+    // The single most important line in this log: it means this device is
+    // running UNPROTECTED and will be reclaimed when the screen goes off.
     log("Native bridge unavailable — running without a foreground service.");
+    backgroundService = { running: false, available: false, supported: false };
     return false;
   }
   try {
     await plugin.startForegroundService({
-      title: "Rippa Node — satellite",
+      title: "Rippa Node is running",
       message: "Foraging for the swarm. The screen may be off.",
     });
     const state = await plugin.isForegroundServiceRunning();
-    log(`Foreground service running=${state?.running === true}.`);
-    return state?.running === true;
+    backgroundService = {
+      running: state?.running === true,
+      // `available` is absent on builds predating the field; a missing key must
+      // not read as "this build is broken", or the toggle would warn on a
+      // perfectly good APK.
+      available: state?.available !== false,
+      supported: true,
+    };
+    log(`Foreground service running=${backgroundService.running}.`);
+    return backgroundService.running;
   } catch (error) {
     // Never fatal: in a desktop browser preview there is no plugin at all, and
     // the worker should still run.
     log(`Could not start the foreground service: ${describe(error)}`);
+    backgroundService = { running: false, available: false, supported: true };
     return false;
+  }
+}
+
+/**
+ * Stops the foreground service, clearing the notification and releasing the wake
+ * lock.
+ *
+ * This is what the "Run as Background Service" switch calls when unticked. The
+ * OS is then free to freeze and reclaim the app normally, which is the documented
+ * meaning of turning it off: the node keeps working while it is in the
+ * foreground, but sleeps when the tablet does.
+ */
+export async function stopBackgroundService(): Promise<boolean> {
+  const plugin = native();
+  if (!plugin) {
+    backgroundService = { running: false, available: false, supported: false };
+    return false;
+  }
+  try {
+    await plugin.stopForegroundService();
+    backgroundService = { running: false, available: true, supported: true };
+    log("Foreground service stopped — the node now sleeps with the screen.");
+    publish({ type: "background_service", backgroundService: backgroundServiceStatus() });
+    return true;
+  } catch (error) {
+    log(`Could not stop the foreground service: ${describe(error)}`);
+    return false;
+  }
+}
+
+/**
+ * Applies the operator's background-service choice.
+ *
+ * The single entry point behind the UI toggle, so ON and OFF cannot drift apart:
+ * both go through the same native calls the boot path uses, and both report the
+ * state the native side ACTUALLY returned rather than the state that was asked
+ * for. That distinction is the whole point — a toggle that claims success while
+ * the service failed to start is the bug that made this feature untrustworthy.
+ */
+export async function setBackgroundService(enabled: boolean): Promise<boolean> {
+  if (!enabled) return stopBackgroundService();
+  const started = await ensureBackgroundService();
+  if (!started) {
+    log("Background service was requested but Android did not start it.");
+  }
+  publish({ type: "background_service", backgroundService: backgroundServiceStatus() });
+  return started;
+}
+
+/**
+ * Re-reads the live service state without trying to change it.
+ *
+ * Used by the dashboard's poll so the switch reflects reality after Android
+ * restarts or kills the service on its own — which it will, under memory
+ * pressure, and which the operator needs to SEE rather than discover overnight.
+ */
+export async function refreshBackgroundService(): Promise<boolean> {
+  const plugin = native();
+  if (!plugin) {
+    backgroundService = { running: false, available: false, supported: false };
+    return false;
+  }
+  try {
+    const state = await plugin.isForegroundServiceRunning();
+    const next = {
+      running: state?.running === true,
+      available: state?.available !== false,
+      supported: true,
+    };
+    const changed = next.running !== backgroundService.running;
+    backgroundService = next;
+    if (changed) publish({ type: "background_service", backgroundService: backgroundServiceStatus() });
+    return backgroundService.running;
+  } catch (error) {
+    log(`Could not read the foreground service state: ${describe(error)}`);
+    return backgroundService.running;
   }
 }
 
@@ -1084,6 +1248,16 @@ export function workerStatus(): Record<string, unknown> {
     // The setup card's badge, the telemetry row and the tests all read it from
     // here, so there is exactly one definition of "is this node paired".
     connection: connectionStatus(),
+    /*
+      Whether Android is currently protecting this process.
+
+      Rendered by the dashboard's "Run as Background Service" switch and the
+      matching status row. It is in workerStatus() rather than read directly from
+      the plugin by the page because the page polls this object every two seconds
+      and a bridge call per poll is exactly the cost this node is trying to
+      avoid.
+    */
+    backgroundService: backgroundServiceStatus(),
   };
 }
 

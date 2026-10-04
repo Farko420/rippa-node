@@ -230,6 +230,52 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
              animation:spin .8s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
 
+  /* ---- VIEW SWITCHING ----------------------------------------------------------
+     SETUP AND DASHBOARD USED TO BE ONE STACK. The pairing form sat above the
+     telemetry, and once connected it collapsed to a heading — which still left
+     the operator scrolling past a form-shaped hole to reach the numbers they
+     actually came for. Two real views, switched with [hidden], is the fix: the
+     dashboard is now STRICTLY telemetry/logs/policies, and setup is reachable
+     only deliberately, through the Settings button.
+
+     [hidden] rather than a class, because the existing "details[hidden]" and
+     ".dash[hidden]" rules already establish it as the convention here. */
+  .view[hidden] { display:none; }
+  .tabs { display:flex; gap:8px; margin-bottom:18px; }
+  .tab { flex:1; padding:10px 12px; font-size:13px; font-weight:600; cursor:pointer;
+         color:var(--mut); background:var(--bg); border:1px solid var(--line);
+         border-radius:10px; font-family:inherit; }
+  .tab[aria-selected="true"] { color:#0d1117; background:var(--ok); border-color:var(--ok); }
+  /* The Settings button on the dashboard header. Text rather than an icon alone,
+     because "what does this pencil do" is not a safe thing to make a tablet
+     operator guess at. */
+  .btn.ghost { background:transparent; color:var(--mut); border:1px solid var(--line); }
+  .btn.ghost:active { background:var(--line); }
+  .btn.small { margin-top:0; padding:8px 12px; font-size:12px; }
+  .btn[disabled] { opacity:.6; }
+  /* ---- BACKGROUND SERVICE TOGGLE ----------------------------------------------
+     Its own block rather than one more row in the power list: it is the only
+     control on the page that changes how the OS treats the whole app, so it
+     gets a heading and an explanation the operator can act on. */
+  .svc { margin-top:14px; padding:12px; border-radius:10px; background:var(--bg);
+         border:1px solid var(--line); }
+  .svc-title { display:flex; align-items:center; gap:8px; font-size:13px;
+               font-weight:600; }
+  .svc input[type=checkbox] { width:16px; height:16px; flex:0 0 auto;
+                              accent-color:var(--ok); }
+  .svc-state { margin-top:8px; font-size:11px; line-height:1.5; }
+  /* ---- UPDATE CHECK BUTTON ----------------------------------------------------
+     The prompt is auto-shown only when a newer build exists, which is correct
+     but leaves an operator with nothing to press on the (common) day the build
+     is current. This is the manual half: always visible, always actionable. */
+  .ota { margin-bottom:16px; padding:14px; border-radius:12px; background:var(--bg);
+         border:1px solid var(--line); }
+  .ota-head { display:flex; align-items:center; justify-content:space-between;
+              gap:10px; flex-wrap:wrap; }
+  .ota-head h2 { margin:0; font-size:14px; }
+  .ota .btn { width:auto; margin-top:10px; }
+  .ota-status { margin-top:8px; font-size:11px; line-height:1.5; }
+
   /* ---- POST-SETUP TELEMETRY DASHBOARD (Epic 5) ---- */
   .dash { background:var(--card); border:1px solid var(--line); border-radius:14px;
     padding:16px; margin-bottom:16px; }
@@ -256,23 +302,39 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
     background:var(--bg); color:var(--txt); border:1px solid var(--line);
     border-radius:8px; }
 
-  /* THE POST-SETUP COLLAPSE (Epic 5).
-     The pairing card reduces to its heading once the node is connected, rather
-     than disappearing. It has to stay reachable: an operator who changes networks
-     and needs to correct the Mothership URL must not have to clear app data to
-     get back to the form. The dashboard's pencil button re-opens it. */
-  .pair.collapsed .field,
-  .pair.collapsed .btn,
-  .pair.collapsed .hint { display:none; }
-  .pair.collapsed .pair-head { margin-bottom:0; }
-  .pair.collapsed::after { content:'Tap the pencil on Node Telemetry to edit these settings.';
-    display:block; font-size:11px; color:var(--mut); margin-top:8px; }
+  /* THE POST-SETUP COLLAPSE WAS REMOVED WITH THE VIEW SPLIT.
+     The pairing card used to reduce itself to its heading once the node was
+     connected, with a pencil on the telemetry card to expand it again. That was
+     a workaround for the two sharing one scroll; now that Setup is its own view,
+     the collapse has no remaining purpose — and keeping the CSS would leave a
+     class nothing ever sets, which is the kind of dead rule that later gets
+     "helpfully" reconnected to the wrong element. Reachability is handled by the
+     Setup tab and the Settings button instead. */
 </style>
 </head>
 <body>
 <div class="card">
   <h1>Rippa Node &mdash; Android Satellite</h1>
   <p class="sub">Background worker. The screen may be turned off.</p>
+
+  <!--
+    THE TAB BAR.
+
+    Two views, one of them the dashboard. Setup is shown automatically on first
+    launch (nothing is configured yet, so there is nothing to look at on the
+    dashboard) and every time the operator presses Settings. "aria-selected"
+    drives the highlight rather than a separate class, so the visual state cannot
+    drift away from the accessible one.
+  -->
+  <div class="tabs" role="tablist">
+    <button class="tab" id="tabDashboard" type="button" role="tab"
+            aria-selected="true" aria-controls="viewDashboard">Dashboard</button>
+    <button class="tab" id="tabSetup" type="button" role="tab"
+            aria-selected="false" aria-controls="viewSetup">Setup</button>
+  </div>
+
+  <!-- ========================= DASHBOARD VIEW ========================= -->
+  <section class="view" id="viewDashboard" role="tabpanel" aria-labelledby="tabDashboard">
 
   <!--
     THE IN-APP UPDATE PROMPT.
@@ -286,6 +348,22 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
 
     The button is NOT disabled while hidden, because the whole card is hidden with
     it; everything about the update state lives in renderUpdate() and the
+<!--
+    THE MANUAL UPDATE CHECK.
+
+    The prompt above is automatic and only appears when the build is stale. This
+    is the button the operator presses when they want to KNOW, rather than being
+    told — because "is this tablet on last week's bug fix?" is a question a node
+    on a desk can never answer by looking at the notification shade.
+  -->
+  <div class="ota">
+    <div class="ota-head">
+      <h2>App Updates</h2>
+      <span class="badge" id="otaVersion">&mdash;</span>
+    </div>
+    <button class="btn ghost small" id="otaCheck" type="button">Check for Updates</button>
+    <div class="ota-status" id="otaStatus">Installed build unknown until checked.</div>
+  </div>
     rippa-update CustomEvent handler below.
 
     NOTE: this whole document is inside a JS template literal in the packager, so
@@ -306,59 +384,26 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   </div>
 
   <!--
-    NODE PAIRING SETUP.
+    NODE PAIRING SETUP NOW LIVES IN ITS OWN VIEW.
 
-    This card is what makes the node a member of the swarm rather than a dark
-    screen. Everything below it is telemetry about a connection that had no way to
-    be configured: the worker reads a Mothership URL and a node key from
-    localStorage, and until this card existed nothing ever WROTE either of them.
-    The result was a tablet that looked alive and had sent zero heartbeats.
+    This block used to sit here, above the telemetry, and collapsed to a heading
+    once the node was connected. That still left a form-shaped hole in the middle
+    of the dashboard and made the operator scroll past setup to reach telemetry.
 
-    The values are persisted by the worker's configureNode(), not by inline
-    script here, so there is exactly one writer for the config the pollers read.
-    NOTE: this whole block is inside a JS template literal, so it must not contain
-    a backtick — one there silently truncates the page at build time.
+    It is now a separate view (see "SETUP VIEW" below), reachable from the
+    Dashboard tab and from the Settings button in the telemetry header. The
+    collapse behaviour and the pencil affordance are deliberately NOT ported: a
+    dedicated view makes both redundant, and carrying them forward would keep two
+    competing ways to open the same form.
   -->
-  <div class="pair" id="pairCard">
-    <div class="pair-head">
-      <h2>Node Connection Setup</h2>
-      <span class="badge awaiting-setup" id="connBadge">Awaiting Setup</span>
-    </div>
-    <p class="hint">Enter the Mothership address and the node key issued by your
-      Master. The key is stored on this device only and is sent as a bearer token.</p>
-
-    <label class="field" for="pUrl">
-      <span>Mothership URL</span>
-      <input id="pUrl" type="text" inputmode="url" autocomplete="off"
-             autocapitalize="none" spellcheck="false"
-             value="https://rippaadventures.com" />
-    </label>
-
-    <label class="field" for="pKey">
-      <span>Master Node / Satellite Key</span>
-      <input id="pKey" type="text" autocomplete="off" autocapitalize="characters"
-             spellcheck="false" placeholder="RIPPA-XXXX-XXXX" />
-    </label>
-
-    <label class="field" for="pName">
-      <span>Device Name</span>
-      <input id="pName" type="text" autocomplete="off"
-             placeholder="Galaxy S26 Ultra" />
-    </label>
-
-    <button class="btn" id="pairSave" type="button">Save &amp; Connect</button>
-    <div class="saved" id="pairSaved"></div>
-  </div>
-
   <div id="rows"></div>
 
   <!--
     THE POST-SETUP NODE TELEMETRY DASHBOARD (Epic 5).
 
-    Hidden until the node authenticates, then swapped in for the setup card. The
-    setup card is not hidden - it collapses to a one-line summary with an edit
-    button, because an operator who needs to fix the Mothership URL after a
-    network change should never have to uninstall and start over.
+    Hidden until the node authenticates. The Settings button is the deliberate
+    route into the setup view — labelled rather than a bare pencil glyph, because
+    an icon alone is not a safe thing to make a tablet operator guess at.
 
     Every value here comes from workerStatus() and is rendered as TEXT, never as
     HTML: node names and task labels originate from a remote Mothership, and this
@@ -367,7 +412,7 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
 <section class="dash" id="telemetryDash" hidden>
   <div class="dash-head">
     <h2>Node Telemetry</h2>
-    <button class="btn ghost" id="dashEdit" type="button" title="Re-open connection settings">&#9998;</button>
+    <button class="btn ghost small" id="dashEdit" type="button">Settings</button>
   </div>
 
   <div class="tile-block">
@@ -448,6 +493,36 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
           mains.</span></label>
       </div>
 
+      <!--
+        RUN AS A BACKGROUND SERVICE — the switch that actually decides whether
+        this tablet survives the night.
+
+        It lives in the Power panel because that is where an operator looks when
+        asking "why did it stop overnight?", and it is visually separated from
+        the battery limits because it is not one: those suspend the WORKER, this
+        changes how ANDROID TREATS THE WHOLE APP. Unticking it stops the service,
+        clears the notification, releases the wake lock, and lets the OS freeze
+        the process normally.
+
+        The state line is not decorative. This toggle previously had no way to
+        report the truth — the native side answered "running" by checking whether
+        the process existed, which is always true — so the switch could claim
+        success on a node Android was about to kill.
+      -->
+      <div class="svc">
+        <div class="svc-title">
+          <input type="checkbox" id="pBackground" />
+          <label for="pBackground">Run as Background Service</label>
+        </div>
+        <p class="hint" style="margin:8px 0 0">
+          Keeps this node alive with the screen off, and shows a
+          &ldquo;Rippa Node is running&rdquo; notification you can tap straight
+          back into this dashboard. Turn it off to let Android sleep the app
+          normally &mdash; the node then only works while you are looking at it.
+        </p>
+        <div class="svc-state" id="pBackgroundState">Checking&hellip;</div>
+      </div>
+
       <button class="btn" id="pSave" type="button">Save &amp; apply now</button>
       <div class="saved" id="pSaved"></div>
     </div>
@@ -455,6 +530,55 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
 
   <div class="banner" id="powerBanner" hidden></div>
   <pre id="log">Starting&hellip;</pre>
+  </section><!-- /viewDashboard -->
+
+  <!-- ============================= SETUP VIEW ============================= -->
+  <!--
+    THE SETUP VIEW. Everything needed to turn this tablet into a swarm member,
+    and nothing else.
+
+    It was pulled out of the dashboard because they are different jobs: the
+    dashboard is read at a glance by a passing operator, and the form is a
+    deliberate, once-a-quarter visit. Sharing one scroll meant the numbers this
+    node exists to report were always below a form that is already filled in.
+
+    The values are persisted by the worker's configureNode(), not by inline
+    script here, so there is exactly one writer for the config the pollers read.
+    NOTE: this whole block is inside a JS template literal, so it must not contain
+    a backtick — one there silently truncates the page at build time.
+  -->
+  <section class="view" id="viewSetup" role="tabpanel" aria-labelledby="tabSetup" hidden>
+    <div class="pair" id="pairCard">
+      <div class="pair-head">
+        <h2>Node Connection Setup</h2>
+        <span class="badge awaiting-setup" id="connBadge">Awaiting Setup</span>
+      </div>
+      <p class="hint">Enter the Mothership address and the node key issued by your
+        Master. The key is stored on this device only and is sent as a bearer token.</p>
+
+      <label class="field" for="pUrl">
+        <span>Mothership URL</span>
+        <input id="pUrl" type="text" inputmode="url" autocomplete="off"
+               autocapitalize="none" spellcheck="false"
+               value="https://rippaadventures.com" />
+      </label>
+
+      <label class="field" for="pKey">
+        <span>Master Node / Satellite Key</span>
+        <input id="pKey" type="text" autocomplete="off" autocapitalize="characters"
+               spellcheck="false" placeholder="RIPPA-XXXX-XXXX" />
+      </label>
+
+      <label class="field" for="pName">
+        <span>Device Name</span>
+        <input id="pName" type="text" autocomplete="off"
+               placeholder="Galaxy S26 Ultra" />
+      </label>
+
+      <button class="btn" id="pairSave" type="button">Save &amp; Connect</button>
+      <div class="saved" id="pairSaved"></div>
+    </div>
+  </section>
 </div>
 <script src="worker.js"></script>
 <script>
@@ -485,8 +609,52 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   var updateStatus = document.getElementById('updateStatus');
   var updatePayload = null;
   var updateBusy = false;
+  /* ---- VIEW SWITCHING -----------------------------------------------------
+     The setup form and the dashboard are now separate views. currentView is
+     module state rather than a read of the DOM so the tab handler and the
+     Settings button cannot disagree about which one is showing. */
+  var viewDashboard = document.getElementById('viewDashboard');
+  var viewSetup = document.getElementById('viewSetup');
+  var tabDashboard = document.getElementById('tabDashboard');
+  var tabSetup = document.getElementById('tabSetup');
+  var currentView = 'dashboard';
+
+  /* ---- BACKGROUND SERVICE ------------------------------------------------
+     backgroundBusy disables the checkbox for the duration of a native call.
+     Without it a second tap arrives while the first is still resolving and the
+     operator ends up with a switch showing ON and a service that was stopped. */
+  var pBackground = document.getElementById('pBackground');
+  var pBackgroundState = document.getElementById('pBackgroundState');
+  var backgroundBusy = false;
+
+  /**
+   * Shows one view and hides the other.
+   *
+   * "aria-selected" is updated on BOTH tabs every time rather than toggled, so
+   * the two can never end up with both marked selected or neither.
+   */
+  function showView(name) {
+    currentView = name === 'setup' ? 'setup' : 'dashboard';
+    if (viewDashboard) viewDashboard.hidden = currentView !== 'dashboard';
+    if (viewSetup) viewSetup.hidden = currentView !== 'setup';
+    if (tabDashboard) tabDashboard.setAttribute('aria-selected', String(currentView === 'dashboard'));
+    if (tabSetup) tabSetup.setAttribute('aria-selected', String(currentView === 'setup'));
+  }
+
+  tabDashboard.addEventListener('click', function () { showView('dashboard'); });
+  tabSetup.addEventListener('click', function () { showView('setup'); });
   /** How often the Mothership is asked whether a newer build exists. */
   var UPDATE_CHECK_MS = 15 * 60 * 1000;
+  /**
+   * How often the native foreground-service state is re-read.
+   *
+   * Separate from the 2s telemetry tick because that tick reads CACHED worker
+   * state on purpose — it must not cost a bridge round-trip per poll — and
+   * Android restarts services on its own schedule. Thirty seconds catches a
+   * change quickly enough for an operator to see it, slowly enough to be
+   * invisible in the battery budget.
+   */
+  var BACKGROUND_POLL_MS = 30 * 1000;
   function line(text) {
     logEl.textContent = (text + '\\n' + logEl.textContent).slice(0, 4000);
   }
@@ -535,6 +703,12 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
    */
   function renderUpdate(check) {
     if (!check) return;
+    // The installed version is shown next to the manual Check for Updates button
+    // too, so an operator always has the current build on screen without having
+    // to wait for an update to be found.
+    if (otaVersion) {
+      otaVersion.textContent = check.currentVersion ? 'v' + check.currentVersion : 'unknown';
+    }
     if (check.state !== 'available' || !check.downloadUrl) {
       updateCard.hidden = true;
       return;
@@ -588,6 +762,73 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
     if (!W || !W.checkForUpdate) return;
     W.checkForUpdate().then(renderUpdate).catch(function (error) {
       line('Update check failed: ' + error);
+    });
+  }
+
+  /* ---- MANUAL UPDATE CHECK ------------------------------------------------
+     The automatic prompt above only appears when a newer build exists. This is
+     the button an operator presses to ask the question themselves.
+
+     It reports EVERY outcome, including "already current" — a check that says
+     nothing when the answer is "nothing to do" is indistinguishable from a
+     check that silently failed, which is precisely how an operator ends up
+     believing an old build is current. */
+  var otaCheck = document.getElementById('otaCheck');
+  var otaVersion = document.getElementById('otaVersion');
+  var otaStatus = document.getElementById('otaStatus');
+
+  function renderOta(check) {
+    if (!check) return;
+    var installed = check.currentVersion || '';
+    if (otaVersion) otaVersion.textContent = installed ? 'v' + installed : 'unknown';
+
+    if (check.state === 'available') {
+      if (otaStatus) {
+        otaStatus.textContent = 'v' + installed + ' \u2192 v' + check.remoteVersion +
+          ' is available. Use the Update & Install button above.';
+        otaStatus.style.color = 'var(--warn)';
+      }
+      // renderUpdate() has already raised the banner; nothing more to do here.
+      return;
+    }
+    if (check.state === 'current') {
+      if (otaStatus) {
+        otaStatus.textContent = 'This device is on the latest build' +
+          (check.remoteVersion ? ' (v' + check.remoteVersion + ')' : '') + '.';
+        otaStatus.style.color = 'var(--ok)';
+      }
+      return;
+    }
+    // "unavailable" means no Mothership is configured yet; "error" means the
+    // Mothership could not be reached. Both are stated rather than swallowed —
+    // an operator who pressed a button deserves to be told it did not work.
+    if (otaStatus) {
+      otaStatus.textContent = check.state === 'error'
+        ? 'Could not reach the Mothership to check for updates.'
+        : 'No Mothership configured yet. Add one in Setup to check for updates.';
+      otaStatus.style.color = 'var(--warn)';
+    }
+  }
+
+  if (otaCheck) {
+    otaCheck.addEventListener('click', function () {
+      if (!W || !W.checkForUpdate) return;
+      var button = this;
+      button.disabled = true;
+      if (otaStatus) {
+        otaStatus.textContent = 'Checking the Mothership\u2026';
+        otaStatus.style.color = 'var(--mut)';
+      }
+      // Never throws by contract, but the catch keeps a bug in the worker from
+      // leaving the button permanently disabled.
+      W.checkForUpdate().then(renderOta).catch(function (error) {
+        if (otaStatus) {
+          otaStatus.textContent = 'Update check failed: ' + error;
+          otaStatus.style.color = 'var(--bad)';
+        }
+      }).then(function () {
+        button.disabled = false;
+      });
     });
   }
   /**
@@ -693,6 +934,72 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
     }
   });
   // __UPDATE_UI_TAIL__
+
+  /**
+   * Paints the background-service state and keeps the checkbox honest.
+   *
+   * The checkbox is driven from the STATE THE NATIVE SIDE REPORTED, never from
+   * what was tapped. That is deliberate: an operator who ticks the box must not
+   * be shown a ticked box when Android refused to start the service, because
+   * that switch is the answer to "will this node still be alive at midnight?".
+   */
+  function renderBackground(svc) {
+    if (!svc) return;
+    if (pBackground) pBackground.checked = svc.running === true;
+    if (!pBackgroundState) return;
+
+    if (svc.supported !== true) {
+      pBackgroundState.textContent = 'Not available in this build. A browser preview ' +
+        'has no Android foreground service to start.';
+      pBackgroundState.style.color = 'var(--warn)';
+      return;
+    }
+    if (svc.available === false) {
+      pBackgroundState.textContent = 'The foreground service is missing from this APK. ' +
+        'Rebuild the app — the node will not survive the screen turning off.';
+      pBackgroundState.style.color = 'var(--bad)';
+      return;
+    }
+    pBackgroundState.textContent = svc.running
+      ? 'Running. Android is holding a wake lock and showing the notification.'
+      : 'Stopped. The node only works while this app is in the foreground.';
+    pBackgroundState.style.color = svc.running ? 'var(--ok)' : 'var(--mut)';
+  }
+
+  /**
+   * The toggle handler.
+   *
+   * Applies immediately rather than waiting for "Save & apply now" — the two
+   * other things it does are gated behind that button, but this one has a
+   * notification and a wake lock attached, and an operator who has walked over
+   * to the tablet expects it to have taken effect by the time they walk away.
+   */
+  if (pBackground) {
+    pBackground.addEventListener('change', function () {
+      if (!W || !W.setBackgroundService || backgroundBusy) return;
+      var wanted = this.checked;
+      backgroundBusy = true;
+      this.disabled = true;
+      if (pBackgroundState) {
+        pBackgroundState.textContent = wanted
+          ? 'Starting the foreground service\u2026'
+          : 'Stopping the foreground service\u2026';
+        pBackgroundState.style.color = 'var(--mut)';
+      }
+      W.setBackgroundService(wanted).then(function () {
+        if (W.workerStatus) renderBackground(W.workerStatus().backgroundService);
+      }).catch(function (error) {
+        if (pBackgroundState) {
+          pBackgroundState.textContent = 'Could not change the background service: ' + error;
+          pBackgroundState.style.color = 'var(--bad)';
+        }
+        if (W.workerStatus) renderBackground(W.workerStatus().backgroundService);
+      }).then(function () {
+        backgroundBusy = false;
+        pBackground.disabled = false;
+      });
+    });
+  }
   /**
    * Persists the credentials and proves them against the Mothership.
    *
@@ -752,11 +1059,9 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
    */
   function renderDash(status) {
     var dash = document.getElementById('telemetryDash');
-    var pair = document.getElementById('pairCard');
     var connected = (status.connection || {}).state === 'connected';
     if (!dash) return;
     dash.hidden = !connected;
-    if (pair) pair.classList.toggle('collapsed', connected);
     if (!connected) return;
 
     document.getElementById('dashActive').textContent =
@@ -825,11 +1130,9 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
     return Math.round(hours / 24) + 'd ago';
   }
 
-  /** Re-opens the connection settings from the dashboard's edit button. */
+  /** Opens the setup view from the dashboard's Settings button. */
   document.getElementById('dashEdit').addEventListener('click', function () {
-    var pair = document.getElementById('pairCard');
-    if (!pair) return;
-    pair.classList.remove('collapsed');
+    showView('setup');
     var url = document.getElementById('pUrl');
     if (url) url.focus();
   });
@@ -870,6 +1173,22 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   function render(status) {
     var caps = status.capabilities || {};
     var conn = status.connection || {};
+    var svc = status.backgroundService || {};
+    /*
+      THE FOREGROUND SERVICE ROW. This used to be the constant string
+      "requested on boot", which is a statement about what the code ASKED for
+      rather than what the platform actually did — so it read "running" on a
+      browser preview and on a node Android was about to kill. It now renders
+      the state the native side reported, which is the only version of this
+      answer worth printing.
+    */
+    var svcLabel = svc.supported !== true ? 'unavailable in this build'
+      : svc.available === false ? 'missing from this APK'
+      : svc.running ? 'running'
+      : 'stopped';
+    var svcTone = svc.running ? 'ok'
+      : (svc.supported === true && svc.available !== false) ? 'warn' : '';
+
     var rows = [
       ['Connection', conn.label || 'Disconnected',
        conn.state === 'connected' ? 'ok' :
@@ -878,7 +1197,7 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
       ['Runtime', caps.description || '-', ''],
       ['Scraping', caps.browserScraping ? 'headless Chromium' : 'lightweight fetch',
                   caps.browserScraping ? 'ok' : 'warn'],
-      ['Foreground service', 'requested on boot', ''],
+      ['Foreground service', svcLabel, svcTone],
       ['Heartbeats sent', status.heartbeats || 0, ''],
       ['Tasks claimed', status.tasksClaimed || 0, ''],
       ['Tasks completed', status.tasksCompleted || 0,
@@ -899,6 +1218,7 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
     // connected and not connected is worse than one that is merely stale.
     renderDash(status);
     renderNetwork(status.network || {});
+    renderBackground(svc);
   }
 
   /**
@@ -982,12 +1302,45 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   }
   // Autostart: this page IS the node. Requiring a tap would mean the tablet
   // does nothing until someone walks over to it.
-  if (W) { render(W.workerStatus()); startWorker(); }
+  if (W) {
+    /*
+      OPEN ON SETUP WHEN THERE IS NOTHING TO SEE, DASHBOARD OTHERWISE.
+
+      On a fresh install the dashboard is an empty shell — no connection, no
+      telemetry, no history — so dropping an operator there means the first
+      thing they scroll past to find the form they came for. Once a key is
+      stored the dashboard has real content and is the better default.
+
+      Re-evaluated on every render rather than only at boot, so a node whose key
+      is later revoked by the Mothership sends the operator back to Setup to fix
+      it. The operator's own choice is not overridden by this — it only decides
+      where the page STARTS.
+    */
+    render(W.workerStatus());
+    showView(W.workerStatus().configured ? 'dashboard' : 'setup');
+    startWorker();
+  }
   function startWorker() {
     if (!W || started) return;
     started = true;
     W.startWorker();
     setInterval(function () { render(W.workerStatus()); }, 2000);
+    /*
+      RE-READ THE SERVICE STATE ON ITS OWN SLOW CADENCE.
+
+      Android kills and restarts foreground services on its own schedule, and
+      the 2s telemetry tick above reads CACHED worker state — deliberately, since
+      it must not cost a bridge call per poll. So without this the switch would
+      keep showing a stale answer all night. Thirty seconds is frequent enough to
+      notice a change and rare enough to be invisible in the battery budget.
+    */
+    if (W.refreshBackgroundService) {
+      setInterval(function () {
+        W.refreshBackgroundService().then(function () {
+          if (W.workerStatus) renderBackground(W.workerStatus().backgroundService);
+        });
+      }, BACKGROUND_POLL_MS);
+    }
   }
 
   // The update check runs on ITS OWN timer, not on the 2s telemetry tick. A
@@ -1390,6 +1743,113 @@ console.log(
 );
 
 /*
+  THE FOREGROUND-SERVICE BRIDGE IS REACHABLE FROM JAVASCRIPT. CHECKED, NOT ASSUMED.
+
+  This is the guard for the exact failure that shipped as:
+
+      Native bridge unavailable — running without a foreground service.
+
+  Three separate things had to line up for that log line, and not one of them is
+  checkable by Gradle:
+
+    1. RippaNodePlugin is REGISTERED. Capacitor only auto-registers plugins named
+       in the GENERATED assets/capacitor.plugins.json, which `cap sync` writes
+       from the npm packages — @capacitor/device and nothing else. A plugin in
+       the app's own source set is simply not in that file, so the bridge is
+       built without it and `window.Capacitor.Plugins.RippaNode` is undefined on
+       every device. Only an explicit registerPlugin() in MainActivity fixes it.
+    2. It is registered BEFORE super.onCreate(). registerPlugin() feeds a
+       Bridge.Builder that BridgeActivity.onCreate() consumes via load();
+       calling it afterwards adds a plugin to a builder nobody reads again, which
+       compiles and does nothing.
+    3. The worker's lookup id MATCHES the @CapacitorPlugin name. Capacitor
+       derives the JavaScript global from that annotation, so a mismatch on
+       either side produces a clean build, a running node, and an unprotected
+       process — the failure is only observable at runtime, on a tablet, at
+       midnight.
+
+  None of these produce a compiler diagnostic, so all three are asserted here.
+*/
+const pluginSource = fs.readFileSync(path.join(overlayDir, "RippaNodePlugin.java"), "utf8");
+const serviceSource = fs.readFileSync(path.join(overlayDir, "RippaNodeService.java"), "utf8");
+const mainActivitySource = fs.readFileSync(path.join(overlayDir, "MainActivity.java"), "utf8");
+const workerSource = fs.readFileSync(path.join(mobileDir, "src", "worker.ts"), "utf8");
+
+/** The plugin id declared in Java. The JS side must agree with it. */
+const pluginIdMatch = /@CapacitorPlugin\(name\s*=\s*"([^"]+)"\)/.exec(pluginSource);
+const javaPluginId = pluginIdMatch ? pluginIdMatch[1] : "";
+/** The id the worker resolves. */
+const workerPluginIdMatch = /NATIVE_PLUGIN_ID\s*=\s*"([^"]+)"/.exec(workerSource);
+const workerPluginId = workerPluginIdMatch ? workerPluginIdMatch[1] : "";
+
+const bridgeChecks = [
+  [
+    javaPluginId.length > 0,
+    "the @CapacitorPlugin name in RippaNodePlugin.java",
+  ],
+  [
+    workerPluginId.length > 0,
+    "NATIVE_PLUGIN_ID in mobile/src/worker.ts",
+  ],
+  [
+    javaPluginId.length > 0 && javaPluginId === workerPluginId,
+    `the plugin id agreeing across Java and JS (java="${javaPluginId}" js="${workerPluginId}")`,
+  ],
+  [
+    /registerPlugin\(RippaNodePlugin\.class\)/.test(mainActivitySource),
+    "MainActivity registering RippaNodePlugin",
+  ],
+  [
+    // THE ORDERING ASSERTION: registerPlugin must appear before super.onCreate().
+    //
+    // COMMENTS ARE STRIPPED FIRST, and that is the whole subtlety. MainActivity's
+    // Javadoc discusses "registerPlugin ... BEFORE super.onCreate()" in prose that
+    // sits physically above the real code, so a naive indexOf() on the raw source
+    // finds the COMMENT mentioning super.onCreate() first and reports the correct
+    // code as broken. A guard that cries wolf on correct input gets deleted.
+    (() => {
+      const code = mainActivitySource
+        .replace(/\/\*[\s\S]*?\*\//g, " ")
+        .replace(/\/\/.*$/gm, " ");
+      const registered = code.indexOf("registerPlugin(RippaNodePlugin.class)");
+      const superCalled = code.indexOf("super.onCreate(");
+      return registered > -1 && superCalled > -1 && registered < superCalled;
+    })(),
+    "RippaNodePlugin registered BEFORE super.onCreate() (the builder is consumed there)",
+  ],
+  [
+    // The service must expose real state, not a process probe. isRunning() backed
+    // by the service's own flag is what makes the dashboard's toggle honest.
+    /static boolean isRunning\(\)/.test(serviceSource),
+    "RippaNodeService.isRunning() — the real service state",
+  ],
+  [
+    /setBackgroundService/.test(workerSource),
+    "the worker exposing setBackgroundService() to the dashboard",
+  ],
+  [
+    /isForegroundServiceRunning/.test(pluginSource),
+    "RippaNodePlugin.isForegroundServiceRunning()",
+  ],
+];
+const missingBridgePieces = bridgeChecks.filter(([present]) => !present).map(([, label]) => label);
+if (missingBridgePieces.length) {
+  console.error(
+    `[APK] The native foreground-service bridge is not reachable from JavaScript:\n` +
+      missingBridgePieces.map((piece) => `         - missing ${piece}\n`).join("") +
+      "       Every one of these is silent at build and runtime alike: the APK\n" +
+      "       installs, the node joins the swarm, and it is unprotected the moment\n" +
+      "       the screen goes off. Check the overlay's RippaNodePlugin.java,\n" +
+      "       RippaNodeService.java and MainActivity.java, and NATIVE_PLUGIN_ID in\n" +
+      "       mobile/src/worker.ts.",
+  );
+  process.exit(1);
+}
+console.log(
+  `[APK] Verified ${bridgeChecks.length} foreground-bridge check(s) (plugin id "${javaPluginId}").`,
+);
+
+/*
   THE IN-APP UPDATER IS WIRED END TO END. CHECKED HERE, BECAUSE IT CANNOT BE CHECKED
   ANYWHERE ELSE.
 
@@ -1435,6 +1895,12 @@ const updaterChecks = [
 const bridgeSource = fs.readFileSync(path.join(overlayDir, "MobileBridge.java"), "utf8");
 updaterChecks.push(
   [
+    // mainActivitySource is read once above, for the foreground-bridge checks.
+    // Re-reading it here would make two sources of truth for one file.
+    /addJavascriptInterface\(\s*new MobileBridge\(/.test(mainActivitySource),
+    "MainActivity registering MobileBridge as a JavascriptInterface",
+  ],
+  [
     bridgeSource.includes('getPackageName() + ".provider"'),
     "the runtime authority MobileBridge passes to FileProvider",
   ],
@@ -1451,12 +1917,6 @@ updaterChecks.push(
     "mobileBridge.canInstallPackages()",
   ],
 );
-
-const mainActivitySource = fs.readFileSync(path.join(overlayDir, "MainActivity.java"), "utf8");
-updaterChecks.push([
-  /addJavascriptInterface\(\s*new MobileBridge\(/.test(mainActivitySource),
-  "MainActivity registering MobileBridge as a JavascriptInterface",
-]);
 
 const filePathsSource = fs.readFileSync(path.join(overlayDir, "res", "xml", "file_paths.xml"), "utf8");
 updaterChecks.push(
@@ -1562,6 +2022,65 @@ const promptChecks = [
   */
   [!dashboard.includes("${"), "no un-interpolated template marker in the page"],
   [!/'undefined'|"undefined"/.test(dashboard), "no interpolated value rendered as undefined"],
+
+  /*
+    THE SETUP/DASHBOARD SPLIT IS INTACT, AND THE TWO NEW CONTROLS EXIST.
+
+    Every element id here is looked up by getElementById() at load. A rename is
+    not a build error and not a console error worth reading: the page renders
+    perfectly, the dashboard looks fine, and the control is simply missing. The
+    pairing form disappearing is especially dangerous — it is the only way to
+    write a Mothership URL and key, so a regression here produces a node that
+    cannot be reconfigured without clearing app data.
+  */
+  [dashboard.includes('id="viewDashboard"'), "the dashboard view"],
+  [dashboard.includes('id="viewSetup"'), "the setup view"],
+  [dashboard.includes('id="tabDashboard"'), "the dashboard tab"],
+  [dashboard.includes('id="tabSetup"'), "the setup tab"],
+  [dashboard.includes('id="pairCard"'), "the connection setup card"],
+  [dashboard.includes("function showView("), "the view switcher"],
+  [
+    /*
+      THE PAIRING CARD LIVES INSIDE THE SETUP VIEW — CHECKED POSITIONALLY.
+
+      A greedy /id="viewSetup"[\s\S]*id="pairCard"/ would pass no matter which
+      view the card ended up in, because the two ids are separated by thousands
+      of characters either way round. What actually matters is the ORDER of three
+      landmarks in the emitted HTML:
+
+          </section> (closing viewDashboard)
+            <section id="viewSetup">
+              <div class="pair" id="pairCard">
+
+      If the card sits before the dashboard section closes, it is on the
+      dashboard — which is precisely the regression this guards. So all three
+      offsets must be found and strictly increasing.
+    */
+    (() => {
+      const dashCloses = dashboard.indexOf("</section><!-- /viewDashboard -->");
+      const setupOpens = dashboard.indexOf('id="viewSetup"');
+      const card = dashboard.indexOf('id="pairCard"');
+      return dashCloses > -1 && setupOpens > dashCloses && card > setupOpens;
+    })(),
+    "the setup card living INSIDE the setup view rather than the dashboard",
+  ],
+  [
+    /id="pBackground"/.test(dashboard),
+    'the "Run as Background Service" toggle',
+  ],
+  [dashboard.includes("setBackgroundService"), "the toggle calling the worker's setter"],
+  [dashboard.includes("renderBackground"), "the toggle rendering the real service state"],
+  [dashboard.includes("refreshBackgroundService"), "the toggle polling the live service state"],
+  /*
+    THE OTA BUTTON IS ALWAYS REACHABLE.
+
+    The auto-prompt only appears when a newer build exists, which left no way to
+    ask the question when the answer is "you are up to date". This asserts the
+    manual half exists independently of the prompt.
+  */
+  [dashboard.includes('id="otaCheck"'), 'the "Check for Updates" button'],
+  [dashboard.includes("Check for Updates"), 'the "Check for Updates" label'],
+  [dashboard.includes('id="otaVersion"'), "the installed-version badge"],
 ];
 const missingPromptPieces = promptChecks.filter(([present]) => !present).map(([, label]) => label);
 if (missingPromptPieces.length) {

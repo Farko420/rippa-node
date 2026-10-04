@@ -1,8 +1,6 @@
 package com.rippaadventures.node;
 
 import android.content.Context;
-import android.content.Intent;
-import android.os.Build;
 
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -18,6 +16,15 @@ import com.getcapacitor.annotation.CapacitorPlugin;
  * surface is deliberately tiny: every additional method here is another thing
  * that can start pinning a wake lock, and this node's whole background story
  * rests on doing exactly one thing predictably.
+ *
+ * THE `@CapacitorPlugin` NAME IS THE JS IDENTITY, AND IT IS THE FIRST HALF OF THE
+ * BUG THAT PRODUCED "Native bridge unavailable". Capacitor derives the JavaScript
+ * global from this annotation: `@CapacitorPlugin(name = "RippaNode")` publishes the
+ * methods at `window.Capacitor.Plugins.RippaNode`, NOT at
+ * `window.RippaNodePlugin`. The worker looked for `globalThis.RippaNodePlugin`,
+ * which nothing in the Capacitor runtime has ever created, so the bridge was
+ * unreachable on every device. The two halves of the contract must change
+ * together: the name here, and `NATIVE_PLUGIN_ID` in mobile/src/worker.ts.
  */
 @CapacitorPlugin(name = "RippaNode")
 public class RippaNodePlugin extends Plugin {
@@ -36,21 +43,19 @@ public class RippaNodePlugin extends Plugin {
             call.reject("No Android context available.");
             return;
         }
-        try {
-            Intent intent = new Intent(context, RippaNodeService.class);
-            /*
-              startForegroundService (not startService).
+        /*
+          startForegroundService (not startService).
 
-              Android 8+ throws if a background app calls startService() and then
-              tries to call startForeground(). Because the WebView may well be
-              backgrounded when the worker boots, the correct call must be made up
-              front.
-            */
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent);
-            } else {
-                context.startService(intent);
-            }
+          Android 8+ throws if a background app calls startService() and then
+          tries to call startForeground(). Because the WebView may well be
+          backgrounded when the worker boots, the correct call must be made up
+          front.
+        */
+        try {
+            RippaNodeService.start(
+                    context,
+                    call.getString("title", "Rippa Node is running"),
+                    call.getString("message", "Foraging for the swarm. The screen may be off."));
             call.resolve();
         } catch (Exception error) {
             // Rejected rather than swallowed: if the service cannot start, the
@@ -85,39 +90,38 @@ public class RippaNodePlugin extends Plugin {
     @PluginMethod
     public void isForegroundServiceRunning(PluginCall call) {
         JSObject result = new JSObject();
-        // The service is START_STICKY with no binding, so "running" is reported
-        // from the process rather than a live binder — which is exactly what a
-        // caller actually wants to know.
-        boolean running = isServiceProcessAlive();
-        result.put("running", running);
+        /*
+          THE SERVICE'S OWN FLAG, NOT A PROCESS PROBE.
+
+          This used to walk ActivityManager looking for "is my own pid in the
+          running-process list", which is true for as long as the WebView is
+          alive. It therefore answered `running: true` on a desktop browser
+          preview, after a failed start, and any time no service existed at all —
+          so the dashboard's "Run as Background Service" switch reported success
+          while the node was unprotected. The dashboard renders this value
+          verbatim, so a wrong answer here is a lie the operator acts on.
+
+          A secondary check is still performed and reported separately: if the
+          service class does not resolve, the manifest overlay was never applied
+          and the node cannot be protected no matter what this flag says.
+        */
+        boolean overlayApplied = serviceClassResolves();
+        result.put("running", overlayApplied && RippaNodeService.isRunning());
+        // Surfaced so the dashboard can distinguish "off" from "broken", which
+        // are very different things to an operator at 11pm.
+        result.put("available", overlayApplied);
         call.resolve(result);
     }
 
     /**
-     * Best-effort liveness probe.
-     *
-     * Deliberately conservative: it reports what it can actually prove — the
-     * service class resolves (so the manifest overlay really was applied) and
-     * this app's process is alive — rather than claiming a stronger guarantee it
-     * cannot verify without binding to the service.
+     * Resolves the service class, which only exists in the APK if the manifest
+     * overlay was applied. Used as the "is this build capable of protecting the
+     * node at all" probe.
      */
-    private boolean isServiceProcessAlive() {
+    private boolean serviceClassResolves() {
         try {
-            // The service class resolves only if the manifest wired it up, so
-            // this doubles as a check that the overlay was actually applied.
             Class.forName("com.rippaadventures.node.RippaNodeService");
-            android.app.ActivityManager manager =
-                    (android.app.ActivityManager) getContext().getSystemService(Context.ACTIVITY_SERVICE);
-            if (manager == null) {
-                return false;
-            }
-            int pid = android.os.Process.myPid();
-            for (android.app.ActivityManager.RunningAppProcessInfo info : manager.getRunningAppProcesses()) {
-                if (info != null && info.pid == pid) {
-                    return true;
-                }
-            }
-            return false;
+            return true;
         } catch (Exception error) {
             return false;
         }

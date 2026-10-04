@@ -3,7 +3,6 @@ package com.rippaadventures.node;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.os.Build;
 
 /**
  * RESTARTS THE NODE AFTER A REBOOT OR AN APP UPDATE.
@@ -27,14 +26,18 @@ public class RippaNodeBootReceiver extends BroadcastReceiver {
             return;
         }
         try {
-            Intent service = new Intent(context, RippaNodeService.class);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                // Same reason as the plugin: startForegroundService is the only
-                // call legal from a background receiver on Android 8+.
-                context.startForegroundService(service);
-            } else {
-                context.startService(service);
-            }
+            /*
+              DELEGATED TO RippaNodeService.start(), NOT REPEATED HERE.
+
+              This receiver used to inline its own SDK_INT check, which was a second
+              copy of the rule "Android 8+ requires startForegroundService from a
+              background context". Two copies of that rule is one more than a
+              project should have, and they had already started to drift in their
+              comments. The null title/message let the service fall back to its own
+              defaults, which is what a reboot restart wants — there is no JS alive
+              to supply wording.
+            */
+            RippaNodeService.start(context, null, null);
         } catch (Exception error) {
             // A reboot receiver that throws crashes the system on some OEM
             // builds. Failing to restart is recoverable; crashing the tablet is
