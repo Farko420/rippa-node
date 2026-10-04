@@ -185,6 +185,16 @@ export interface HeartbeatTelemetry extends SystemVitals {
   connected_satellites: string[];
   ollama: OllamaTelemetry;
   /**
+   * Embedded AI supervisor telemetry for the Mothership's fleet dashboard.
+   *
+   * Mapped from the `ollama` block above to the field names the Mothership
+   * expects (`ai_status`, `hardware_tier`, `active_model`, `supports_embedding`).
+   * The Mothership's `normaliseMeshTelemetry` reads this as `embedded_ai`,
+   * `embeddedAi`, `ai`, or at the root level, so nesting it here keeps the
+   * heartbeat shape clean while staying compatible.
+   */
+  embedded_ai: Record<string, unknown>;
+  /**
    * The build this node is RUNNING, e.g. "1.0.23".
    *
    * Named `current_version` rather than reusing the pre-existing top-level
