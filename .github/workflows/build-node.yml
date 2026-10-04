@@ -84,6 +84,11 @@ jobs:
           # shallow fetch (depth 1) that ref is missing and the step fails with a
           # checkout error that reads nothing like its cause.
           fetch-depth: 0
+          # Pin the checkout to the exact ref that triggered the run. Without an
+          # explicit `ref`, checkout resolves the default branch tip, which on a
+          # tag-triggered run is NOT the tag under build — the workspace can then
+          # end up on a different tree than the one the workflow was launched for.
+          ref: ${{ github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -228,6 +233,17 @@ jobs:
         with:
           commit_message: "chore: bump version to ${{ steps.version.outputs.version }}"
           file_pattern: package.json
+          # The runner's local `master` is a snapshot from checkout time; any push
+          # that lands while this build is running makes the default fast-forward
+          # push a NON-FAST-FORWARD rejection and fails "Commit the version bump".
+          # `--force-with-lease` lets the bump win the race, while still refusing
+          # to clobber a remote that moved to a commit this runner never saw — so
+          # a genuine conflicting push is still detected rather than overwritten.
+          push_options: '--force-with-lease'
+          # Re-fetch before pushing so the lease is evaluated against the newest
+          # remote refs. Combined with the option above, this is what turns the
+          # race into a resolved push instead of an opaque rejection.
+          skip_fetch: false
 
       # -------------------------------------------------------------------------
       # RELEASE TAG RESOLUTION
