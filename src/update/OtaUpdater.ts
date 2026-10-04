@@ -131,13 +131,32 @@ interface ApplyOptions {
   allowDowngrade?: boolean;
 }
 
+/**
+ * OTA download/installation status exposed to telemetry and the dashboard.
+ */
+export interface OtaStatus {
+  state: "downloading" | "staged" | "restarting" | "completed" | "error";
+  progress: number;
+  targetVersion?: string;
+  errorMessage?: string;
+}
+
+const IDLE_OTA_STATUS: OtaStatus = { state: "completed", progress: 0 };
+
 export class OtaUpdater {
   private updating = false;
   private disabledReason: string | null = null;
   /** Last version attempted, so a broken build is not retried every hour. */
   private lastAttemptedVersion: string | null = null;
+  /** Current OTA status for telemetry. */
+  private otaStatus: OtaStatus = { ...IDLE_OTA_STATUS };
 
   constructor(private readonly swarm: SwarmClient) {}
+
+  /** Returns the current OTA status for telemetry. */
+  getOtaStatus(): OtaStatus {
+    return { ...this.otaStatus };
+  }
 
   /**
    * Handles an update advertised on the heartbeat reply. Fire-and-forget and
@@ -357,6 +376,8 @@ export class OtaUpdater {
 
     const updatePath = path.join(stage, TEMP_UPDATE_FILE);
     const partialPath = `${updatePath}${PARTIAL_SUFFIX}`;
+
+       this.otaStatus = { state: "downloading", progress: 0, targetVersion: latest.version };
 
     try {
       console.log("[OTA] New version detected. Downloading...");

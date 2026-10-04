@@ -1,0 +1,5 @@
+[33m9a1fc9c[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m, [m[1;31morigin/master[m[33m, [m[1;31morigin/HEAD[m[33m)[m Merge branch 'master' of https://github.com/Farko420/rippa-node # Please enter a commit message to explain why this merge is necessary, # especially if it merges an updated upstream into a topic branch. # # Lines starting with '#' will be ignored, and an empty message aborts # the commit.
+[33m2fbba66[m CRITICAL FIX: Add missing android.os.Build import to RippaNodePlugin
+[33m7afe292[m chore: bump version to 1.0.36
+[33m4f64d4d[m Merge branch 'master' of https://github.com/Farko420/rippa-node
+[33m0a102ef[m 
