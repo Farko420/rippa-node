@@ -306,8 +306,45 @@ process.env.NODE_API_KEY = "verify-ack-key-0001";
 process.env.NODE_ROLE = "satellite";
 process.env.MASTER_LOCAL_URL = "http://127.0.0.1:5199";
 
+/*
+  THE OVERRIDE ABOVE IS INERT UNTIL THIS CALL — AND THAT IS THE WHOLE POINT.
+
+  `dist/config.js` snapshots the environment ONCE at module load
+  (`export const env = parsed.data`). `dist/services/heartbeat.js` pulls that
+  module in at the top of this file, so by the time the four assignments above
+  run, `env.MOTHERSHIP_URL` has already been frozen to whatever `.env` says —
+  in practice the LIVE `https://rippaadventures.com`.
+
+  Without `reloadEnv()`, `new SwarmClient()` reads that stale snapshot as its
+  axios `baseURL` and every assertion below "passes" or fails against the REAL
+  Mothership: the local server records nothing (`received` stays `[]`), the
+  assertions that inspect recorded bodies fail for the wrong reason, and the
+  suite silently depends on another company's uptime and network. A green run
+  would prove nothing about this code.
+
+  `reloadEnv()` re-reads `process.env` into the live `env` object, so the
+  client below is pointed at the throwaway server on the line above.
+*/
+const configModule = await load("dist/config.js");
+configModule.reloadEnv();
+
 const { SwarmClient } = await load("dist/network/SwarmClient.js");
 const ackClient = new SwarmClient();
+
+/*
+  HERMETICITY GUARD. Every assertion below is only meaningful if the client is
+  talking to the throwaway server. Without this check a regression of the
+  snapshot above would not surface as a failure — it would quietly restore the
+  suite to hitting the live Mothership and reporting whatever it said. This is
+  the assertion that makes "the tests passed" mean "the tests ran against the
+  code", so it is deliberately the FIRST thing proved.
+*/
+check(
+  "the ack client is pointed at the LOCAL mock, not the live Mothership",
+  String(ackClient.client?.defaults?.baseURL ?? "").startsWith(`http://127.0.0.1:${ackPort}`),
+  String(ackClient.client?.defaults?.baseURL ?? "(unknown)"),
+);
+
 const acked = await ackClient.acknowledgeRemoteCommand({
   commandId: "cmd-1234",
   command: "FORCE_UPDATE",
@@ -359,6 +396,18 @@ if (prevUrl === undefined) delete process.env.MOTHERSHIP_URL; else process.env.M
 if (prevKey === undefined) delete process.env.NODE_API_KEY; else process.env.NODE_API_KEY = prevKey;
 if (prevRole === undefined) delete process.env.NODE_ROLE; else process.env.NODE_ROLE = prevRole;
 if (prevMaster === undefined) delete process.env.MASTER_LOCAL_URL; else process.env.MASTER_LOCAL_URL = prevMaster;
+
+/*
+  UNDO THE OVERRIDE IN THE SNAPSHOT TOO, not just in `process.env`.
+
+  `reloadEnv()` copied the throwaway URL into the shared `env` object, which
+  every later module in this process reads. Restoring `process.env` alone would
+  leave `env.MOTHERSHIP_URL` pointing at a port that is now CLOSED, so every
+  remaining check that touches the Mothership would fail for a reason that has
+  nothing to do with what it is testing. One more `reloadEnv()` re-derives the
+  live values from the just-restored environment.
+*/
+configModule.reloadEnv();
 
 // --- 8. Swap script generation -------------------------------------------------
 // The script is what actually replaces the binary, so its contents are the
@@ -1379,9 +1428,25 @@ if (mothershipPresent) {
   );
   check(
     "the Mothership pre-checks the node's reported version before queueing a force_ota_update",
-    mothershipAdmin.includes('data.command === "force_ota_update"') &&
-      mothershipAdmin.includes("readNodeReportedVersion") &&
-      mothershipAdmin.includes("compareVersions(nodeVersion, targetVersion) >= 0"),
+    /*
+      ASSERTED AGAINST `swarm.server.ts`, NOT `swarm-admin.functions.ts`.
+
+      This check used to read the admin handler, and it failed there for a
+      legitimate reason: the pre-check was DELIBERATELY removed from the admin
+      button's own path so a human pressing "Force" is never told "already
+      current" by a stale constant (see the long note in `swarm-admin.functions.ts`
+      above `enqueueNodeCommand`).
+
+      The gate still exists — it just moved down one layer into
+      `shouldQueueOtaUpdate` in `swarm.server.ts`, where it runs for every
+      unattended caller and at redelivery. Pinning the check to the file the
+      gate actually lives in keeps the real guarantee (an unattended OTA command
+      is not queued to a node that is already current) without asserting a
+      behaviour the Mothership chose to remove on purpose.
+    */
+    mothershipServer.includes('command !== "force_ota_update"') &&
+      mothershipServer.includes("readNodeReportedVersion") &&
+      /compareVersions\(reported, target\)/.test(mothershipServer),
   );
   check(
     "the heartbeat carries the node's version so the pre-check has something to read",

@@ -187,8 +187,17 @@
         <div class="tile"><span class="tile-label">Restarts</span><strong id="ollamaRestarts">0</strong></div>
         <div class="tile"><span class="tile-label">System RAM</span><strong id="ollamaRam">—</strong></div>
         <div class="tile"><span class="tile-label">Embedding Model</span><strong id="ollamaEmbed">—</strong></div>
+        <!--
+          THE GENERATION MODEL TILE. Separate from the "Model" tile above, which
+          reports WHICH model is selected; this one reports whether it is actually
+          INSTALLED, which for an auto-profiled qwen2.5-coder:7b is a ~4.6 GB
+          download. Without it a repair in progress was indistinguishable from a
+          hung one until the request timed out.
+        -->
+        <div class="tile"><span class="tile-label">Model Download</span><strong id="ollamaModelState">—</strong></div>
       </div>
       <p id="ollamaError" class="hint" hidden></p>
+      <p id="ollamaRepair" class="hint" hidden></p>
 
       <!--
         ENTRY POINT FOR THE AI ENDPOINT SETTINGS MODAL (Epic 3).

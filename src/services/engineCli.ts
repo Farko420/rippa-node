@@ -198,8 +198,31 @@ export async function runEngineCommand(raw: string, deps: EngineCliDeps): Promis
     if (lower.startsWith("ollama pull")) {
       const parsed = readModelArgument(input.slice("ollama pull".length));
       if (!parsed.ok) return fail(parsed.message);
-      const result = await deps.pull(parsed.model);
-      return result.ok ? { ok: true, message: result.message } : fail(result.message);
+      /*
+        STARTED, NOT WAITED FOR. This used to `await deps.pull(...)`, and because
+        `/api/engine/exec` awaits `runEngineCommand`, that held the HTTP request
+        open for the entire download. Pulling `qwen2.5-coder:7b` is ~4.6 GB, so
+        typing `ollama pull` into the terminal produced the same reported symptom as
+        the repair button: the browser gave up on a request whose work was
+        succeeding. Progress is already streaming into this terminal line by line
+        (see `pullModelStreaming`), so there is nothing for the HTTP response to
+        wait for — it returns the moment the pull starts.
+
+        The failure line is therefore reported HERE, in the terminal, rather than
+        in the HTTP body the browser may no longer be listening for.
+      */
+      void deps.pull(parsed.model).then(
+        (result) => {
+          if (!result.ok) publishLine("err", `pull failed: ${result.message}`);
+        },
+        (error) => {
+          publishLine("err", `pull failed: ${error instanceof Error ? error.message : String(error)}`);
+        },
+      );
+      return {
+        ok: true,
+        message: `Pulling ${parsed.model} — progress is streaming below.`,
+      };
     }
 
     if (lower === "ollama restart") {

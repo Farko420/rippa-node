@@ -72,6 +72,24 @@ const EMBEDDING_RECONCILE_FAST_MS = 15_000;
 /** Reconcile cadence while idle or after a failed pull — it keeps looking. */
 const EMBEDDING_RECONCILE_SLOW_MS = 60_000;
 
+/**
+ * GENERATION MODEL PULL — the same bounded, streaming discipline as the embedding
+ * pull, sized for the fact that this download is tens of times larger.
+ *
+ * WHY IT IS SEPARATE FROM `EMBEDDING_PULL_TIMEOUT_MS` AND NOT REUSED. The
+ * embedding model is ~100 MB; the generation model the auto-profiler selects is
+ * ~4.6 GB (Ollama's own log line: `downloading ... in 16 292 MB part(s)`). Giving
+ * both the same 10-minute budget is what produced the reported symptom: a pull
+ * that was demonstrably progressing was killed and reported as a failure. So this
+ * ceiling is sized for a large transfer on a slow link, and — more importantly —
+ * the pull that uses it is ASYNCHRONOUS and streaming, so an operator watching
+ * the dashboard sees "Downloading Model…" rather than a request that appears to
+ * hang and then errors.
+ */
+const MODEL_PULL_TIMEOUT_MS = 120 * 60_000;
+/** Reconcile cadence while the generation pull is actively streaming. */
+const MODEL_RECONCILE_FAST_MS = 20_000;
+
 export type OllamaRunState = "stopped" | "starting" | "running" | "crashed" | "unmanaged";
 
 /**
@@ -85,6 +103,17 @@ export type OllamaRunState = "stopped" | "starting" | "running" | "crashed" | "u
  * leaving a badge frozen on a state the work no longer holds.
  */
 export type EmbeddingModelStatus = "idle" | "pulling" | "ready" | "failed";
+
+/**
+ * WHAT THE GENERATION MODEL TILE IS ALLOWED TO SAY.
+ *
+ * The same union as the embedding tile, for the same reason: `pulling` is a claim
+ * with an end. Without it, a ~4.6 GB download has no representation on the status
+ * endpoint at all, so the only thing the dashboard could do was show an error when
+ * the request eventually timed out — the exact failure this state machine exists
+ * to make honest.
+ */
+export type ModelStatus = "idle" | "pulling" | "ready" | "failed";
 
 export interface OllamaStatus {
   /** True when this node is allowed to spawn/restart the process itself. */
@@ -128,6 +157,35 @@ export interface OllamaStatus {
   bundledRuntimeComplete: boolean;
   /** Release tag of the installed bundled runtime, or "". */
   bundledVersion: string;
+  /** True once the GENERATION model is installed on this node. */
+  modelReady: boolean;
+  /**
+   * Machine state behind the generation-model tile — see {@link ModelStatus}.
+   *
+   * `pulling` is what the dashboard renders as "Downloading Model…". It is the
+   * difference between an operator watching a 4.6 GB transfer proceed and an
+   * operator staring at a spinner that will eventually become an error.
+   */
+  modelStatus: ModelStatus;
+  /** Why the last generation pull failed; null unless the status is `failed`. */
+  modelError: string | null;
+  /** 0-100 while a generation pull is streaming; null when no pull is running. */
+  modelPullPercent: number | null;
+  /** Bytes transferred so far on the current pull, as Ollama reports it. */
+  modelPullCompleted: number | null;
+  /** Total bytes for the current pull, as Ollama reports it. */
+  modelPullTotal: number | null;
+  /**
+   * True while a repair (self-heal) is running in the BACKGROUND.
+   *
+   * Self-heal used to be awaited by its HTTP route, which meant the request stayed
+   * open across a server restart AND a multi-gigabyte model download. The route now
+   * returns `202 Accepted` immediately and the operator polls this flag, so the
+   * button can show progress instead of the browser sitting on a dead socket.
+   */
+  repairing: boolean;
+  /** Last repair outcome message, shown by the dashboard after a 202. */
+  repairMessage: string | null;
 }
 
 function extractPort(url: string): number {
@@ -177,6 +235,34 @@ function readOllamaModels(body: unknown): string[] {
 function installedModelMatches(installed: string[], target: string): boolean {
   const bare = target.split(":")[0];
   return installed.some((name) => name === target || name.split(":")[0] === bare);
+}
+
+/**
+ * TRUE FOR LOG LINES THAT ARE ABOUT REACHING OLLAMA.COM RATHER THAN ABOUT THIS
+ * NODE'S HEALTH.
+ *
+ * Recent Ollama builds probe `ollama.com` to hydrate a cloud model cache. On a
+ * satellite behind a firewall that probe times out and the server logs
+ * `model show cloud cache hydration failed`. `bundledOllamaEnv()` sets
+ * `OLLAMA_NO_CLOUD=1` so a current build never makes the request, but an already
+ * running child (or a build that predates the flag) still emits it, and an
+ * operator reading it reasonably concludes the node is broken when the engine is
+ * in fact serving.
+ *
+ * WHY IT IS SAFE TO DROP. Local reachability is established authoritatively by
+ * `/api/tags` returning 200 — that is the entire basis of {@link probeHealth} and
+ * of the status dot. A failed attempt to warm a REMOTE cache says nothing about
+ * whether the local server is answering, so dropping the line cannot hide a real
+ * fault. It is deliberately narrow: anything mentioning a pull, a load, an OOM or
+ * a bind failure still reaches the terminal.
+ *
+ * EXPORTED FOR THE SAME REASON AS `publishManagedOllamaOrigin`: a filter that is
+ * only reachable by spawning a real Ollama child cannot be regression-tested, and
+ * a suppression filter that silently stops matching would put the noise back
+ * without anything noticing.
+ */
+export function isExternalNetworkNoise(line: string): boolean {
+  return /\bcloud cache hydration\b|\bmodel show cloud\b|cloud model cache/i.test(line);
 }
 
 /** One newline-delimited JSON progress frame from `POST /api/pull`. */
@@ -274,6 +360,22 @@ class OllamaManager {
   private embeddingPulling = false;
   /** Pending `/api/tags` reconcile timer; null when none is scheduled. */
   private embeddingReconcileTimer: NodeJS.Timeout | null = null;
+  /** Generation-model tile state machine — see {@link ModelStatus}. */
+  private modelStatus: ModelStatus = "idle";
+  /** Populated only on failure; shown as the retry tile's tooltip. */
+  private modelError: string | null = null;
+  /** Live progress of the in-flight generation pull, as Ollama reports it. */
+  private modelPullPercent: number | null = null;
+  private modelPullCompleted: number | null = null;
+  private modelPullTotal: number | null = null;
+  /** True while `pullGenerationModel()` is running — guards a second pull. */
+  private modelPulling = false;
+  /** Pending reconcile timer for the generation model. */
+  private modelReconcileTimer: NodeJS.Timeout | null = null;
+  /** True while a self-heal runs in the background; surfaced on the status route. */
+  private repairing = false;
+  /** Outcome of the last repair, so a 202'd request has something to report. */
+  private repairMessage: string | null = null;
   private crashTimestamps: number[] = [];
   private restartTimer: NodeJS.Timeout | null = null;
   private stopping = false;
@@ -305,7 +407,19 @@ class OllamaManager {
   }
 
   setModel(model: string): void {
-    this.model = model.trim() || PRIMARY_MODEL;
+    const next = model.trim() || PRIMARY_MODEL;
+    if (next === this.model) return;
+    this.model = next;
+    // A DIFFERENT MODEL IS A DIFFERENT DOWNLOAD. Carrying the old model's `ready`
+    // forward would tell the dashboard the new model is installed when it is not,
+    // so the tile resets to `idle` and the reconcile chain re-arms to find out.
+    this.modelStatus = "idle";
+    this.modelError = null;
+    this.modelPullPercent = null;
+    this.modelPullCompleted = null;
+    this.modelPullTotal = null;
+    this.stopModelReconcile();
+    this.scheduleModelReconcile(0);
   }
 
   getModel(): string {
@@ -335,6 +449,14 @@ class OllamaManager {
       // when the install is broken, which is the case worth surfacing.
       bundledRuntimeComplete: bundledRuntimeComplete(),
       bundledVersion: bundledOllama.getStatus().version,
+      modelReady: this.modelStatus === "ready",
+      modelStatus: this.modelStatus,
+      modelError: this.modelError,
+      modelPullPercent: this.modelPullPercent,
+      modelPullCompleted: this.modelPullCompleted,
+      modelPullTotal: this.modelPullTotal,
+      repairing: this.repairing,
+      repairMessage: this.repairMessage,
     };
   }
 
@@ -502,6 +624,14 @@ class OllamaManager {
    * trailing line is therefore buffered until its newline arrives (or the stream
    * closes).
    *
+   * EXTERNAL-NETWORK NOISE IS DROPPED. `OLLAMA_NO_CLOUD=1` stops a current Ollama
+   * from probing ollama.com at all, but the suppression is belt-and-braces because
+   * the log line is alarming out of all proportion to what it means: an operator
+   * reading `model show cloud cache hydration failed` reasonably concludes their
+   * node is broken. `/api/tags` answering 200 is the authoritative health signal
+   * (see {@link probeHealth}); a failed attempt to reach a cloud cache is not a
+   * local fault and must not be presented as one.
+   *
    * Never throws, and never applies backpressure to the child: a dashboard that stops
    * reading must not be able to wedge the Ollama server this node depends on.
    */
@@ -515,10 +645,12 @@ class OllamaManager {
         const lines = pending.split(/\r?\n/);
         // The final element is whatever came after the last newline: incomplete.
         pending = lines.pop() ?? "";
-        for (const line of lines) publishLine(kind, line);
+        for (const line of lines) {
+          if (!isExternalNetworkNoise(line)) publishLine(kind, line);
+        }
       });
       stream.on("end", () => {
-        if (pending) publishLine(kind, pending);
+        if (pending && !isExternalNetworkNoise(pending)) publishLine(kind, pending);
         pending = "";
       });
       stream.on("error", () => {
@@ -566,9 +698,11 @@ class OllamaManager {
         `ollama pull`, a restored backup — flips the Embedding Model tile to
         `ready` on the next health ping without issuing a second request. This
         is also the only reconcile an UNMANAGED node gets (it never runs
-        `ensureModelsPulled`), which is exactly why it lives here.
+        `ensureModelsPulled`), which is exactly why it lives here. The generation
+        tile reconciles the same way from the same response body.
       */
       this.absorbEmbeddingInstalled(installedModels);
+      this.absorbModelInstalled(installedModels);
 
       // `/api/ps` is newer than `/api/tags`; an older server 404s here, which is a
       // degraded probe and not a failed engine, so it must not read as offline.
@@ -588,7 +722,11 @@ class OllamaManager {
           : "ready";
 
       const detail = state === "pulling"
-        ? `Pulling ${activity?.label ?? "model weights"}…`
+        ? `Pulling ${activity?.label ?? "model weights"}…${
+            this.modelStatus === "pulling" && this.modelPullPercent !== null
+              ? ` ${this.modelPullPercent}%`
+              : ""
+          }`
         : state === "busy"
           ? `Generating — ${activity?.label ?? "inference"}`
           : loadedModels.length > 0
@@ -637,6 +775,7 @@ class OllamaManager {
     // The reconcile chain has no reason to keep polling a server this method is
     // about to take down; `start()` re-arms it when the child comes back.
     this.stopEmbeddingReconcile();
+    this.stopModelReconcile();
     const child = this.child;
     this.child = null;
     if (child && child.exitCode === null) {
@@ -719,6 +858,17 @@ class OllamaManager {
       );
 
       let lastPercent = -1;
+      /*
+        THE STREAM'S OWN ERRORS ARE COLLECTED, NOT SWALLOWED. This used to
+        `resolve()` on `stream.on("error")` and then fall through to
+        `return { ok: true, message: "pulled successfully" }` — so a pull whose
+        connection died was announced to the operator as installed. That is the
+        exact confident-wrong-answer failure this module exists to avoid, and
+        making the command fire-and-forget made it worse: the HTTP response no
+        longer carries the outcome, so the terminal line IS the report.
+      */
+      let streamError: string | null = null;
+      let reportedError: string | null = null;
       await new Promise<void>((resolve) => {
         const stream = response.data as NodeJS.ReadableStream;
         let pending = "";
@@ -738,6 +888,7 @@ class OllamaManager {
                 error?: string;
               };
               if (frame.error) {
+                reportedError = frame.error;
                 publishLine("err", `pull error: ${frame.error}`);
                 continue;
               }
@@ -760,11 +911,20 @@ class OllamaManager {
           if (pending.trim()) publishLine("out", pending.trim());
           resolve();
         });
-        stream.on("error", () => {
+        stream.on("error", (error) => {
+          streamError = error instanceof Error ? error.message : String(error);
           publishLine("err", "the pull stream ended unexpectedly");
           resolve();
         });
       });
+
+      // An error reported INSIDE a 200 stream beats the fact that we reached the
+      // end, and a dead socket beats both.
+      const failure = streamError ?? reportedError;
+      if (failure) {
+        publishLine("err", `pull failed: ${failure}`);
+        return { ok: false, message: failure };
+      }
 
       clearEngineActivity();
       publishLine("out", `✓ ${model} is installed.`);
@@ -1057,18 +1217,185 @@ class OllamaManager {
   private async ensureModelsPulled(): Promise<void> {
     this.scheduleEmbeddingReconcile(0);
     await this.pullEmbeddingModel();
+    await this.pullGenerationModel();
+  }
 
-    const client = new OllamaClient();
+  /**
+   * THE GENERATION MODEL PROVISIONER — the ~4.6 GB pull, never blocking a caller.
+   *
+   * THIS IS THE FIX FOR THE REPORTED FAILURE. The pull used to run through
+   * `OllamaClient.pullModel()` with `stream: false` and a 15-minute axios timeout.
+   * Ollama kept downloading (its own log said `downloading ... in 16 292 MB
+   * part(s)`) while axios gave up, so the operator was shown a timeout error for a
+   * transfer that was working. Three things changed, and all three matter:
+   *
+   *   1. STREAMING. `OllamaClient.pullModel` now requests `stream: true` and reads
+   *      NDJSON progress frames, so the request stays demonstrably alive and real
+   *      byte counts reach the status endpoint instead of nothing at all.
+   *   2. FIRE-AND-FORGET. Callers never await this. The HTTP route returns
+   *      `202 Accepted` and the dashboard polls `/api/ollama/status`, which is why
+   *      a repair no longer holds a browser request open for the length of a
+   *      multi-gigabyte download.
+   *   3. RECONCILING. `/api/tags` is consulted before the pull (so an already
+   *      installed model costs nothing), on a timer while it streams, and after it
+   *      ends — including on the failure path, so a timeout that fires a moment
+   *      after the download actually landed still reports `ready`.
+   *
+   * Never throws: every failure is reported through the returned message, the
+   * terminal, the status field and the overlay, because every caller runs this on
+   * an idle node that must not be able to crash.
+   */
+  async pullGenerationModel(): Promise<{ ok: boolean; message: string }> {
+    const model = this.model;
+    if (this.modelPulling) {
+      return {
+        ok: false,
+        message: `already pulling ${model} — progress is on the Model tile and in the terminal.`,
+      };
+    }
+    // The tag list decides first: an installed model is an instant "ready".
+    if (await this.reconcileGeneration()) {
+      return { ok: true, message: `${model} is already installed.` };
+    }
+
+    this.modelPulling = true;
+    this.modelStatus = "pulling";
+    this.modelError = null;
+    this.modelPullPercent = 0;
+    this.modelPullCompleted = null;
+    this.modelPullTotal = null;
+    publishLine("cmd", `pulling ${model} …`);
+    console.log(`[OllamaManager] Pulling generation model "${model}".`);
+    noteEngineActivity("pulling", model, MODEL_PULL_TIMEOUT_MS);
+    this.stopModelReconcile();
+    this.scheduleModelReconcile(MODEL_RECONCILE_FAST_MS);
+
     try {
-      await client.pullModel(this.model);
+      const client = new OllamaClient();
+      await client.pullModel(model, (frame) => {
+        // Only touch the fields when Ollama actually reported numbers — a
+        // `status`-only frame must not blank out a percentage we already have.
+        if (frame.percent !== null) this.modelPullPercent = frame.percent;
+        if (typeof frame.total === "number") this.modelPullTotal = frame.total;
+        if (typeof frame.completed === "number") this.modelPullCompleted = frame.completed;
+      });
+      this.markModelReady("pull completed");
+      return { ok: true, message: `${model} pulled successfully.` };
+    } catch (error) {
+      // THE TIMEOUT MAY HAVE FIRED A MOMENT AFTER THE PULL ACTUALLY LANDED —
+      // always ask the tag list before declaring failure.
+      if (await this.reconcileGeneration()) {
+        return { ok: true, message: `${model} is installed.` };
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      this.modelStatus = "failed";
+      this.modelError = message;
+      this.modelPullPercent = null;
+      this.modelPullCompleted = null;
+      this.modelPullTotal = null;
+      publishLine("err", `model pull failed: ${message}`);
+      console.warn(`[OllamaManager] Generation model pull failed — ${message}`);
       publishNodeEvent({
         kind: "info",
-        title: "Ollama model ready",
-        detail: `Pulled "${this.model}" (${systemRamGb()}GB RAM detected).`,
+        title: "Model download failed",
+        detail: `${model}: ${message}. Click the Model tile to retry.`,
       });
-    } catch (error) {
-      this.lastError = error instanceof Error ? error.message : String(error);
-      console.warn(`[OllamaManager] Failed to pull "${this.model}" — ${this.lastError}`);
+      // Keep reconciling after a failure — a later successful pull still flips the
+      // tile to `ready` by itself.
+      this.scheduleModelReconcile(EMBEDDING_RECONCILE_SLOW_MS);
+      return { ok: false, message };
+    } finally {
+      this.modelPulling = false;
+      clearEngineActivity();
+    }
+  }
+
+  /**
+   * ASKS `/api/tags` WHETHER THE GENERATION MODEL IS INSTALLED — AND BELIEVES IT.
+   *
+   * The tag list is the source of truth, so a model that landed by ANY path (this
+   * pull, the operator's terminal, a manual `ollama pull`, a failover) flips the
+   * tile to `ready`. Never throws: an unreachable server is simply "not found yet",
+   * because a probe failure during a pull's own error handling must not mask the
+   * real error.
+   */
+  async reconcileGeneration(): Promise<boolean> {
+    if (this.modelStatus === "ready") return true;
+    try {
+      const origin = `http://127.0.0.1:${this.getPort()}`;
+      const tags = await axios.get(`${origin}/api/tags`, { timeout: 3_000, proxy: false });
+      if (!installedModelMatches(readOllamaModels(tags?.data), this.model)) return false;
+      this.markModelReady("found in /api/tags");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Folds a tag list the health probe already holds into the model tile. */
+  private absorbModelInstalled(installed: string[]): void {
+    if (this.modelStatus === "ready") return;
+    if (!installedModelMatches(installed, this.model)) return;
+    this.markModelReady("found in /api/tags");
+  }
+
+  /** Read through a method so awaits cannot narrow `modelStatus` to a literal. */
+  private isModelReady(): boolean {
+    return this.modelStatus === "ready";
+  }
+
+  /**
+   * THE SINGLE TRANSITION INTO `ready` FOR THE GENERATION MODEL.
+   *
+   * Mirrors {@link markEmbeddingReady}: the overlay fires only when the operator
+   * was previously told `pulling` or `failed`, because a routine idle→ready at
+   * boot (model already installed) is not news, and claiming "Pulled …" for a
+   * download that never ran is exactly the confident wrong answer this state
+   * machine exists to prevent.
+   */
+  private markModelReady(source: string): void {
+    const previous = this.modelStatus;
+    if (previous === "ready") return;
+    this.modelStatus = "ready";
+    this.modelError = null;
+    this.modelPullPercent = null;
+    this.modelPullCompleted = null;
+    this.modelPullTotal = null;
+    this.stopModelReconcile();
+    publishLine("out", `✓ ${this.model} is installed (${source}).`);
+    console.log(`[OllamaManager] Generation model "${this.model}" ready — ${source}.`);
+    if (previous === "pulling" || previous === "failed") {
+      publishNodeEvent({
+        kind: "info",
+        title: "Model ready",
+        detail: `Pulled "${this.model}" — local generation is now available.`,
+      });
+    }
+  }
+
+  /**
+   * ORDERS ONE `/api/tags` RECONCILE FOR THE GENERATION MODEL — one pending
+   * timer at a time, exactly like the embedding chain.
+   */
+  private scheduleModelReconcile(delayMs: number): void {
+    if (this.modelReconcileTimer || this.isModelReady()) return;
+    this.modelReconcileTimer = setTimeout(() => {
+      this.modelReconcileTimer = null;
+      void this.reconcileGeneration().then((found) => {
+        if (found || this.isModelReady()) return;
+        this.scheduleModelReconcile(
+          this.modelStatus === "pulling" ? MODEL_RECONCILE_FAST_MS : EMBEDDING_RECONCILE_SLOW_MS,
+        );
+      });
+    }, delayMs);
+    this.modelReconcileTimer.unref?.();
+  }
+
+  /** Cancels a pending model reconcile. Safe when none is scheduled. */
+  private stopModelReconcile(): void {
+    if (this.modelReconcileTimer) {
+      clearTimeout(this.modelReconcileTimer);
+      this.modelReconcileTimer = null;
     }
   }
 
@@ -1076,6 +1403,9 @@ class OllamaManager {
    * SELF-HEAL — the Embedded AI panel's repair routine. Kills a stuck
    * managed child, clears the last-error diagnostic, and relaunches the
    * server, re-pulling both models on the way back up.
+   *
+   * STILL AWAITABLE, AND STILL BLOCKING — see {@link startRepair} for why the HTTP
+   * route no longer calls this directly.
    */
   async selfHeal(): Promise<{ healed: boolean; message: string }> {
     this.lastError = null;
@@ -1092,6 +1422,53 @@ class OllamaManager {
       this.lastError = message;
       return { healed: false, message: `Self-heal failed — ${message}` };
     }
+  }
+
+  /**
+   * STARTS A REPAIR AND RETURNS IMMEDIATELY — what the self-heal route calls.
+   *
+   * WHY THIS EXISTS. The route used to `await selfHeal()`, and `selfHeal()` awaits
+   * `start()`, which can download the ~1.4 GB bundled runtime and then kick off a
+   * ~4.6 GB model pull. The HTTP request therefore stayed open for minutes while
+   * the repair was in fact working, and the browser reported a timeout — the same
+   * "the operation succeeded but the operator saw an error" failure as the pull
+   * itself. A repair is now ACCEPTED, not awaited: this returns immediately, the
+   * work runs in the background, and `repairing`/`repairMessage` on the status
+   * endpoint carry the outcome to the UI.
+   *
+   * A second request while a repair is already running is refused rather than
+   * queued, so a double-click cannot race two restarts against each other.
+   */
+  startRepair(): { accepted: boolean; message: string } {
+    if (this.repairing) {
+      return {
+        accepted: false,
+        message: "A repair is already running — watch the Live Engine Terminal for progress.",
+      };
+    }
+    this.repairing = true;
+    this.repairMessage =
+      "Repair started — restarting the local Ollama server and re-verifying models.";
+    publishLine("cmd", "self-heal: restarting the local Ollama server …");
+
+    void this.selfHeal()
+      .then((result) => {
+        this.repairMessage = result.message;
+        publishLine(result.healed ? "out" : "err", result.message);
+      })
+      .catch((error) => {
+        // `selfHeal` already catches, so this is belt-and-braces: a repair must
+        // never leave `repairing` stuck true and the button disabled forever.
+        this.repairMessage = `Self-heal failed — ${
+          error instanceof Error ? error.message : String(error)
+        }`;
+        publishLine("err", this.repairMessage);
+      })
+      .finally(() => {
+        this.repairing = false;
+      });
+
+    return { accepted: true, message: this.repairMessage };
   }
 
   private scheduleRestart(): void {

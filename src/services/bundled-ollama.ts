@@ -540,6 +540,15 @@ export function bundledOllamaEnv(): NodeJS.ProcessEnv {
     // Resolved, never the bare constant — this is the variable the child binds.
     OLLAMA_HOST: `127.0.0.1:${resolveBundledOllamaPort()}`,
     OLLAMA_NOHISTORY: "1",
+    // CLOUD MODEL ROUTING IS OFF. Recent Ollama builds probe ollama.com on every
+    // `model show` to hydrate a cloud model cache, and on an air-gapped or
+    // firewalled satellite that probe times out and the server logs
+    // `model show cloud cache hydration failed`. It is pure noise here: this node
+    // is deliberately pinned to a LOCAL Ollama with its own models directory and
+    // port (see the isolation notes above), and it must never silently depend on a
+    // remote service being reachable. Setting this keeps the child from making
+    // the request at all, rather than merely hiding the warning.
+    OLLAMA_NO_CLOUD: "1",
   };
 }
 // MARK: - Archive extraction

@@ -69,6 +69,43 @@ const MAX_INPUT_CHARS = 16_000;
 const REQUEST_TIMEOUT_MS = 180_000; // local 7B inference can take a while
 
 /**
+ * CEILING ON ONE MODEL PULL — and why it is measured in hours, not minutes.
+ *
+ * This used to be 15 minutes, applied to a `stream: false` request. That is the
+ * exact pairing that produced the reported failure: `stream: false` makes Ollama
+ * buffer the entire download and answer only when it is finished, so the axios
+ * timeout was a wall-clock limit on a multi-gigabyte transfer. A `qwen2.5-coder:7b`
+ * pull is ~4.6 GB (Ollama reports it as `16 292 MB part(s)`); on any link slower
+ * than ~5 MB/s that cannot finish inside 15 minutes, so axios threw
+ * `timeout of 900000ms exceeded` **while Ollama was still downloading**, the pull
+ * was reported as failed, and the operator saw an error for work that was in fact
+ * progressing. The bytes kept landing with nobody watching.
+ *
+ * The fix is not a bigger number bolted onto a blocking call — it is that the
+ * request now STREAMS. Progress frames arrive continuously, the connection is
+ * demonstrably alive the whole time, and this ceiling only fires on a genuinely
+ * dead socket. Two hours is far longer than any real pull yet still bounded,
+ * because an unbounded pull is how a node ends up wedged forever.
+ */
+const PULL_TIMEOUT_MS = 120 * 60_000;
+
+/** One newline-delimited JSON progress frame from `POST /api/pull`. */
+interface PullProgressFrame {
+  status?: string;
+  digest?: string;
+  total?: number;
+  completed?: number;
+  /**
+   * Ollama reports a FAILED LAYER INSIDE THE STREAM rather than by closing the
+   * connection, so a caller that only watched for `end` would call a broken pull a
+   * success. The pull reads this and treats it as the outcome.
+   */
+  error?: string;
+  /** 0-100 when the frame carried both `completed` and `total`; else null. */
+  percent: number | null;
+}
+
+/**
  * The structured shape of a `verified_knowledge` row, as produced by the LLM.
  * `coordinates` is a "lat, lon" string when the source implies a place,
  * otherwise `null`.
@@ -303,25 +340,104 @@ export class OllamaClient {
    *
    * Used by `ollamaManager.failoverToFallback()` when the primary model
    * fails to load or generate, so the node can recover a usable local model
-   * without operator intervention. Streaming is disabled so this resolves
-   * once the pull genuinely completes rather than mid-download.
+   * without operator intervention.
+   *
+   * WHY THIS STREAMS NOW, AND NOT `stream: false`. With `stream: false` Ollama
+   * buffers the whole download and replies once at the end, so the only thing
+   * the caller can express is "still going" or "gave up" — and it gave up on a
+   * 15-minute timer, which a ~4.6 GB model download beats on any ordinary link.
+   * The result was a pull that Ollama was visibly still performing
+   * (`downloading ... in 16 292 MB part(s)`) being reported to the operator as a
+   * timeout error. Requesting `stream: true` turns the response into a live
+   * sequence of NDJSON progress frames, so the connection proves itself
+   * continuously and `onProgress` can surface real percentages.
+   *
+   * The bound is still there — an unbounded pull would wedge a node forever — but
+   * it is now PULL_TIMEOUT_MS (hours) and only fires on a socket that has genuinely
+   * stopped delivering frames.
+   *
+   * `onProgress` is best-effort and never allowed to throw: a broken callback must
+   * not be able to kill a download that is otherwise working.
    */
-  async pullModel(model: string): Promise<void> {
+  async pullModel(model: string, onProgress?: (frame: PullProgressFrame) => void): Promise<void> {
     const name = model.trim();
     if (!name) throw new Error("pullModel: empty model name");
     // Same reason as inference: a multi-gigabyte download with no amber badge on it
     // looks identical to a hung engine.
-    noteEngineActivity("pulling", name, 30 * 60_000);
+    noteEngineActivity("pulling", name, PULL_TIMEOUT_MS);
+
+    // AbortController rather than an axios `timeout` on a buffered body: this has
+    // to cancel the TRANSFER, not just the wait for it.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PULL_TIMEOUT_MS);
     try {
-      await this.client.post(
+      const response = await this.client.post(
         "/api/pull",
-        { model: name, stream: false },
-        { timeout: 15 * 60_000 }, // a fresh pull can be a large download
+        { model: name, stream: true },
+        {
+          responseType: "stream",
+          // 0 = no client-side wall clock. The AbortController above is the only
+          // deadline, so a slow-but-alive download is never cut off mid-flight.
+          timeout: 0,
+          signal: controller.signal,
+          // Loopback address — an operator with HTTP_PROXY set would otherwise have
+          // the pull answered by the proxy.
+          proxy: false,
+        },
       );
+
+      let sawError: string | null = null;
+      let lastPercent = -1;
+      await new Promise<void>((resolve, reject) => {
+        const stream = response.data as NodeJS.ReadableStream;
+        let pending = "";
+        stream.setEncoding?.("utf8");
+        stream.on("data", (chunk: string | Buffer) => {
+          pending += String(chunk);
+          const parts = pending.split(/\r?\n/);
+          // The final element is whatever came after the last newline: incomplete.
+          pending = parts.pop() ?? "";
+          for (const part of parts) {
+            if (!part.trim()) continue;
+            try {
+              const parsed = JSON.parse(part) as Omit<PullProgressFrame, "percent">;
+              const percent =
+                typeof parsed.total === "number" && parsed.total > 0
+                  ? Math.floor(((parsed.completed ?? 0) / parsed.total) * 100)
+                  : null;
+              // Ollama reports a failed layer inside the stream rather than by
+              // closing it, so this is the only place that error can be caught.
+              if (parsed.error) sawError = parsed.error;
+              if (percent !== null && percent !== lastPercent) {
+                lastPercent = percent;
+                publishLine("out", `${parsed.status ?? "downloading"} ${percent}%`);
+              }
+              try {
+                onProgress?.({ ...parsed, percent });
+              } catch {
+                /* a broken observer must not kill the download */
+              }
+            } catch {
+              publishLine("out", part);
+            }
+          }
+        });
+        stream.on("end", () => {
+          if (pending.trim()) publishLine("out", pending.trim());
+          resolve();
+        });
+        stream.on("error", reject);
+      });
+
+      // The stream can close "successfully" around a failure, so the error frames
+      // collected above win over the fact that we reached the end.
+      if (sawError) throw new Error(sawError);
+
       this.resolvedModel = name;
-      console.log(`[Ollama] Pulled and pinned fallback model "${name}".`);
+      console.log(`[Ollama] Pulled and pinned model "${name}".`);
       publishLine("out", `pulled ${name} (background)`);
     } finally {
+      clearTimeout(timer);
       clearEngineActivity();
     }
   }

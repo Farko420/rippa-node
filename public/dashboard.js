@@ -1495,6 +1495,8 @@ let ollamaUnlocked = false;
 let ollamaManagedState = false;
 /** True only while the Embedding Model tile last reported a FAILED pull — arms the retry click. */
 let ollamaEmbedFailed = false;
+/** True only while the generation Model tile last reported a FAILED pull. */
+let ollamaModelFailed = false;
 
 /** Paints a shared status badge (Active / Error / Downloading / Idle). */
 function setStatusBadge(id, state) {
@@ -1539,6 +1541,70 @@ function renderEmbeddingTile(status) {
   }
 }
 
+/**
+ * GENERATION MODEL TILE — "Downloading Model…" instead of a timeout error.
+ *
+ * This is the UI half of the fix for a ~4.6 GB pull that used to be reported to
+ * the operator as a failed request. The server owns the state machine
+ * (`modelStatus` / `modelPullPercent` on /api/ollama/status, backed by a streaming
+ * `/api/pull` and a periodic reconcile against GET /api/tags):
+ *   ready   -> installed, confirmed against the tag list
+ *   pulling -> the stream is open; the live percentage comes from the same poll
+ *   failed  -> the pull errored; clicking the tile retries it (202, not a wait)
+ *   idle    -> before the first attempt
+ *
+ * While a pull is running this is also what keeps the Self-Heal button's promise
+ * honest: the repair returns 202 immediately, so the only thing that tells the
+ * operator it is working is this tile.
+ */
+function renderModelTile(status) {
+  const tile = $("ollamaModelState");
+  const state = status.modelStatus || (status.modelReady ? "ready" : "idle");
+  ollamaModelFailed = state === "failed";
+  if (!tile) return;
+  const name = status.model || "the model";
+  if (state === "ready") {
+    setText("ollamaModelState", "installed");
+    tile.style.cursor = "";
+    tile.title = name + " is installed on this node.";
+  } else if (state === "pulling") {
+    const pct = typeof status.modelPullPercent === "number" ? " " + status.modelPullPercent + "%" : "";
+    setText("ollamaModelState", "Downloading…" + pct);
+    tile.style.cursor = "";
+    tile.title =
+      "Downloading " + name + " — this is a multi-gigabyte transfer. Progress also " +
+      "streams into the Live Engine Terminal; the node keeps working while it runs.";
+  } else if (state === "failed") {
+    setText("ollamaModelState", "failed (click to retry)");
+    tile.style.cursor = "pointer";
+    tile.title =
+      "The model download failed" +
+      (status.modelError ? " — " + status.modelError : "") +
+      ". Click to retry.";
+  } else {
+    setText("ollamaModelState", "not installed");
+    tile.style.cursor = "";
+    tile.title = name + " has not been downloaded to this node yet.";
+  }
+}
+
+/** Shows the background-repair line after a 202 from the self-heal route. */
+function renderRepairLine(status) {
+  const box = $("ollamaRepair");
+  if (!box) return;
+  if (status.repairing) {
+    box.textContent =
+      "Repair in progress — the server is restarting and models are being re-verified. " +
+      "This can take several minutes on a large download; progress is in the Live Engine Terminal.";
+    box.hidden = false;
+  } else if (status.repairMessage) {
+    box.textContent = status.repairMessage;
+    box.hidden = false;
+  } else {
+    box.hidden = true;
+  }
+}
+
 function renderOllamaStatus(status) {
   if (!status) return;
   ollamaManagedState = Boolean(status.managed);
@@ -1550,6 +1616,8 @@ function renderOllamaStatus(status) {
   setText("ollamaRestarts", String(status.restartCount || 0));
   setText("ollamaRam", status.ramGb ? status.ramGb + " GB" : "—");
   renderEmbeddingTile(status);
+  renderModelTile(status);
+  renderRepairLine(status);
   setStatusBadge(
     "ollamaStatusBadge",
     status.lastError ? "error" : status.running ? "active" : status.managed ? "downloading" : "idle",
@@ -1661,25 +1729,91 @@ if (ollamaRestartBtn) {
   });
 }
 
-/** Wires a generic Self-Heal button: POSTs to `path`, shows the result, refreshes `after`. */
-function wireSelfHeal(btnId, path, after) {
+/**
+ * Wires a generic Self-Heal button: POSTs to `path`, shows the result, refreshes `after`.
+ *
+ * HANDLES A 202 MEANING "ACCEPTED, RUNNING IN THE BACKGROUND". The Ollama route
+ * answers 202 immediately instead of blocking on a multi-gigabyte model download,
+ * so the button must not sit disabled waiting for a reply that is never coming: it
+ * hands off to the status poll, which reports `repairing` until the work finishes.
+ * Treating 202 as an ordinary success and re-enabling instantly would leave an
+ * operator free to fire a second repair into the one already running.
+ */
+function wireSelfHeal(btnId, path, after, opts) {
   const btn = $(btnId);
   if (!btn) return;
+  const options = opts || {};
+  const original = btn.textContent;
   btn.addEventListener("click", async () => {
     btn.disabled = true;
-    const original = btn.textContent;
     btn.textContent = "🩹 Healing…";
+    let handedOff = false;
     try {
       const { response, data } = await api(path, { method: "POST", body: "{}" });
-      showAlert(data.message || (response.ok ? "Self-heal complete." : "Self-heal failed."), response.ok ? "ok" : "err");
+      if (response.status === 202 || data.repairing === true) {
+        // ACCEPTED, NOT FINISHED. `repairing` on the status poll is what tracks it
+        // from here, so the button stays disabled until the repair genuinely ends.
+        showAlert(data.message || "Repair started — progress is in the Live Engine Terminal.", "ok");
+        handedOff = true;
+        watchRepair(btn, original, after, options.pollStatus);
+        return;
+      }
+      showAlert(
+        data.message || (response.ok ? "Self-heal complete." : "Self-heal failed."),
+        response.ok ? "ok" : "err",
+      );
     } catch (err) {
       showAlert("Self-heal request failed.", "err");
     } finally {
+      if (!handedOff) {
+        btn.disabled = false;
+        btn.textContent = original;
+        if (after) void after();
+      }
+    }
+  });
+}
+
+/**
+ * POLLS THE STATUS ENDPOINT UNTIL AN ACCEPTED REPAIR SETTLES.
+ *
+ * `pollStatus` is the URL to read (the Ollama panel polls /api/ollama/status,
+ * which carries `repairing`). The loop is bounded so a node that dies mid-repair
+ * cannot leave the button stuck disabled forever — the operator gets the button
+ * back and a last-known message either way.
+ */
+function watchRepair(btn, original, after, pollStatus) {
+  if (!pollStatus) {
+    btn.disabled = false;
+    btn.textContent = original;
+    if (after) void after();
+    return;
+  }
+  let ticks = 0;
+  const timer = setInterval(async () => {
+    ticks += 1;
+    if (ticks > 120) {
+      clearInterval(timer);
       btn.disabled = false;
       btn.textContent = original;
       if (after) void after();
+      return;
     }
-  });
+    try {
+      const { response, data } = await api(pollStatus);
+      if (response.ok && data.repairing === true) {
+        btn.textContent = "🩹 Repairing…";
+        return;
+      }
+      clearInterval(timer);
+      btn.disabled = false;
+      btn.textContent = original;
+      if (data.repairMessage) showAlert(data.repairMessage, "ok");
+      if (after) void after();
+    } catch (err) {
+      /* a transient poll failure must not abandon the watch */
+    }
+  }, 3000);
 }
 
 // CLICK-TO-RETRY for the Embedding Model tile. Armed ONLY while the last poll
@@ -1701,7 +1835,32 @@ if (ollamaEmbedTile) {
   });
 }
 
-wireSelfHeal("ollamaSelfHeal", "/api/ollama/self-heal", refreshOllama);
+// CLICK-TO-RETRY for the GENERATION Model tile. Armed ONLY while the last poll
+// reported a failed download, so a stray click on a healthy or in-progress tile
+// does nothing. The route answers 202 immediately — the ~4.6 GB transfer must
+// never be something the browser waits on — and the 5s poll picks up the
+// pulling -> ready/failed transition while progress lands in the terminal.
+const ollamaModelTile = $("ollamaModelState");
+if (ollamaModelTile) {
+  ollamaModelTile.addEventListener("click", async () => {
+    if (!ollamaModelFailed) return;
+    ollamaModelFailed = false;
+    try {
+      const { data } = await api("/api/ollama/model-pull", { method: "POST", body: "{}" });
+      showAlert(data.message || "Downloading Model… — watch the terminal for progress.", "ok");
+    } catch (err) {
+      showAlert("Could not start the model download.", "err");
+    }
+    void refreshOllama();
+  });
+}
+
+// The Ollama repair is the one that answers 202, so it is the one that needs a
+// status endpoint to watch. The scraper and mesh routes still return a plain
+// 200/500 for their (fast) repairs and keep the original behaviour.
+wireSelfHeal("ollamaSelfHeal", "/api/ollama/self-heal", refreshOllama, {
+  pollStatus: "/api/ollama/status",
+});
 wireSelfHeal("scraperSelfHeal", "/api/scraper/self-heal", () => refreshScraper());
 wireSelfHeal("meshSelfHeal", "/api/mesh/self-heal", () => refreshMesh());
 

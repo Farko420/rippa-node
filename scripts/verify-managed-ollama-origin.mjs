@@ -46,7 +46,25 @@ import http from "node:http";
   A reverted fix therefore fails to connect to a port with no listener — a louder
   and more honest failure than a boolean mismatch.
 */
-const MANAGED_PORT = 11435;
+/*
+  THE REAL MANAGED PORT BY DEFAULT — and overridable only when it is genuinely
+  occupied, which is a state a developer's machine reaches routinely.
+
+  WHY IT IS NOT AN EPHEMERAL PORT. Binding a random free port would let this
+  suite pass while asserting about a number no production node will ever use,
+  so the whole test would stop meaning anything. 11435 is the port under test.
+
+  WHY THE OVERRIDE EXISTS ANYWAY. `verify-managed-ollama-origin.mjs` was the only
+  suite that could not run on a machine with the product actually running: the
+  managed `ollama.exe` supervises and RESPAWNS itself, so killing it is not an
+  option and the bind died with EADDRINUSE every time. `resolveBundledOllamaPort()`
+  reads `RIPPA_BUNDLED_OLLAMA_PORT` at call time precisely so a real port can be
+  moved; this suite now sets that same variable rather than a second mechanism.
+
+  It stays a Loud failure by default — an occupied 11435 with no override is
+  still an error, not a silently-skipped test. The escape hatch is explicit.
+*/
+const MANAGED_PORT = Number(process.env.RIPPA_BUNDLED_OLLAMA_PORT) || 11435;
 
 const fake = http.createServer((req, res) => {
   if (req.url === "/api/tags") {

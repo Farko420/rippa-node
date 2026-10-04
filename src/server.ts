@@ -1481,9 +1481,28 @@ export function createApp(): Express {
     repair routine (kill stuck processes, clear caches, restart local
     servers) and reports whether the feature is back to 100% functionality.
   */
-  app.post("/api/ollama/self-heal", requireDashboardAuth, async (_req: Request, res: Response) => {
-    const result = await ollamaManager.selfHeal();
-    res.status(result.healed ? 200 : 500).json({ success: result.healed, message: result.message });
+  /*
+    THE OLLAMA ONE RETURNS 202 AND DOES NOT WAIT — this is the fix for the
+    reported "repair throws a timeout error".
+
+    It used to `await ollamaManager.selfHeal()`. That call awaits `start()`,
+    which can download the ~1.4 GB bundled runtime and then kick off a ~4.6 GB
+    model pull, so the HTTP request stayed open for minutes while the repair was
+    in fact succeeding. The browser gave up first and the operator saw a timeout
+    for work that was genuinely in progress.
+
+    `startRepair()` returns immediately and the work runs in the background;
+    `repairing`/`repairMessage` on GET /api/ollama/status carry the outcome, and
+    the dashboard polls that. 409 means a repair is already running (a
+    double-click), which is a conflict rather than an acceptance.
+  */
+  app.post("/api/ollama/self-heal", requireDashboardAuth, (_req: Request, res: Response) => {
+    const outcome = ollamaManager.startRepair();
+    res.status(outcome.accepted ? 202 : 409).json({
+      success: outcome.accepted,
+      message: outcome.message,
+      repairing: outcome.accepted,
+    });
   });
 
   /*
@@ -1494,7 +1513,7 @@ export function createApp(): Express {
     already performs on its own at boot; the tile only offers a retry AFTER that
     operation failed, so gating it behind the unlock would make the button
     decorative on a node in full autonomic control (the same reasoning as the
-    self-heal route below).
+    generation-model route below).
 
     The response returns immediately either way: an already-installed model is
     reconciled against `/api/tags` synchronously (fast), while a real pull runs
@@ -1510,6 +1529,41 @@ export function createApp(): Express {
     res.json({
       success: true,
       message: "Pulling the embedding model — progress streams into the Live Engine Terminal.",
+    });
+  });
+
+  /*
+    RETRY FOR THE GENERATION MODEL TILE — the same action for the ~4.6 GB pull.
+
+    This is the route an operator reaches after the reported failure, so it has to
+    carry the two guarantees the old synchronous path could not:
+
+      1. IT RETURNS `202 Accepted` IMMEDIATELY. Only the "already installed?" check
+         is awaited, and that is a single fast `/api/tags` round-trip. The pull
+         itself is fire-and-forget, so a repair click can never turn into a browser
+         timeout on a multi-gigabyte download.
+      2. IT IS NOT PADLOCKED. Same reasoning as the embedding route: this is the
+         autonomic operation the node already performs at boot, offered again after
+         it failed. Gating it would make the button decorative on a node in full
+         autonomic control.
+
+    The Model tile and its progress read from `modelStatus` / `modelPullPercent` on
+    GET /api/ollama/status, so the operator watches the transfer instead of a
+    spinner.
+  */
+  app.post("/api/ollama/model-pull", requireDashboardAuth, async (_req: Request, res: Response) => {
+    if (await ollamaManager.reconcileGeneration()) {
+      res.status(200).json({
+        success: true,
+        message: "The model is already installed — ready.",
+        alreadyInstalled: true,
+      });
+      return;
+    }
+    void ollamaManager.pullGenerationModel();
+    res.status(202).json({
+      success: true,
+      message: "Downloading Model… — progress streams into the Live Engine Terminal.",
     });
   });
 
