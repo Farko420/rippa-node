@@ -1353,13 +1353,29 @@ const FALLBACK_APK_VERSION: string =
 /**
  * The Mothership routes this is tried against, in order.
  *
- * Two paths because the endpoint was specified under both names and a node must
- * not care which one its Mothership happens to expose: a 404 falls through to the
- * next, and the first route that answers wins. Once a route has answered, it is
- * remembered for the life of the process so every later check costs one request
- * rather than two.
+ * THREE PATHS, AND THE FIRST ONE IS THE POINT.
+ *
+ * `/api/node/latest-apk` is the route that actually breaks the `1.0.19`
+ * fallback deadlock. It is served straight from the deployment's APK variables,
+ * makes no GitHub call, and reports its version purely as a label — so a forced
+ * check can install the published APK even when the advertised number is behind
+ * the device. It is tried first for exactly that reason.
+ *
+ * The other two are the historical spellings of the release feed. They resolve
+ * through GitHub, and on a private repo that lookup 404s on every poll and the
+ * hard-coded fallback answers instead — which is how the fleet came to believe
+ * `1.0.19` was current. They are kept only as a fallback for a Mothership that
+ * has not shipped the APK route yet.
+ *
+ * A 404 falls through to the next, and the first route that answers wins. Once
+ * a route has answered it is remembered for the life of the process, so every
+ * later check costs one request rather than three.
  */
-const UPDATE_ENDPOINTS = ["/api/node/latest-version", "/api/node/apk-version"];
+const UPDATE_ENDPOINTS = [
+  "/api/node/latest-apk",
+  "/api/node/latest-version",
+  "/api/node/apk-version",
+];
 
 /** What the dashboard renders. `state` is the only field it branches on. */
 export interface UpdateCheck {
@@ -1381,6 +1397,13 @@ export interface UpdateCheck {
 
 /** In-flight check, so a manual re-check cannot stack on top of the timer. */
 let updateCheckInFlight: Promise<UpdateCheck> | null = null;
+/**
+ * Whether that in-flight check was a FORCED one.
+ *
+ * Kept beside the promise so a forced caller is never handed a conservative
+ * background answer (and vice versa) — see the note in `checkForUpdate`.
+ */
+let updateCheckInFlightForce = false;
 /** The route that answered last time, so we stop paying for a 404 every 15 minutes. */
 let updateEndpoint: string | null = null;
 
@@ -1484,16 +1507,30 @@ function resolveDownloadUrl(url: string): string {
  * normally public, and a node whose key was revoked should still be told there is
  * a build that fixes the problem, rather than being left on the broken one.
  */
-export async function checkForUpdate(): Promise<UpdateCheck> {
-  if (updateCheckInFlight) return updateCheckInFlight;
-  updateCheckInFlight = runUpdateCheck().finally(() => {
+export async function checkForUpdate(options: { force?: boolean } = {}): Promise<UpdateCheck> {
+  /*
+    THE IN-FLIGHT GUARD IS KEYED ON `force`, NOT JUST SHARED.
+
+    Two callers with different intent must not share one answer. The 15-minute
+    background poll wants the conservative "is there genuinely a newer build?"
+    verdict, while a manual "Check for Updates" tap wants "give me the APK the
+    Mothership publishes". Sharing a single promise meant a manual tap landing
+    while the background poll was in flight silently inherited the poll's
+    conservative result — and that is exactly how the 1.0.19 fallback kept
+    telling a 1.0.27 tablet "you are on the latest build".
+  */
+  const force = options.force === true;
+  if (updateCheckInFlight && updateCheckInFlightForce === force) return updateCheckInFlight;
+  updateCheckInFlightForce = force;
+  updateCheckInFlight = runUpdateCheck(force).finally(() => {
     updateCheckInFlight = null;
+    updateCheckInFlightForce = false;
   });
   return updateCheckInFlight;
 }
 
 /** The body of {@link checkForUpdate}, split out so the in-flight guard stays readable. */
-async function runUpdateCheck(): Promise<UpdateCheck> {
+async function runUpdateCheck(force: boolean): Promise<UpdateCheck> {
   /*
     LOAD THE STORED CONFIG FIRST, EVERY TIME.
 
@@ -1548,7 +1585,28 @@ async function runUpdateCheck(): Promise<UpdateCheck> {
       }
 
       updateEndpoint = route; // stop paying for the 404 on every future check
-      if (!isVersionNewer(release.version, currentVersion)) {
+
+      /*
+        THE `1.0.19` FALLBACK TRAP, AND WHY A FORCED CHECK BYPASSES THIS GATE.
+
+        The Mothership's release endpoint falls back to a hard-coded version when
+        its GitHub lookup fails, and the release repo is PRIVATE — so the lookup
+        fails on every poll and the fallback became the normal production answer.
+        Left behind at 1.0.19 while the fleet ran 1.0.27, that constant meant a
+        tablet asked "is 1.0.19 newer than 1.0.27?" is told no, and reported
+        "This device is on the latest build (v1.0.19)" — a statement that is
+        self-contradictory on its face and left the operator unable to update.
+
+        The conservative comparison below stays CORRECT for the background poll:
+        it is what stops a stale fallback from forcing a reinstall every 15
+        minutes. But an explicit human tap on "Check for Updates" is a different
+        instruction. The operator is not asking "is there newer?" — they are
+        asking "show me the build you publish", and the Mothership's download URL
+        is authoritative regardless of the version number attached to it. So a
+        forced check offers the APK whenever a usable URL came back, and the
+        `state: "current"` branch is only reached when there is nothing to offer.
+      */
+      if (!force && !isVersionNewer(release.version, currentVersion)) {
         return { ...blank, state: "current", remoteVersion: release.version, notes: release.notes };
       }
 

@@ -348,22 +348,6 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
 
     The button is NOT disabled while hidden, because the whole card is hidden with
     it; everything about the update state lives in renderUpdate() and the
-<!--
-    THE MANUAL UPDATE CHECK.
-
-    The prompt above is automatic and only appears when the build is stale. This
-    is the button the operator presses when they want to KNOW, rather than being
-    told — because "is this tablet on last week's bug fix?" is a question a node
-    on a desk can never answer by looking at the notification shade.
-  -->
-  <div class="ota">
-    <div class="ota-head">
-      <h2>App Updates</h2>
-      <span class="badge" id="otaVersion">&mdash;</span>
-    </div>
-    <button class="btn ghost small" id="otaCheck" type="button">Check for Updates</button>
-    <div class="ota-status" id="otaStatus">Installed build unknown until checked.</div>
-  </div>
     rippa-update CustomEvent handler below.
 
     NOTE: this whole document is inside a JS template literal in the packager, so
@@ -372,6 +356,24 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
     sentence had to be worded twice: the obvious way to write it says the thing it
     is warning about.)
   -->
+
+  <!--
+    THE MANUAL UPDATE CHECK.
+
+    The prompt above is automatic and only appears when the build is stale. This
+    is the button the operator presses when they want to KNOW, rather than being
+    told — because "is this tablet on last week's bug fix?" is a question a node
+    on a desk can never answer by looking at the notification shade.
+  -->
+
+  <div class="ota">
+    <div class="ota-head">
+      <h2>App Updates</h2>
+      <span class="badge" id="otaVersion">&mdash;</span>
+    </div>
+    <button class="btn ghost small" id="otaCheck" type="button">Check for Updates</button>
+    <div class="ota-status" id="otaStatus">Installed build unknown until checked.</div>
+  </div>
   <div class="update" id="updateCard" hidden>
     <div class="update-head">
       <h2 id="updateTitle">Update Available</h2>
@@ -793,9 +795,22 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
     }
     if (check.state === 'current') {
       if (otaStatus) {
-        otaStatus.textContent = 'This device is on the latest build' +
-          (check.remoteVersion ? ' (v' + check.remoteVersion + ')' : '') + '.';
-        otaStatus.style.color = 'var(--ok)';
+        /*
+           Report the INSTALLED build, not the one the Mothership advertises.
+
+           The advertised number is routinely STALE here: the release repo is
+           private, so the feed's GitHub lookup 404s on every poll and it falls
+           back to a hard-coded version that has been left behind. Echoing it
+           produced the self-contradictory 'This device is on the latest build
+           (v1.0.19)' on a device running 1.0.27 — an operator reading that has
+           no way to tell an up-to-date device from a poisoned feed.
+        */
+        otaStatus.textContent = 'This device is running v' + installed +
+          (check.remoteVersion && check.remoteVersion !== installed
+            ? '. The Mothership advertises v' + check.remoteVersion +', which' +
+              ' may be behind the release feed.'
+            : ', which is the latest published build.');
+        otaStatus.style.color = 'var(--warn)';
       }
       return;
     }
@@ -821,7 +836,20 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
       }
       // Never throws by contract, but the catch keeps a bug in the worker from
       // leaving the button permanently disabled.
-      W.checkForUpdate().then(renderOta).catch(function (error) {
+      /*
+         `force: true` — AN EXPLICIT TAP OVERRIDES THE VERSION GATE.
+
+         The feed's advertised version is unreliable (see above), and comparing it
+         against this device is what produced the permanent 'you are on the latest
+         build (v1.0.19)' dead end. An operator pressing this button is asking for
+         the APK the Mothership publishes, so the download is offered whenever a
+         usable URL comes back — the background poll still applies the comparison.
+      */
+      W.checkForUpdate({ force: true }).then(function (check) {
+        // Raise the install banner too, or the tap only reports and never acts.
+        renderUpdate(check);
+        renderOta(check);
+      }).catch(function (error) {
         if (otaStatus) {
           otaStatus.textContent = 'Update check failed: ' + error;
           otaStatus.style.color = 'var(--bad)';

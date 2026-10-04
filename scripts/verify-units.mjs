@@ -374,13 +374,34 @@ const script = fsSwap.readFileSync(scriptPath, "utf8");
 
 check("the swap script is named update.bat", pathSwap.basename(scriptPath) === "update.bat");
 check("the update is staged as temp_update.exe", pathSwap.basename(stagedExe) === "temp_update.exe");
-check("the script waits 3 seconds for the image lock", /timeout \/t 3 /.test(script));
+/*
+  The settle-time must work with `stdio: "ignore"`, which is how the node spawns
+  it. `timeout` refuses to run when its input is redirected and answers "ERROR:
+  Input redirection is not supported" rather than waiting, so the intended delay
+  silently became a no-op and the copy raced the image lock. A loopback ping
+  always burns the delay, and it is what the script uses.
+*/
+check("the script waits 3 seconds for the image lock", /ping -n 4 127\.0\.0\.1/.test(script));
 check("it overwrites the running exe in place", /copy \/y .*rippa-node\.exe/.test(script));
 check("it does NOT delete the exe before copying (no brick path)", !/^\s*del .*rippa-node\.exe/im.test(script));
 check("it retries the copy while the target is missing", /goto :rippa_copy/.test(script));
 check("it relaunches the executable afterwards", /start "" "C:.*rippa-node\.exe"/.test(script));
 check("it removes the staged download afterwards", /del \/f \/q .*temp_update\.exe/.test(script));
 check("it deletes itself last", /%~f0/.test(script));
+
+/*
+  THE TWO BUGS THAT MADE A .EXE NODE FREEZE ON THE UPDATE SCREEN. Both are
+  asserted on the generated text; `scripts/verify-ota-handoff.mjs` then proves the
+  behaviour by EXECUTING the script against a genuinely locked executable.
+*/
+check(
+  "the copy is judged by its exit code, not by `if exist` (which is always true)",
+  /if not errorlevel 1/.test(script) && !/if exist ".*rippa-node\.exe"/.test(script),
+);
+check(
+  "a failed swap keeps the staged download for the watchdog",
+  /RIPPA_SWAPPED% EQU 1 del/.test(script),
+);
 
 // A node launched with a config path must come back pointed at the same config.
 const originalArgv = process.argv;

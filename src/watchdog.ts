@@ -16,6 +16,7 @@ import { type GhostConfig, waitForStartCommand } from "./update/ghostMode";
 import {
   HANDOFF_STAMP,
   TEMP_UPDATE_FILE,
+  WATCHDOG_LOCK_FILE,
   installDir,
   releaseHandoffClaim,
   stagingDir,
@@ -167,7 +168,7 @@ function log(message: string): void {
  * after the next reboot — the exact failure this daemon exists to prevent.
  */
 function acquireSingletonLock(): boolean {
-  const lockFile = path.join(stagingDir(), "watchdog.lock");
+  const lockFile = path.join(stagingDir(), WATCHDOG_LOCK_FILE);
   try {
     if (fs.existsSync(lockFile)) {
       const owner = Number.parseInt(fs.readFileSync(lockFile, "utf8").trim(), 10);
@@ -194,7 +195,7 @@ function acquireSingletonLock(): boolean {
 
 function releaseSingletonLock(): void {
   try {
-    fs.rmSync(path.join(stagingDir(), "watchdog.lock"), { force: true });
+    fs.rmSync(path.join(stagingDir(), WATCHDOG_LOCK_FILE), { force: true });
   } catch {
     /* nothing to clean up */
   }
@@ -886,7 +887,7 @@ function reportStatus(nodeExe: string): void {
   const stage = stagingDir();
   try {
     const owner = Number.parseInt(
-      fs.readFileSync(path.join(stage, "watchdog.lock"), "utf8").trim(),
+      fs.readFileSync(path.join(stage, WATCHDOG_LOCK_FILE), "utf8").trim(),
       10,
     );
     console.log(
@@ -895,7 +896,7 @@ function reportStatus(nodeExe: string): void {
   } catch {
     console.log("running:   no");
   }
-  console.log(`lock file: ${path.join(stage, "watchdog.lock")}`);
+  console.log(`lock file: ${path.join(stage, WATCHDOG_LOCK_FILE)}`);
   console.log(`log:       ${path.join(stage, "watchdog.log")}`);
 }
 

@@ -46,10 +46,25 @@ export const HANDOFF_SCRIPT = "update.bat";
 export const HANDOFF_SCRIPT_POSIX = "update.sh";
 /** Marks that this process has already committed to a handoff. */
 export const HANDOFF_STAMP = ".ota-handoff";
+/**
+ * The watchdog's singleton lock, holding the supervising PID.
+ *
+ * Shared as a constant because the node reads it to decide whether its supervisor
+ * is still alive ({@link watchdogIsAlive}) and the watchdog writes it. Two literals
+ * that must agree are two ways to silently disagree.
+ */
+export const WATCHDOG_LOCK_FILE = "watchdog.lock";
 /** Windows keeps the mapped image locked briefly; the script waits this long. */
 export const HANDOFF_DELAY_SECONDS = 3;
-/** Bounded retries for the overwrite, in case the lock outlives the first wait. */
-const HANDOFF_COPY_ATTEMPTS = 10;
+/**
+ * Bounded retries for the overwrite, in case the lock outlives the first wait.
+ *
+ * Exported because the handoff verification harness has to size its external
+ * file lock to outlast the WHOLE retry budget — a lock that releases halfway
+ * through would let a later attempt succeed and quietly turn the "locked target"
+ * scenario into the happy path, proving nothing.
+ */
+export const HANDOFF_COPY_ATTEMPTS = 10;
 
 /** True when this process is a packaged .exe — the only self-replaceable case. */
 export function isPackagedExe(): boolean {
@@ -148,6 +163,28 @@ function sanitizeBatchArg(value: string): string {
 /**
  * Generates the Windows swap script.
  *
+ * THE COPY IS GATED ON ITS EXIT CODE, NOT ON `if exist`. This is the whole fix
+ * for "the node freezes on the update screen until someone restarts it by hand".
+ *
+ * The previous version decided the copy had worked with `if exist "<exe>"` —
+ * but the target executable ALWAYS exists: it is the build currently running,
+ * which is precisely the file we are trying to replace. So that test answered
+ * "yes" whether the `copy` succeeded or was refused with "Access is denied"
+ * (sharing violation against the mapped image), which made the retry loop
+ * unreachable dead code. The consequences were both fatal:
+ *
+ *   - the copy was attempted exactly ONCE, ~3s after exit, which is often
+ *     before Windows has released the image lock, so the update silently never
+ *     applied and the node came straight back up on the old build; and
+ *   - the script then fell through to cleanup and DELETED the staged download,
+ *     so the watchdog's `applyPendingStagedUpdate` recovery path had nothing
+ *     left to find. The update was gone and the operator had nothing to retry.
+ *
+ * `copy` returns 0 on success and non-zero on failure, so `if not errorlevel 1`
+ * is the only test that can actually tell the two apart. Success is now gated
+ * on that, the loop really retries while the lock is held, and a total failure
+ * keeps the staged file for the watchdog to apply on the next boot.
+ *
  * The failure path matters as much as the success path: if every copy attempt is
  * refused (a stubborn lock, a read-only install folder) the ORIGINAL executable
  * is still sitting there untouched, so the script relaunches that rather than
@@ -164,22 +201,46 @@ function buildWindowsScript(updatePath: string, targetExe: string): string {
     "rem executable in place, then relaunches it with the original arguments.",
     "setlocal",
     `cd /d "${sanitizeBatchArg(process.cwd())}"`,
-    `timeout /t ${HANDOFF_DELAY_SECONDS} /nobreak > NUL`,
+    /*
+      `ping -n N 127.0.0.1` rather than `timeout /t N`.
+
+      `timeout` refuses to run when its input is redirected and answers "ERROR:
+      Input redirection is not supported" instead of waiting — and this script is
+      launched with `stdio: "ignore"`, so its stdin is not a console. Depending on
+      the host that makes the intended settle-time a no-op. A loopback ping is the
+      conventional, dependency-free way to burn exactly N-1 seconds with no
+      console attached, and it is already used for the inter-attempt delay below.
+    */
+    `ping -n ${HANDOFF_DELAY_SECONDS + 1} 127.0.0.1 > NUL`,
     "set /a RIPPA_ATTEMPT=0",
+    "set /a RIPPA_SWAPPED=0",
     ":rippa_copy",
     "set /a RIPPA_ATTEMPT+=1",
     // In-place overwrite. The previous build survives a failure untouched.
     `copy /y "${update}" "${exe}" > NUL 2>&1`,
-    `if exist "${exe}" goto :rippa_launch`,
-    `if %RIPPA_ATTEMPT% GEQ ${HANDOFF_COPY_ATTEMPTS} goto :rippa_cleanup`,
+    // THE SUCCESS GATE — see the note above on why this must be `errorlevel`.
+    "if not errorlevel 1 goto :rippa_done",
+    `if %RIPPA_ATTEMPT% GEQ ${HANDOFF_COPY_ATTEMPTS} goto :rippa_launch`,
+    // Hold the loop for ~1s between attempts while Windows releases the lock.
     "ping -n 2 127.0.0.1 > NUL",
     "goto :rippa_copy",
+    ":rippa_done",
+    "set /a RIPPA_SWAPPED=1",
     ":rippa_launch",
     // Reached on success AND on total failure; in the latter case this simply
     // brings the previous, still-working build back up.
     `start "" "${exe}"${suffix}`,
     ":rippa_cleanup",
-    `del /f /q "${update}" > NUL 2>&1`,
+    /*
+      Only discard the staged download when the swap actually landed.
+
+      Deleting it after a failed copy threw away the only copy of the update and
+      left the watchdog's interrupted-update recovery with nothing to apply — the
+      node silently reverted to the old build and the operator was told to restart
+      it by hand. If RIPPA_SWAPPED is still 0 the file stays exactly where it is,
+      and `applyPendingStagedUpdate` finishes the job before the next boot.
+    */
+    `if %RIPPA_SWAPPED% EQU 1 del /f /q "${update}" > NUL 2>&1`,
     // Self-delete through a short-lived child: a bare `del "%~f0"` makes cmd
     // report "batch file cannot be found" as it reads past its own deleted file.
     'start "" /b cmd /c "timeout /t 1 /nobreak > NUL & del ""%~f0"""',
@@ -196,17 +257,93 @@ function buildPosixScript(updatePath: string, targetExe: string): string {
     "# it with the original arguments.",
     `cd "${dir}" || exit 1`,
     `sleep ${HANDOFF_DELAY_SECONDS}`,
-    // `cp` over the target rather than `mv`: a failed overwrite must leave the
-    // working build in place, matching the Windows behaviour above.
-    `cp -f "${updatePath}" "${targetExe}" || exit 1`,
-    `chmod +x "${targetExe}"`,
+    /*
+      `cp` over the target rather than `mv`: a failed overwrite must leave the
+      working build in place, matching the Windows behaviour above.
+
+      THE RETRY LOOP mirrors the Windows one for the same reason — the image lock
+      can outlive the exit, and a single attempt at a fixed delay is a race that
+      silently loses the update. It is bounded so a permanently unwritable target
+      cannot spin forever.
+
+      ON TOTAL FAILURE THE PREVIOUS BUILD IS STILL LAUNCHED. Bailing out instead
+      would leave a machine with no node at all, and the staged download is left
+      in place so the next boot can finish the job.
+    */
+    "attempt=0",
+    "while [ \"$attempt\" -lt " + String(HANDOFF_COPY_ATTEMPTS) + " ]; do",
+    "  attempt=$((attempt + 1))",
+    `  if cp -f "${updatePath}" "${targetExe}"; then`,
+    "    swapped=1",
+    "    break",
+    "  fi",
+    "  sleep 1",
+    "done",
+    `chmod +x "${targetExe}" 2>/dev/null`,
     `nohup "${targetExe}"${relaunchSuffix()} >/dev/null 2>&1 &`,
-    `rm -f "${updatePath}"`,
+    // Discard the staged download only when the swap actually landed.
+    'if [ "$swapped" = "1" ]; then rm -f "${updatePath}"; fi',
     'rm -f "$0"',
   ].join("\n");
 }
 
 /**
+/**
+ * True when a Rippa Watchdog is genuinely supervising this machine.
+ *
+ * WHY THE ENV VAR ALONE IS NOT ENOUGH — THIS IS THE "NODE FREEZES UNTIL SOMEONE
+ * RESTARTS IT BY HAND" BUG. {@link isUnderWatchdog} only asks whether
+ * `RIPPA_WATCHDOG=1` is in the environment, and that flag is set by the watchdog
+ * when it spawns its child. It says nothing about whether that watchdog is STILL
+ * ALIVE now, minutes or hours later, when the update finally happens.
+ *
+ * So every failure mode that kills the supervisor — the watchdog crashed, the
+ * machine's antivirus quarantined it, an operator ended the task, a scheduled
+ * task was disabled — left `RIPPA_WATCHDOG=1` set on a node that would then exit
+ * 43 into a machine with nothing left to read that code. Nothing swapped the
+ * binary, nothing rebooted, and the operator's only remedy was a manual restart.
+ * That is precisely the reported symptom.
+ *
+ * The fix is to verify the claim instead of trusting it. The watchdog owns a
+ * lock file containing its PID, and the same liveness probe it uses on itself
+ * (`process.kill(pid, 0)`) decides whether that PID still exists. Only a
+ * confirmed-live supervisor justifies handing the swap to it; anything else falls
+ * back to the standalone detached-script path, which can always bring the node
+ * back because it does not depend on a supervisor being alive.
+ *
+ * FAILING CLOSED TOWARDS THE SCRIPT. An unreadable lock, a garbage PID, or a
+ * probe error all report `false`, and `false` selects the script. That is the
+ * safe direction: the script needs no supervisor and always relaunches, whereas
+ * a wrongly-trusted flag is exactly how the node ends up dead.
+ */
+export function watchdogIsAlive(): boolean {
+  let owner: number;
+  try {
+    const raw = fs.readFileSync(path.join(stagingDir(), WATCHDOG_LOCK_FILE), "utf8").trim();
+    owner = Number.parseInt(raw, 10);
+  } catch {
+    return false; // no lock file, or unreadable — nothing to trust
+  }
+  if (!Number.isInteger(owner) || owner <= 0 || owner === process.pid) return false;
+
+  try {
+    process.kill(owner, 0); // signal 0: existence only, delivers nothing
+    return true;
+  } catch (error) {
+    // EPERM means the process EXISTS but belongs to another user, which on
+    // Windows does not happen for a same-user watchdog — treat it as gone.
+    return (error as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+/**
+ * Whether the running process will be replaced by a SUPERVISOR rather than by
+ * its own detached script.
+ *
+ * THE DECISION, AND WHY IT IS IN ONE PLACE. Both OTA paths end the same way, and
+ * they used to end it two different ways: each wrote `update.bat`, spawned it
+ * detached, and called `process.exit(0)`. That worked for a binary swap and
+ * nothing else — there was no process left to notice the replacement dying, so a
  * Writes the swap script and returns its path.
  *
  * @param updatePath  the verified, staged download
@@ -270,12 +407,18 @@ export function spawnDetached(scriptPath: string, cwd: string): number | undefin
  * have no supervisor. So exactly one of the two paths runs, chosen here, and both
  * updaters call the same function to choose it.
  *
- * @returns "watchdog" when the running process is a Watchdog child and must exit
- *          with {@link EXIT_APPLY_UPDATE}; "script" for a standalone install that
- *          still has to hand itself off.
+ * THE SUPERVISOR IS VERIFIED, NOT ASSUMED. `isUnderWatchdog()` alone only proves
+ * the env flag was set at launch; it does not prove a watchdog is still running
+ * now (see {@link watchdogIsAlive}). Exiting 43 into a machine whose watchdog has
+ * since died is the freeze-until-manual-restart bug, so the flag is combined with
+ * a live PID probe. A node that cannot confirm its supervisor takes the script
+ * path, which needs no supervisor and always relaunches the node.
+ *
+ * @returns "watchdog" when a LIVE Watchdog owns this process and must be told to
+ *          swap via {@link EXIT_APPLY_UPDATE}; "script" otherwise.
  */
 export function handoffMode(): "watchdog" | "script" {
-  return isUnderWatchdog() ? "watchdog" : "script";
+  return isUnderWatchdog() && watchdogIsAlive() ? "watchdog" : "script";
 }
 
 /**
