@@ -40,6 +40,57 @@ const fakeNode = path.join(dataDir, "fake-rippa-node.js");
 const queueFile = path.join(dataDir, "codes.json");
 const ranFile = path.join(dataDir, "runs.log");
 
+/*
+  THE SUPERVISED NODE MUST BOOT IN THE INSTALL DIRECTORY, NOT THE WATCHDOG'S CWD.
+
+  This is the "node lost its managed Ollama port after an auto-update" regression.
+  `src/config.ts` calls `loadDotenv()` with no path, so dotenv resolves `.env`
+  relative to `process.cwd()`. The watchdog is started from the Startup folder by
+  its silent `.vbs`, so its cwd is the Startup folder — and a child spawned without
+  an explicit `cwd` inherits that, making the operator's `.env` (and with it
+  `RIPPA_OLLAMA_MANAGED` / any `OLLAMA_URL`) invisible.
+
+  MEASURED on this machine: booting with the `.env` beside the install directory
+  injected 2 variables; booting from the Startup folder injected 0.
+
+  Every other test in this file runs from a checkout whose cwd already contains a
+  `.env`, which is exactly why this went unnoticed — so it is asserted directly
+  against an install path that deliberately differs from the current directory.
+*/
+{
+  const installDir = path.join(dataDir, "install");
+  fs.mkdirSync(installDir, { recursive: true });
+  const installedExe = path.join(installDir, "rippa-node.exe");
+  fs.writeFileSync(installedExe, "", "utf8");
+
+  check(
+    "the supervised node is booted in the INSTALL directory, not the watchdog's cwd",
+    path.resolve(watchdog.nodeWorkingDirectory(installedExe)) ===
+      path.resolve(installDir),
+    `chose ${watchdog.nodeWorkingDirectory(installedExe)}`,
+  );
+  check(
+    "and that directory actually differs from the cwd the watchdog was started in",
+    path.resolve(installDir) !== path.resolve(process.cwd()),
+    "if these matched, this test could not distinguish the fix from the bug",
+  );
+
+  // A missing install directory must not throw: a deleted install should still be
+  // able to start something that reports the problem, not restart-loop forever.
+  const missingExe = path.join(dataDir, "does-not-exist", "rippa-node.exe");
+  let fallback = "";
+  try {
+    fallback = watchdog.nodeWorkingDirectory(missingExe);
+  } catch (error) {
+    fallback = `THREW: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  check(
+    "a missing install directory falls back instead of throwing",
+    fallback === process.cwd(),
+    `fell back to ${fallback}`,
+  );
+}
+
 fs.writeFileSync(
   fakeNode,
   [

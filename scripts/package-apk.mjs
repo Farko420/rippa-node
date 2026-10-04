@@ -1910,6 +1910,57 @@ const bridgeChecks = [
     "RippaNodePlugin.isForegroundServiceRunning()",
   ],
 ];
+
+/*
+  THE OEM APP-KILLER EXEMPTION IS WIRED END TO END. CHECKED FOR THE SAME REASON
+  AS THE REST OF THIS BLOCK: every piece is silent when it is missing.
+
+  Without this permission and this intent the node builds, installs, launches, and
+  runs perfectly all day — and is then killed by Samsung's sleeping-apps service at
+  roughly midnight, which is indistinguishable from a network fault and takes the
+  whole tablet out of the swarm. There is no error, no log line, and no crash.
+
+  Four things must all be present, and they live in three different files:
+    1. the manifest permission  (AndroidManifest.xml)
+    2. the plugin method        (RippaNodePlugin.java)
+    3. the worker call          (mobile/src/worker.ts)
+    4. the pre-check            (so it prompts once, not on every boot)
+*/
+const batteryChecks = [
+  [
+    overlaySource.includes('android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"'),
+    "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS permission",
+  ],
+  [
+    /public void requestIgnoreBatteryOptimizations\(PluginCall call\)/.test(pluginSource),
+    "RippaNodePlugin.requestIgnoreBatteryOptimizations()",
+  ],
+  [
+    /public void isIgnoringBatteryOptimizations\(PluginCall call\)/.test(pluginSource),
+    "RippaNodePlugin.isIgnoringBatteryOptimizations() — the pre-check",
+  ],
+  [
+    /ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS/.test(pluginSource) &&
+      /ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS/.test(pluginSource),
+    "the battery-optimisation intents, with a fallback for OEMs that disable the dialog",
+  ],
+  [
+    /requestBatteryExemption\(\)/.test(workerSource),
+    "the worker calling requestBatteryExemption()",
+  ],
+];
+const missingBatteryPieces = batteryChecks.filter(([present]) => !present).map(([, label]) => label);
+if (missingBatteryPieces.length) {
+  console.error(
+    `[APK] The battery-optimisation exemption is not wired end to end:\n` +
+      missingBatteryPieces.map((piece) => `         - missing ${piece}\n`).join("") +
+      "       This is the Samsung app killer: the node will run all day and be killed\n" +
+      "       overnight, with no error anywhere. It needs the manifest permission, the\n" +
+      "       plugin method AND the worker's call to requestBatteryExemption().",
+  );
+  process.exit(1);
+}
+console.log(`[APK] Verified ${batteryChecks.length} battery-exemption check(s).`);
 const missingBridgePieces = bridgeChecks.filter(([present]) => !present).map(([, label]) => label);
 if (missingBridgePieces.length) {
   console.error(

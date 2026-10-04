@@ -140,6 +140,57 @@ function watchdogExecutable(): string {
   return process.execPath;
 }
 
+/**
+ * The working directory a supervised node is booted in.
+ *
+ * WHY THIS EXISTS — IT IS THE CAUSE OF "THE NODE LOST ITS MANAGED OLLAMA PORT".
+ * `src/config.ts` calls `loadDotenv()` with NO path, so dotenv resolves `.env`
+ * relative to `process.cwd()`. The watchdog itself is started from the Startup
+ * folder by the silent `.vbs`, so ITS cwd is the Startup folder — and a child
+ * spawned without an explicit `cwd` INHERITS that.
+ *
+ * The measured consequence: with the `.env` beside the install directory, booting
+ * with the install dir as cwd injected 2 variables, while booting with the Startup
+ * folder as cwd injected 0. So a supervised node silently lost every value in its
+ * `.env` — including `RIPPA_OLLAMA_MANAGED=true` and any `OLLAMA_URL` override.
+ * `index.ts` then never called `ollamaManager.setManaged(true)`, `env.OLLAMA_URL`
+ * fell back to the 11434 default, and `localAi.ts` logged "No usable local model
+ * found — staying a standard node".
+ *
+ * This looked exactly like a Watchdog/OTA bug and was invisible in every test,
+ * because the watchdog tests spawn with their own cwd and a repo checkout has its
+ * `.env` in the cwd. It only reproduces on a real packaged install, where the
+ * working directory and the install directory differ.
+ *
+ * WHY THE INSTALL DIRECTORY IS THE RIGHT ANSWER. It is where the operator's `.env`
+ * lives, it is where the node's own relative paths (the data dir fallback in
+ * `swapHandoff.stagingDir()`, the webgui assets) already expect to resolve, and it
+ * is what a manual double-click of the exe produces. Booting there makes the
+ * supervised node indistinguishable from a hand-launched one, which is the whole
+ * contract of a supervisor: it must change WHEN a process restarts, never WHAT it
+ * is.
+ *
+ * FALLS BACK TO THE WATCHDOG'S OWN DIRECTORY when the install directory has
+ * vanished — a deleted-then-restored install must still be able to start
+ * something that can report the problem, rather than throwing ENOENT and silently
+ * restarting forever.
+ *
+ * EXPORTED so it can be tested directly. The failure it prevents is invisible to
+ * every watchdog integration test, because those run from a checkout whose cwd
+ * already contains the `.env` — so the only honest way to pin it is to assert the
+ * chosen directory against an install path that deliberately differs from the
+ * current working directory.
+ */
+export function nodeWorkingDirectory(nodeExe: string): string {
+  const installDir = path.dirname(nodeExe);
+  try {
+    if (fs.existsSync(installDir)) return installDir;
+  } catch {
+    /* fall through to the watchdog's own directory */
+  }
+  return process.cwd();
+}
+
 function log(message: string): void {
   console.log(`[Watchdog] ${message}`);
   try {
@@ -559,13 +610,26 @@ export async function applyStagedUpdate(targetExe: string): Promise<boolean> {
  * attaches the child to the watchdog's EXISTING console handles, so when the
  * watchdog was started from a terminal the logs still stream to that terminal.
  * What is suppressed is only the creation of a second, focus-stealing window.
+ *
+ * `env: { ...process.env, ... }` IS ALREADY CORRECT AND WAS NOT THE BUG. It
+ * forwards the watchdog's entire environment, so anything exported before the
+ * watchdog started does reach the child. What it cannot forward is anything the
+ * node derives from its working directory — which is exactly how `.env` is found
+ * (see {@link nodeWorkingDirectory}). Adding more env forwarding here would have
+ * changed nothing while looking like it fixed the reported symptom.
  */
 function launchNode(nodeExe: string, args: string[]): ChildProcess {
+  const cwd = nodeWorkingDirectory(nodeExe);
   log(`starting ${nodeExe} ${args.join(" ")}`.trim());
   const child = spawn(nodeExe, args, {
     stdio: "inherit",
     windowsHide: true,
     env: { ...process.env, [WATCHDOG_ENV_FLAG]: "1" },
+    // Without this the child inherits the watchdog's own cwd (the Startup
+    // folder) and silently loses the `.env` that carries RIPPA_OLLAMA_MANAGED
+    // and any OLLAMA_URL override — the "node lost its managed Ollama port after
+    // an auto-update" report.
+    cwd,
   });
   child.on("error", (error) => log(`could not start ${nodeExe}: ${describeError(error)}`));
   return child;

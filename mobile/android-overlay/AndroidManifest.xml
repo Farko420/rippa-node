@@ -97,6 +97,40 @@
       android:name="android.permission.READ_EXTERNAL_STORAGE"
       android:maxSdkVersion="32" />
 
+  <!--
+    REQUEST_IGNORE_BATTERY_OPTIMIZATIONS — the OEM app-killer exemption, and the
+    only permission here that exists purely to ASK for something.
+
+    WHY A FOREGROUND SERVICE WAS NOT ENOUGH. The FGS + wake lock already keep this
+    process alive against stock Android: the service holds a PARTIAL_WAKE_LOCK and
+    shows a persistent notification, so the process is exempt from Doze and App
+    Standby. That works, and it is why the node survives a screen-off night on a
+    Pixel.
+
+    It does NOT work on Samsung (and several other OEMs), which is where the fleet
+    actually is. Those skins layer a proprietary "app killer" / "sleeping apps"
+    service ON TOP of stock Android. It reads none of the FGS rules above: it
+    freezes and then kills background apps on its own schedule, regardless of
+    wake locks, regardless of a running foreground service, and regardless of the
+    app having asked for nothing. This is the single most common cause of "my
+    overnight node stops at 11pm" on a Samsung tablet, and no amount of manifest
+    work fixes it — the only fix is the user tapping "Never sleeping apps" for this
+    package in Settings, which is exactly what this permission lets us ask for.
+
+    IT IS A NORMAL PERMISSION, NOT A PRIVILEGED ONE, and that is the point: it is
+    granted at install time and its only effect is to let the app DISPLAY the
+    system dialog. It grants no capability by itself. This is deliberately NOT
+    BATTERY_STATS (see the note above) — that one is signature|privileged, is never
+    granted to a sideloaded APK, and declaring it crashes the app at launch.
+
+    THE PROMPT IS SHOWN ONCE, ON FIRST SETUP, AND ONLY WHEN NEEDED. RippaNodePlugin
+    checks `isIgnoringBatteryOptimizations()` first and does nothing when the app
+    is already exempt, so a user who has already granted it is never nagged. The
+    worker calls it from `startWorker()` rather than on a timer, because Android
+    rate-limits this dialog and repeated prompts get the whole app uninstalled.
+  -->
+  <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
   <application
       android:allowBackup="true"
       android:icon="@mipmap/ic_launcher"

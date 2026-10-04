@@ -555,6 +555,12 @@ interface NativePlugin {
   startForegroundService(options?: { title?: string; message?: string }): Promise<void>;
   stopForegroundService(): Promise<void>;
   isForegroundServiceRunning(): Promise<{ running: boolean; available?: boolean }>;
+  /**
+   * Optional so a desktop preview and an older APK both still typecheck: both
+   * simply report "no exemption support" rather than throwing.
+   */
+  isIgnoringBatteryOptimizations?(): Promise<{ ignoring: boolean; supported?: boolean }>;
+  requestIgnoreBatteryOptimizations?(): Promise<void>;
 }
 
 /**
@@ -1183,10 +1189,60 @@ export function powerStatus(): Record<string, unknown> {
   };
 }
 
+/**
+ * Asks the OS to exempt this app from battery optimisation — the OEM app killer.
+ *
+ * WHY THIS IS NEEDED WHEN THERE IS ALREADY A FOREGROUND SERVICE. The service and
+ * its wake lock are enough on stock Android: they exempt the process from Doze and
+ * App Standby, which is why the node survives a screen-off night on a Pixel. They
+ * are NOT enough on Samsung, which is where the fleet actually is. Samsung layers a
+ * proprietary sleeping-apps service on top of stock Android that freezes and kills
+ * background apps on its own schedule and honours none of the stock exemptions.
+ * This prompt is the only thing that stops it, and without it the fleet quietly
+ * drops offline overnight on exactly the hardware it is deployed on.
+ *
+ * CALLED ONCE, FROM startWorker(), NOT ON A TIMER. Android rate-limits this dialog
+ * and an app that repeatedly nags gets uninstalled, so a re-prompt on every poll
+ * would be worse than the bug it fixes.
+ *
+ * NEVER FATAL AND NEVER LOUD. A node that cannot reach the settings screen must
+ * still boot and join the swarm; the failure is logged once and the worker carries
+ * on. The dashboard surfaces the resulting state so an operator can see, rather
+ * than discover overnight, that the OS is still free to kill the app.
+ */
+async function requestBatteryExemption(): Promise<void> {
+  const plugin = native();
+  // Absent method => an older APK that predates this call. Nothing to do.
+  if (!plugin || typeof plugin.requestIgnoreBatteryOptimizations !== "function") return;
+
+  try {
+    // Ask first, prompt second. On a device that is already exempt — which is the
+    // case after the very first grant, forever — this shows the operator nothing.
+    const state = await plugin.isIgnoringBatteryOptimizations?.();
+    if (state?.ignoring) {
+      log("Battery optimisation is already disabled for this app.");
+      return;
+    }
+    if (state && state.supported === false) {
+      log("This Android version has no battery optimisation to exempt.");
+      return;
+    }
+    log(
+      "Requesting a battery-optimisation exemption. If the dialog does not appear, " +
+        "enable Settings > Apps > Rippa Node > Battery > Unrestricted by hand — " +
+        "OEM app killers ignore the foreground service otherwise.",
+    );
+    await plugin.requestIgnoreBatteryOptimizations();
+  } catch (error) {
+    log(`Could not request a battery-optimisation exemption: ${describe(error)}`);
+  }
+}
+
 /** Boots the worker and every recurring loop. Safe to call once. */
 export async function startWorker(): Promise<void> {
   loadConfig();
   await ensureBackgroundService();
+  await requestBatteryExemption();
 
   /*
     POWER IS EVALUATED BEFORE ANY WORK.

@@ -54,6 +54,10 @@ import {
   validateConfigInput,
   writeConfig,
 } from "./config/configManager";
+// Type-only: used to type the object handed to writeConfig below. Kept out of the
+// value import list because it is erased at compile time and must not become a
+// runtime dependency in the pkg snapshot.
+import type { RippaNodeConfig } from "./config/configManager";
 import {
   backlog,
   publishHealth,
@@ -1429,8 +1433,55 @@ export function createApp(): Express {
       return;
     }
     const body = (req.body ?? {}) as Record<string, unknown>;
-    ollamaManager.setManaged(Boolean(body["managed"]));
-    res.json({ success: true, managed: ollamaManager.isManaged() });
+    const managed = Boolean(body["managed"]);
+    ollamaManager.setManaged(managed);
+
+    /*
+      PERSIST IT. This used to mutate `ollamaManager`'s private field and stop
+      there, which made the Control Panel's switch a lie: the node came back from
+      the next restart — and the Watchdog restarts it after every OTA swap —
+      unmanaged, on the 11434 default, logging "No usable local model found". The
+      operator had no way to tell a setting that never saved from one that did.
+
+      The write goes through the SAME `writeConfig` + `applyConfigToEnv` +
+      `reloadEnv` sequence as the main settings save, and `normalizeConfig`
+      carries `OLLAMA_MANAGED` through, so an unrelated GUI save cannot delete it
+      either.
+    */
+    const root = resolveAppRoot();
+    try {
+      const current = readConfigLenient(root) ?? readConfig(root);
+      const saved = writeConfig(root, {
+        ...(current ?? {}),
+        OLLAMA_MANAGED: managed,
+      } as RippaNodeConfig);
+      applyConfigToEnv(readConfigLenient() ?? {}, true);
+      reloadEnv();
+      console.log(`[API] Ollama supervision set to managed=${managed} (saved to ${saved}).`);
+    } catch (error) {
+      /*
+        A failed write must NOT be reported as success, and must NOT take the
+        running engine down: `setManaged` has already applied the change in memory
+        and the operator gets a truthful warning that it will not survive a
+        reboot. Silently swallowing this is how the original bug survived so long.
+      */
+      console.warn(
+        `[API] Ollama supervision changed for this session but could NOT be saved: ${
+          error instanceof Error ? error.message : String(error)
+        }. It will be lost on the next restart.`,
+      );
+      res.status(200).json({
+        success: false,
+        managed: ollamaManager.isManaged(),
+        persisted: false,
+        message:
+          "Applied for this session only — the setting could not be written to disk, " +
+          "so it will be lost when the node restarts.",
+      });
+      return;
+    }
+
+    res.json({ success: true, managed: ollamaManager.isManaged(), persisted: true });
   });
 
   app.post("/api/ollama/override", requireDashboardAuth, (req: Request, res: Response) => {

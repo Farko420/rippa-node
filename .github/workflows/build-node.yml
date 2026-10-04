@@ -756,7 +756,7 @@ jobs:
             exit 0
           fi
           DUMP="$("$AAPT" dump xmltree --file AndroidManifest.xml "${{ steps.apk.outputs.path }}" | tr -d '\r')"
-          for NEEDLE in WAKE_LOCK FOREGROUND_SERVICE RippaNodeService REQUEST_INSTALL_PACKAGES FileProvider RippaNodeTileService BIND_QUICK_SETTINGS_TILE RECEIVE_BOOT_COMPLETED; do
+          for NEEDLE in WAKE_LOCK FOREGROUND_SERVICE RippaNodeService REQUEST_INSTALL_PACKAGES FileProvider RippaNodeTileService BIND_QUICK_SETTINGS_TILE RECEIVE_BOOT_COMPLETED REQUEST_IGNORE_BATTERY_OPTIMIZATIONS; do
             if ! grep -q "$NEEDLE" <<<"$DUMP"; then
               echo "::error::APK manifest is missing $NEEDLE"
               exit 1

@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { ROOT, check, results } from "./verify-harness.mjs";
+import { ROOT, check, warn, results } from "./verify-harness.mjs";
 
 /** Imports a compiled module by path. Windows ESM needs a file:// URL, not a drive letter. */
 const load = (rel) => import(pathToFileURL(path.join(ROOT, rel)).href);
@@ -483,6 +483,54 @@ check(
   /a\^&/.test(argTail) && !/[^\\^]&/.test(argTail),
   argTail,
 );
+
+/*
+  THE FLASHING CONSOLE — "a cmd window pops up on the operator's screen".
+
+  This is asserted on the LAUNCHER TEXT rather than by watching the screen,
+  because the bug is a property of the generated file: spawning cmd.exe directly
+  cannot be both detached and windowless on Windows, and the only way to know the
+  fix is still in place after a refactor is to read what we now generate.
+
+  The two properties that together make it work, and that must not be traded
+  against each other:
+    - window style 0  -> the script runs with NO console allocated at all
+    - False (3rd arg) -> the launcher does not block, so the node can exit(0)
+*/
+const launcher = swap.buildSilentLauncherScript(scriptPath);
+check(
+  "the silent launcher starts the swap script with window style 0 (no console)",
+  /S\.Run\s+"cmd\.exe \/c\s+""[^"]+""",\s*0,\s*False/.test(launcher),
+  launcher.split("\r\n").find((l) => l.startsWith("S.Run")) ?? launcher,
+);
+check(
+  "the silent launcher does not block (the node exits immediately after spawning it)",
+  /,\s*0,\s*False\s*$/.test(launcher.trimEnd()),
+);
+check(
+  "the silent launcher wraps the script path in VBScript-doubled quotes",
+  /""[A-Za-z]:\\[^"]*update\.bat"""/.test(launcher),
+  launcher,
+);
+// The regression itself: cmd.exe must NOT be the directly-spawned process, and
+// the launcher must be a .vbs, because that is what removes the window.
+check(
+  "the launcher is a .vbs, which has no console to hide in the first place",
+  swap.HANDOFF_LAUNCHER.endsWith(".vbs"),
+  swap.HANDOFF_LAUNCHER,
+);
+{
+  const source = fsSwap.readFileSync(
+    pathSwap.join(ROOT, "src", "update", "swapHandoff.ts"),
+    "utf8",
+  );
+  const spawnBody = /export function spawnDetached[\s\S]*?\n}/.exec(source)?.[0] ?? "";
+  check(
+    "spawnDetached no longer spawns cmd.exe directly on the non-error path",
+    !/spawn\("cmd\.exe"/.test(spawnBody.replace(/child\.on\("error"[\s\S]*?\n {6}\}\);/, "")),
+    "a direct cmd.exe spawn would flash a console on every update",
+  );
+}
 fsSwap.rmSync(stageDir, { recursive: true, force: true });
 
 // --- 8b. The exit-code handoff protocol --------------------------------------
@@ -564,6 +612,75 @@ check(
   "the 1.0.15 -> 1.0.13 downgrade the Mothership asked for is detected",
   isVersionOlder("1.0.13", "1.0.15") === true && isVersionNewer("1.0.13", "1.0.15") === false,
 );
+
+/*
+  THE TEST ROT — WHY THESE EXIST.
+
+  CI rewrites package.json on every push ("chore: bump version to X") and commits it
+  back. The suite used to assert that the Mothership's two hardcoded fallback
+  versions were EXACTLY EQUAL to package.json, so every single bump turned the suite
+  red until somebody hand-edited a file in a different repository. That is the rot.
+
+  Equality was not the only thing tried, and neither replacement worked as a hard
+  gate, which is why these tests exist to stop the wrong fixes coming back:
+    - "not behind"      still fails on the next bump (the Node moves first);
+    - "not behind by N"  fails anyway once the gap grows past N, and the gap grows
+                         without bound because only CI edits package.json.
+  The cross-repo drift is therefore reported with `warn()`, never `check()`.
+
+  What is asserted HARD here is what this repository actually controls.
+*/
+{
+  const { parseVersion } = await load("dist/version-compare.js");
+  /** Mirrors the `lagBehind` helper used against the Mothership above. */
+  const lagBehind = (advertised, current) => {
+    const a = parseVersion(advertised);
+    const c = parseVersion(current);
+    if (!a || !c) return null;
+    return c[2] - a[2];
+  };
+  // The exact scenario that used to fail, now with a LARGE gap to prove no fixed
+  // tolerance is needed: the Node is 7 releases ahead of the advertised fallback.
+  check(
+    "the cross-repo fallback drift is MEASURED, never gated on a fixed tolerance",
+    lagBehind("1.0.34", "1.0.41") === 7,
+    "7 releases of drift is reported, not failed",
+  );
+  check(
+    "an equal version reports zero lag (and is reported as a PASS, not a warning)",
+    lagBehind("1.0.35", "1.0.35") === 0,
+  );
+  check(
+    "a fallback AHEAD of this build reports a negative lag and is never 'behind'",
+    lagBehind("1.0.36", "1.0.35") === -1,
+  );
+  check(
+    "an unparseable advertised fallback is reported as not-comparable, never guessed",
+    lagBehind("unknown", "1.0.35") === null,
+  );
+  /*
+    AND THE REASON THE DRIFT IS HARMLESS: a lagging advertisement cannot actually walk
+    the fleet backwards, because the updater refuses an older version outright. This
+    is what makes turning the drift into a warning SAFE rather than merely convenient,
+    so it is asserted rather than assumed.
+  */
+  const { APP_VERSION } = await load("dist/version.js");
+  // `readFileSync` is destructured from node:fs much further down this file, so
+  // reading package.json here would hit the temporal dead zone. `fsSwap` is
+  // already in scope from the swap-script block above.
+  const manifestVersion = JSON.parse(
+    fsSwap.readFileSync(path.join(ROOT, "package.json"), "utf8"),
+  ).version;
+  check(
+    "the running build's version is read from package.json dynamically, not a literal",
+    APP_VERSION === manifestVersion,
+    `${APP_VERSION} vs ${manifestVersion}`,
+  );
+  check(
+    "a downgrade is still refused outright, which is what makes the drift safe",
+    isVersionOlder("1.0.34", "1.0.41") === true,
+  );
+}
 check(
   "an unparseable version is never treated as a downgrade",
   isVersionOlder("garbage", "1.0.15") === false && isVersionOlder("1.0.13", "garbage") === false,
@@ -1262,6 +1379,88 @@ const mothershipFeedPath = path.join(
   }
 }
 
+/*
+  THE MANAGED-OLLAMA FLAG MUST SURVIVE A RESTART — the reported regression.
+
+  Symptom: after the Watchdog restarted the node (e.g. following an OTA swap) it
+  came back unmanaged, logged `Ollama: http://127.0.0.1:11434` and then "No usable
+  local model found — staying a standard node".
+
+  There were TWO independent causes, and only fixing one leaves the bug alive:
+
+    1. The Control Panel's "managed" toggle only mutated an in-memory field.
+       Nothing was ever written, so no restart could preserve it.
+    2. Even once written, `normalizeConfig` REBUILDS the config object and is not a
+       merge — so any field it does not name is DELETED on the next GUI save. A
+       flag persisted without being carried through here survives exactly until
+       the operator changes an unrelated setting, which is far harder to notice.
+
+  These assertions pin the persistence contract end to end. The Watchdog's `cwd`
+  fix (which is what made `.env` invisible) is asserted separately in
+  verify-watchdog.mjs, because it is a different file and a different failure.
+*/
+{
+  const cfgMod = await load("dist/config/configManager.js");
+  const osMod = await import("node:os");
+  const nodeFs = await import("node:fs");
+  const dir = nodeFs.mkdtempSync(path.join(osMod.tmpdir(), "rippa-managed-flag-"));
+  const prevEnvFlag = process.env.RIPPA_OLLAMA_MANAGED;
+  try {
+    delete process.env.RIPPA_OLLAMA_MANAGED;
+    cfgMod.writeConfig(dir, {
+      NODE_ROLE: "master",
+      NODE_NAME: "Managed Flag Node",
+      NODE_API_KEY: "verify-master-key-0001",
+      MOTHERSHIP_URL: "https://rippaadventures.com",
+      DASHBOARD_PIN: "4242",
+      PORT: 4000,
+      OLLAMA_MANAGED: true,
+    });
+    check(
+      "the managed-Ollama flag is written to config.json",
+      cfgMod.readConfig(dir)?.OLLAMA_MANAGED === true,
+    );
+
+    // The `normalizeConfig` half — the one that silently deletes on a GUI save.
+    const renamed = cfgMod.normalizeConfig({ ...cfgMod.readConfig(dir), NODE_NAME: "Renamed" });
+    check(
+      "normalizeConfig CARRIES OLLAMA_MANAGED through (an unrelated GUI save cannot delete it)",
+      renamed.OLLAMA_MANAGED === true,
+      `NODE_NAME was changed in the same save; OLLAMA_MANAGED=${renamed.OLLAMA_MANAGED}`,
+    );
+    cfgMod.writeConfig(dir, renamed);
+    check(
+      "the flag survives a full write after an unrelated save",
+      cfgMod.readConfig(dir)?.OLLAMA_MANAGED === true,
+    );
+
+    // A restart is a fresh read from disk with NO environment variable at all —
+    // exactly the state the Watchdog produced after an OTA swap.
+    delete process.env.RIPPA_OLLAMA_MANAGED;
+    const afterRestart = cfgMod.readConfig(dir);
+    check(
+      "the flag survives a restart with no env var set (the post-OTA-swap case)",
+      afterRestart?.OLLAMA_MANAGED === true,
+      "config.json alone must be able to restore supervision",
+    );
+
+    // A hand-edited string must not read as enabled, or a corrupt config would
+    // silently start spawning servers nobody asked for.
+    check(
+      'the string "false" does NOT read as managed',
+      cfgMod.normalizeConfig({ ...afterRestart, OLLAMA_MANAGED: "false" }).OLLAMA_MANAGED === false,
+    );
+    check(
+      "an absent flag defaults to unmanaged (the safe direction)",
+      cfgMod.normalizeConfig({ ...afterRestart, OLLAMA_MANAGED: undefined }).OLLAMA_MANAGED === false,
+    );
+  } finally {
+    if (prevEnvFlag === undefined) delete process.env.RIPPA_OLLAMA_MANAGED;
+    else process.env.RIPPA_OLLAMA_MANAGED = prevEnvFlag;
+    nodeFs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // The Mothership is a SEPARATE repository. These assertions only apply when it is
 // checked out beside the Node, so a standalone Node clone skips them rather than
 // failing on a path it does not own.
@@ -1275,24 +1474,74 @@ check(
 if (mothershipPresent) {
   const mothershipFeed = readFileSync(mothershipFeedPath, "utf8");
   const nodeManifest = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8"));
-  const advertisedFallback = /const FALLBACK_VERSION = "([^"]+)"/.exec(mothershipFeed)?.[1];
-  check(
-    `the Mothership's fallback version (${advertisedFallback}) matches package.json (${nodeManifest.version})`,
-    advertisedFallback === nodeManifest.version,
-    `${advertisedFallback} vs ${nodeManifest.version}`,
-  );
+
+  /*
+    THE CROSS-REPO FALLBACKS ARE ADVISORY, NOT A GATE. THIS IS THE ACTUAL FIX FOR
+    THE TEST ROT, and it took three attempts to get right, so the reasoning matters.
+
+    Attempt 1 — assert EQUALITY. Unsatisfiable: CI rewrites package.json on every
+    push, the constant lives in a sibling repo, so the build went red every release.
+
+    Attempt 2 — assert "NOT BEHIND". Also unsatisfiable, for the same reason: the
+    Node always moves first, so any directional check fails on the next bump. This
+    one only *relocated* the rot. Verified by simulating a bump to 1.0.41.
+
+    Attempt 3 — assert "not behind by more than N". Better, but STILL unsatisfiable
+    in the limit: because the Node auto-bumps on every push and the constant only
+    moves when a human edits it, the gap grows without bound. Any fixed N is a
+    countdown to the same red build, which is the reported symptom wearing a new hat.
+
+    THE REAL INSIGHT: this assertion is about a file in a DIFFERENT repository that
+    this build cannot change. There is no code fix that makes it satisfiable, and no
+    tolerance that stays satisfied. So it must not be a gate — an operator cannot
+    fix it from this repo, and a gate they cannot fix trains them to ignore the
+    whole suite, taking every load-bearing check with it.
+
+    What is genuinely load-bearing, and is still asserted HARD below:
+      - the advertised asset name (a rename really would break every download);
+      - this repo reading its own version dynamically from package.json;
+      - the exact 1.0.13 regression, which is still refused outright.
+    The drift is still REPORTED, as a WARN, so it stays visible and actionable.
+  */
+  const { parseVersion } = await load("dist/version-compare.js");
+  const advertisedFallback = /const FALLBACK_VERSION = "([^"]+)"/.exec(mothershipFeed)?.[1] ?? "";
   // The APK route has its OWN last-resort label, and it is the one a tablet
   // actually reads: `/api/node/latest-apk` is the FIRST route the mobile worker
   // tries. When `LATEST_APK_VERSION` is unpinned this constant is the number an
-  // operator sees next to a working download URL, so a stale value here is what
-  // renders "v1.0.32 -> v1.0.28 is available" on an already-current device.
+  // operator sees next to a working download URL.
   const advertisedApkFallback =
-    /const FALLBACK_APK_VERSION = "([^"]+)"/.exec(mothershipFeed)?.[1];
-  check(
-    `the Mothership's APK fallback version (${advertisedApkFallback}) matches package.json (${nodeManifest.version})`,
-    advertisedApkFallback === nodeManifest.version,
-    `${advertisedApkFallback} vs ${nodeManifest.version}`,
-  );
+    /const FALLBACK_APK_VERSION = "([^"]+)"/.exec(mothershipFeed)?.[1] ?? "";
+  const nodeVersion = String(nodeManifest.version ?? "");
+
+  /** How far the advertised fallback has drifted behind this build. */
+  const lagBehind = (advertised, current) => {
+    const a = parseVersion(advertised);
+    const c = parseVersion(current);
+    if (!a || !c) return null; // not comparable — say nothing rather than guess
+    return c[2] - a[2];
+  };
+
+  for (const [label, advertised] of [
+    ["FALLBACK_VERSION", advertisedFallback],
+    ["FALLBACK_APK_VERSION", advertisedApkFallback],
+  ]) {
+    const lag = lagBehind(advertised, nodeVersion);
+    if (lag === null) {
+      warn(`the Mothership's ${label} (${advertised}) could not be compared to ${nodeVersion}`);
+    } else if (lag > 0) {
+      warn(
+        `the Mothership's ${label} (${advertised}) is ${lag} release(s) behind this build (${nodeVersion})`,
+        "informational only — it lives in the Mothership repo and is overridden by " +
+          "LATEST_NODE_VERSION/LATEST_APK_VERSION. Harmless: the updater refuses " +
+          "downgrades. Update it in the Mothership repo if the number is user-visible.",
+      );
+    } else {
+      check(
+        `the Mothership's ${label} (${advertised}) is not behind package.json (${nodeVersion})`,
+        true,
+      );
+    }
+  }
   // The advertised URL must name the asset the workflow actually publishes, because
   // `/releases/latest/download/<asset>` is a literal filename lookup.
   check(

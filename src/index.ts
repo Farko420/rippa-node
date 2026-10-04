@@ -169,8 +169,22 @@ async function main(): Promise<void> {
       RIPPA_OLLAMA_MANAGED=true (or unlocking + starting it from the Control
       Panel) hands this node the responsibility of spawning, verifying and
       auto-restarting `ollama serve` itself — see services/ollamaManager.ts.
+
+      THE PERSISTED CONFIG IS NOW ALSO A SOURCE, AND THAT IS THE FIX FOR THE NODE
+      REBOOTING UNMANAGED. This used to read ONLY the environment variable, which
+      made the Control Panel's "managed" switch a session-only change: the next
+      restart — and the Watchdog restarts the node after every OTA swap — came
+      back unmanaged, on the 11434 default, and logged "No usable local model
+      found — staying a standard node".
+
+      `config.json` is the durable home because it is what `normalizeConfig`
+      carries through a GUI save, and because it lives in the persistent data
+      directory rather than depending on the working directory the Watchdog
+      happened to inherit. The env var is still honoured, and still wins, so an
+      operator who has always set it that way is unaffected.
     */
-    if (process.env.RIPPA_OLLAMA_MANAGED === "true") {
+    const persistedManaged = readCurrentConfig()?.OLLAMA_MANAGED === true;
+    if (persistedManaged || process.env.RIPPA_OLLAMA_MANAGED === "true") {
       ollamaManager.setManaged(true);
     }
 

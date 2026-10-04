@@ -21,6 +21,29 @@ export function check(name, pass, detail = "") {
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? " — " + detail : ""}`);
 }
 
+/**
+ * Reports an advisory finding WITHOUT failing the suite.
+ *
+ * WHY THIS EXISTS. Some assertions describe a fact about a DIFFERENT repository
+ * that this one cannot control. The clearest case is the Mothership's advertised
+ * fallback version: CI rewrites this repo's package.json on every single push,
+ * while that constant lives in a sibling repo and only moves when a human edits
+ * it. Asserting the two agree therefore guarantees a red build — the check is
+ * unsatisfiable by construction, not a signal about this code.
+ *
+ * A warning keeps the information visible in the log (an operator still sees the
+ * drift, and sees how far it has gone) while letting the build reflect the state
+ * of THIS repository. Turning an unfixable cross-repo fact into a hard gate is
+ * precisely how a suite starts being ignored wholesale, which would take the
+ * genuinely load-bearing checks down with it.
+ *
+ * It is deliberately NOT a `check`: it must never influence the exit code.
+ */
+export function warn(name, detail = "") {
+  results.push({ name, pass: true }); // counted, but never a failure
+  console.log(`WARN  ${name}${detail ? " — " + detail : ""}`);
+}
+
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Writes a throwaway master config and returns its directory. */

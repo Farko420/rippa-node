@@ -46,6 +46,29 @@ export interface RippaNodeConfig {
   /** LAN dashboard passkey (compared by POST /api/system/auth). */
   DASHBOARD_PIN: string;
   /**
+   * Whether this node supervises its own Ollama server (spawns, verifies and
+   * auto-restarts `ollama serve` on the managed 11435 port).
+   *
+   * PERSISTED, NOT JUST IN-MEMORY. This was previously only reachable through the
+   * `RIPPA_OLLAMA_MANAGED` environment variable, which has two failure modes:
+   *
+   *   1. The Control Panel's "managed" toggle called `ollamaManager.setManaged()`
+   *      and mutated a private field. Nothing wrote it anywhere, so the very next
+   *      restart — including the one the Watchdog performs after an OTA swap —
+   *      brought the node back unmanaged, at the 11434 default, logging "No usable
+   *      local model found". The operator's switch silently did nothing across a
+   *      reboot, which is the reported regression.
+   *   2. `normalizeConfig` REBUILDS the object on every GUI save and is not a
+   *      merge, so a field absent from it is DELETED from config.json. That is why
+   *      this field has to be named here explicitly — the same reason
+   *      `GITHUB_OTA_TOKEN` is carried through.
+   *
+   * `true` is the only affirmative value; everything else (absent, false, null,
+   * garbage) means unmanaged, so a corrupt config degrades to the safe default
+   * rather than to a node that spawns servers nobody asked for.
+   */
+  OLLAMA_MANAGED?: boolean;
+  /**
    * GitHub token the OTA updater authenticates release downloads with.
    *
    * CARRIED THROUGH `normalizeConfig` FOR THE SAME REASON `MESH_KEY` IS:
@@ -274,6 +297,14 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
     // See the interface note: dropped by a GUI save if not carried through here,
     // which would break OTA against the private release repository.
     GITHUB_OTA_TOKEN: pickString(record, "GITHUB_OTA_TOKEN", "github_ota_token") || undefined,
+    // Carried through for the same reason: `writeConfig` writes what this function
+    // returns and is NOT a merge, so omitting it here deletes the operator's
+    // "manage my own Ollama" choice on the next unrelated GUI save — the node then
+    // reboots unmanaged at 11434 and reports "No usable local model found".
+    //
+    // `=== true` (not truthiness) so a stray "false" STRING from a hand-edited
+    // config does not read as enabled. Absent/undefined means unmanaged.
+    OLLAMA_MANAGED: record["OLLAMA_MANAGED"] === true,
     node_role: role,
     master_node_url: masterLocal,
     dashboard_pin: pin,
