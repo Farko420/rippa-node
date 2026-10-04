@@ -88,6 +88,244 @@ export const BUNDLED_OLLAMA_PORT = 11435;
 export const BUNDLED_OLLAMA_ORIGIN = `http://127.0.0.1:${BUNDLED_OLLAMA_PORT}`;
 
 /**
+ * Env override for the bundled port, used by tests and by an operator whose
+ * 11435 is genuinely taken by something that is NOT an Ollama server.
+ *
+ * WHY THIS EXISTS NOW. The port used to be a bare constant consumed by the
+ * spawn, the readiness probe, the model pull and the status snapshot in four
+ * different places. Any of them drifting from the others produces a node that
+ * binds one port and is probed on another, which is the exact failure this
+ * function exists to make impossible: there is now ONE resolver, and every
+ * consumer asks it.
+ */
+export const BUNDLED_OLLAMA_PORT_ENV = "RIPPA_BUNDLED_OLLAMA_PORT";
+
+/**
+ * THE RESOLVED MANAGED PORT — the single authority for where this node's own
+ * Ollama server listens.
+ *
+ * Every consumer (spawn env, readiness wait, health probe, status snapshot,
+ * orphan guard, the `env.OLLAMA_URL` publish) MUST read this rather than
+ * re-deriving a port, so "the port we bind" and "the port we are asked about"
+ * cannot diverge.
+ *
+ * A malformed or out-of-range override is IGNORED rather than honoured: an
+ * operator typo must never leave the node trying to bind port 0 or 999999,
+ * which fails in a far more confusing way than simply using the default.
+ */
+export function resolveBundledOllamaPort(): number {
+  const raw = process.env[BUNDLED_OLLAMA_PORT_ENV];
+  if (!raw || !raw.trim()) return BUNDLED_OLLAMA_PORT;
+  const parsed = Number(raw.trim());
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    console.warn(
+      `[BundledOllama] Ignoring invalid ${BUNDLED_OLLAMA_PORT_ENV}="${raw}" — ` +
+        `falling back to ${BUNDLED_OLLAMA_PORT}.`,
+    );
+    return BUNDLED_OLLAMA_PORT;
+  }
+  return parsed;
+}
+
+/** Loopback origin for the resolved managed port. */
+export function bundledOllamaOrigin(): string {
+  return `http://127.0.0.1:${resolveBundledOllamaPort()}`;
+}
+
+/**
+ * ORPHANED OLLAMA — the "address already in use" boot failure.
+ *
+ * THE FAILURE THIS EXISTS TO PREVENT. `ollamaManager.stop()` escalates
+ * SIGTERM → SIGKILL and confirms the child is dead, but that only runs on the
+ * CLEAN exit paths. A power cut, a Task Manager kill, an OTA swap that replaces
+ * the exe, or an OOM kill all skip it, and the `ollama serve` child survives as
+ * an orphan still holding the managed port. The next boot then spawns a second
+ * server which cannot bind, exits, and lands in the crash-restart ladder — so
+ * the node reports the engine as permanently broken for a reason that has
+ * nothing to do with the engine.
+ *
+ * WHY THE SCOPE IS NARROW AND DELIBERATE. This runs against the MANAGED port
+ * only, never 11434. 11434 is where a human's personal Ollama lives, and this
+ * node deliberately moved OFF it precisely so it never touches that install
+ * (see the module docblock). Killing "an Ollama on the default port" would
+ * destroy the operator's own working setup to fix a problem on a port they are
+ * not using.
+ *
+ * WHY IT VERIFIES BEFORE IT KILLS. Something else may legitimately own the
+ * port — a genuinely different Ollama the operator started by hand, or an
+ * unrelated app. The port being busy is NOT evidence that the holder is a
+ * stale child of ours, so every candidate must positively identify as an
+ * Ollama server before a signal is sent. Anything ambiguous is left alone and
+ * reported, because an unattended node killing an unknown process is a far
+ * worse outcome than a boot that needs operator attention.
+ */
+
+/** Outcome of a pre-boot orphan sweep. */
+export interface OrphanSweepResult {
+  /** True when the managed port is clear (or was cleared by us). */
+  portFree: boolean;
+  /** PIDs that were terminated. */
+  killed: number[];
+  /** Human-readable notes for the boot log. */
+  notes: string[];
+}
+
+/** How long a terminate signal gets before we escalate to SIGKILL. */
+const ORPHAN_KILL_GRACE_MS = 5_000;
+/** Cap on how many PIDs one sweep will consider. */
+const ORPHAN_MAX_CANDIDATES = 8;
+
+/** True when the string looks like an Ollama server binary name. */
+function isOllamaImageName(name: string): boolean {
+  const base = name.trim().split(/[\\/]/).pop() ?? "";
+  // Matches ollama.exe / ollama and the "ollama app.exe" style bundle name
+  // Ollama ships on Windows. Anchored so "notollama" cannot pass.
+  return /^ollama(\.exe)?$/i.test(base) || /^ollama[\s-].*\.exe$/i.test(base);
+}
+
+/**
+ * Runs a read-only inventory command and returns stdout, or "" on any failure.
+ *
+ * Deliberately NEVER rejects: every caller treats "" as "cannot tell" rather
+ * than as an authoritative empty answer, so a missing platform tool degrades
+ * the sweep instead of throwing during boot.
+ */
+async function runInventory(cmd: string, args: string[]): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  return new Promise((resolve) => {
+    execFile(cmd, args, { windowsHide: true, timeout: 10_000 }, (error, stdout) => {
+      resolve(error ? "" : String(stdout ?? ""));
+    });
+  });
+}
+
+/**
+ * PIDs LISTENING on `port`, or [] when the lookup is unsupported.
+ *
+ * Windows uses `netstat -ano`; POSIX uses `lsof`. Both are read-only inventory
+ * calls — this function NEVER signals anything. It returns [] on any error, and
+ * the caller treats [] as "cannot tell", not as "nothing there".
+ */
+async function listeningPids(port: number): Promise<number[]> {
+  try {
+    if (process.platform === "win32") {
+      const out = await runInventory("netstat", ["-ano", "-p", "TCP"]);
+      const pids = new Set<number>();
+      for (const line of out.split(/\r?\n/)) {
+        // "TCP  127.0.0.1:11435  0.0.0.0:0  LISTENING  4242"
+        if (!/LISTENING/i.test(line)) continue;
+        const cols = line.trim().split(/\s+/);
+        if (cols.length < 5) continue;
+        const local = cols[1] ?? "";
+        const localPort = Number(local.slice(local.lastIndexOf(":") + 1));
+        const pid = Number(cols[cols.length - 1]);
+        if (localPort === port && Number.isInteger(pid) && pid > 0) pids.add(pid);
+      }
+      return [...pids].slice(0, ORPHAN_MAX_CANDIDATES);
+    }
+
+    const out = await runInventory("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
+    return out
+      .split(/\r?\n/)
+      .map((line) => Number(line.trim()))
+      .filter((pid) => Number.isInteger(pid) && pid > 0)
+      .slice(0, ORPHAN_MAX_CANDIDATES);
+  } catch {
+    return [];
+  }
+}
+
+/** The executable name behind a PID, or "" when it cannot be determined. */
+async function processImageName(pid: number): Promise<string> {
+  try {
+    if (process.platform === "win32") {
+      // CSV output, so the image name is a quoted field rather than a column
+      // whose width we would have to guess.
+      const out = await runInventory("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"]);
+      return out.match(/"([^"]*)"/)?.[1] ?? "";
+    }
+    return (await runInventory("ps", ["-p", String(pid), "-o", "comm="])).trim();
+  } catch {
+    return "";
+  }
+}
+
+/** Waits up to `ms` for `port` to stop having a listener. */
+async function waitForPortRelease(port: number, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if ((await listeningPids(port)).length === 0) return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, 500).unref?.());
+  }
+  return (await listeningPids(port)).length === 0;
+}
+
+/**
+ * PRE-BOOT ORPHAN SWEEP for the managed port.
+ *
+ * Runs BEFORE the managed server is spawned, so the child we start binds the
+ * port itself rather than racing a leftover process for it.
+ *
+ * NEVER THROWS. A sweep that cannot inventory the port returns `portFree:
+ * false` with a note, and the caller still attempts the spawn — a node that
+ * reports a busy port it cannot inspect is strictly more useful than one that
+ * refuses to boot because an inventory tool is missing.
+ *
+ * Only a PID that positively identifies as an Ollama binary is terminated.
+ */
+export async function sweepOrphanedOllama(
+  port = resolveBundledOllamaPort(),
+): Promise<OrphanSweepResult> {
+  const notes: string[] = [];
+  const pids = await listeningPids(port);
+  if (pids.length === 0) {
+    // [] means either "nothing there" or "could not tell". A follow-up HTTP
+    // probe separates them cheaply: if a server really is answering, we must
+    // not spawn a competitor even though the inventory came back empty.
+    if (await bundledServerAlive()) {
+      notes.push(
+        `An Ollama server is already answering on port ${port} but could not be attributed to a pid; leaving it alone.`,
+      );
+      return { portFree: false, killed: [], notes };
+    }
+    return { portFree: true, killed: [], notes };
+  }
+
+  const killed: number[] = [];
+  for (const pid of pids) {
+    const image = await processImageName(pid);
+    if (!isOllamaImageName(image)) {
+      notes.push(
+        `Port ${port} is held by pid ${pid}${image ? ` ("${image}")` : ""}, which is not an Ollama server — not touching it.`,
+      );
+      continue;
+    }
+    notes.push(`Terminating orphaned Ollama (pid ${pid}) holding port ${port}.`);
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // Already gone, or not ours to signal. Either way, fall through to the
+      // settle check rather than claiming a kill that did not happen.
+    }
+    if (!(await waitForPortRelease(port, ORPHAN_KILL_GRACE_MS))) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* it may have exited between the check and the signal */
+      }
+      await waitForPortRelease(port, 2_000);
+    }
+    killed.push(pid);
+  }
+
+  const remaining = await listeningPids(port);
+  if (remaining.length > 0) {
+    notes.push(`Port ${port} is still held after the sweep (pid(s): ${remaining.join(", ")}).`);
+  }
+  return { portFree: remaining.length === 0, killed, notes };
+}
+
+/**
  * The model the node is not considered "ready" without.
  *
  * Matches `PRIMARY_MODEL` in `agent/OllamaClient.ts`. It is re-declared as a
@@ -299,7 +537,8 @@ export function bundledRuntimeComplete(): boolean {
 export function bundledOllamaEnv(): NodeJS.ProcessEnv {
   return {
     OLLAMA_MODELS: bundledModelsDir(),
-    OLLAMA_HOST: `127.0.0.1:${BUNDLED_OLLAMA_PORT}`,
+    // Resolved, never the bare constant — this is the variable the child binds.
+    OLLAMA_HOST: `127.0.0.1:${resolveBundledOllamaPort()}`,
     OLLAMA_NOHISTORY: "1",
   };
 }
@@ -896,7 +1135,7 @@ function matchesModel(names: string[], target: string): boolean {
  * what models "this node" has.
  */
 export async function fetchBundledModels(): Promise<string[]> {
-  const response = await axios.get(`${BUNDLED_OLLAMA_ORIGIN}/api/tags`, {
+  const response = await axios.get(`${bundledOllamaOrigin()}/api/tags`, {
     timeout: 5_000,
     proxy: false,
   });
@@ -906,7 +1145,7 @@ export async function fetchBundledModels(): Promise<string[]> {
 /** True when the isolated server answers. Never throws â€” unreachable is false. */
 export async function bundledServerAlive(): Promise<boolean> {
   try {
-    await axios.get(`${BUNDLED_OLLAMA_ORIGIN}/api/tags`, { timeout: 3_000, proxy: false });
+    await axios.get(`${bundledOllamaOrigin()}/api/tags`, { timeout: 3_000, proxy: false });
     return true;
   } catch {
     return false;
@@ -1121,7 +1360,7 @@ export class BundledOllamaManager {
       modelsDir: bundledModelsDir(),
       version: installedBundledVersion(),
       binaryPresent: bundledBinaryPresent(),
-      port: BUNDLED_OLLAMA_PORT,
+      port: resolveBundledOllamaPort(),
       pid: this.child?.pid ?? null,
       restartCount: this.restartCount,
       lastError: this.lastError,
@@ -1162,13 +1401,13 @@ export class BundledOllamaManager {
       if (this.stopping) return;
 
       if (!(await waitForServer())) {
-        this.lastError = `the bundled Ollama server never answered on port ${BUNDLED_OLLAMA_PORT}`;
+        this.lastError = `the bundled Ollama server never answered on port ${resolveBundledOllamaPort()}`;
         console.warn(`[BundledOllama] ${this.lastError}.`);
         return;
       }
       this.state = "running";
       this.lastError = null;
-      console.log(`[BundledOllama] Serving on ${BUNDLED_OLLAMA_ORIGIN} (isolated).`);
+      console.log(`[BundledOllama] Serving on ${bundledOllamaOrigin()} (isolated).`);
 
       // Model provisioning is deliberately NOT awaited into readiness: a first pull
       // is multi-gigabyte and blocking boot on it would make a healthy node look

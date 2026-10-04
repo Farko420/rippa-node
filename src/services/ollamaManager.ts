@@ -22,10 +22,13 @@ import {
   BUNDLED_OLLAMA_PORT,
   bundledBinaryPath,
   bundledBinaryPresent,
+  bundledOllamaOrigin,
   bundledRuntimeComplete,
   bundledOllamaEnv,
   bundledOllama,
   ensureBundledBinary,
+  resolveBundledOllamaPort,
+  sweepOrphanedOllama,
 } from "./bundled-ollama";
 
 /**
@@ -289,7 +292,7 @@ class OllamaManager {
       THE BUNDLED RUNTIME OWNS ITS PORT, AND SAYS SO TO EVERY CONSUMER.
 
       Spawning on `extractPort(env.OLLAMA_URL)` while everything else in the
-      codebase (OllamaClient, localAi, the /api/chat proxy) reads OLLAMA_URL is
+      codebase (OllamaClient, localAi, the /v1/chat proxy) reads OLLAMA_URL is
       how a node ends up serving on one port and being asked about another. So
       the isolated origin is published into the environment as soon as we take
       ownership, and the rest of the process is pointed at it atomically.
@@ -297,9 +300,53 @@ class OllamaManager {
       An operator who does NOT enable management keeps their own OLLAMA_URL
       untouched — this only happens on the path where we spawn the child, so a
       node borrowing a host-wide Ollama behaves exactly as it did before.
+
+      *** THE `reloadEnv()` CALL IS THE ACTUAL FIX, AND IT WAS MISSING. ***
+
+      `env` is not a view of `process.env` — it is a plain object produced once
+      by zod at module load (`src/config.ts`). Assigning `process.env.OLLAMA_URL`
+      therefore changed NOTHING for the ~8 modules that import `env`. They kept
+      reading the stale `http://127.0.0.1:11434` while the child bound 11435,
+      which produced, all at once:
+
+        - `getPort()`/`getStatus().port` reporting 11434 to the Mothership, so
+          the fleet was told to call a port nothing was listening on;
+        - `probeHealth()` probing 11434 and reporting the engine OFFLINE while
+          it was healthy and holding models in VRAM;
+        - `/v1/chat/completions` and `/v1/embeddings` 502-ing on every request;
+        - `localAi` and the Orchestrator's `OllamaClient` aimed at a dead port.
+
+      `reloadEnv()` re-reads `process.env` into that object. Without it the
+      publish below was decoration.
     */
-    const port = BUNDLED_OLLAMA_PORT;
-    process.env.OLLAMA_URL = BUNDLED_OLLAMA_ORIGIN;
+    const port = resolveBundledOllamaPort();
+    publishManagedOllamaOrigin(port);
+
+    /*
+      CLEAR ANY ORPHAN BEFORE SPAWNING. A previous run that did not get to
+      `stop()` (power cut, Task Manager, OTA swap) leaves `ollama serve` alive
+      and holding this exact port; the new child then cannot bind, exits, and
+      walks straight into the crash-restart ladder. The sweep verifies each
+      holder really is an Ollama binary before signalling it, and never touches
+      11434 — see `sweepOrphanedOllama` for why that distinction is deliberate.
+    */
+    try {
+      const sweep = await sweepOrphanedOllama(port);
+      for (const note of sweep.notes) console.log(`[OllamaManager] ${note}`);
+      if (sweep.killed.length > 0) {
+        console.log(
+          `[OllamaManager] Cleared ${sweep.killed.length} orphaned Ollama process(es) from port ${port}.`,
+        );
+      }
+    } catch (error) {
+      // Never let a sweep failure block the spawn — the attempt below is the
+      // real test of whether the port is usable.
+      console.warn(
+        `[OllamaManager] Orphan sweep could not complete — ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
 
     // HARDWARE AUTO-PROFILING — a weak satellite laptop must never be handed
     // the 7B coder model; pick the model BEFORE spawning so the first pull
