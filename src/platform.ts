@@ -13,9 +13,9 @@
  *
  * Code reaching for a desktop-only capability has to ask first. Previously it
  * reached unconditionally: `ScraperService` called `ensureChromiumInstalled()` in
- * its constructor, which shells out to `npx playwright install chromium`. Inside
- * an APK that spawn fails, every idle foraging pass throws, and the node looks
- * permanently broken on a tablet.
+ * its constructor, which reaches for `node:child_process` and installs the
+ * Playwright browser. Inside an APK that require throws, every idle foraging
+ * pass throws, and the node looks permanently broken on a tablet.
  *
  * EVERY PROBE IS DEFENSIVE. This module is imported by code that also runs in a
  * WebView where `process` may be undefined. A detection helper that throws while
@@ -151,7 +151,7 @@ export function canSpawnProcesses(): boolean {
  * The single question the scraper asks before touching Playwright.
  *
  * False in a WebView and on any runtime that cannot spawn — exactly the set of
- * environments where `npx playwright install chromium` and `chromium.launch()`
+ * environments where the Playwright browser installer and `chromium.launch()`
  * are guaranteed to fail.
  */
 export function supportsBrowserScraping(): boolean {

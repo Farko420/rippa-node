@@ -57,9 +57,9 @@ const NETWORK_IDLE_CAP_MS = 5_000;
  * PLAYWRIGHT BROWSER BOOTSTRAP.
  *
  * On startup we check whether Playwright's Chromium binary is already on this
- * machine. If it is missing, `npx playwright install chromium` is kicked off
- * automatically in the background (silent, no CLI knowledge required) and the
- * first launch simply waits for the download to finish.
+ * machine. If it is missing, it is installed programmatically, in-process, via
+ * `playwright-core`'s internal registry (`agent/browserInstaller`) — with a
+ * direct CDN download as a fallback — and the first launch waits for it.
  */
 
 /** Resolved install promise so repeated checks never start a second download. */
@@ -91,15 +91,7 @@ function chromiumExecutablePath(): string | null {
   }
 }
 
-/** Bundled Playwright version (used to pin the installer to this exact build). */
-function bundledPlaywrightVersion(): string | null {
-  try {
-    const pkgJson = require("playwright/package.json") as { version?: unknown };
-    return typeof pkgJson.version === "string" ? pkgJson.version : null;
-  } catch {
-    return null;
-  }
-}
+
 
 function reportBootstrapFailure(reason: string): void {
   // Records the failure so every later scrape takes the lightweight path, then
@@ -111,7 +103,10 @@ function reportBootstrapFailure(reason: string): void {
     "[Scraper] Browser scraping is disabled for this run — falling back to the " +
       "lightweight fetch scraper. All other node capabilities stay online.",
   );
-  console.log('[Scraper] To restore it once online, run: npx playwright install chromium');
+  console.log(
+    "[Scraper] The node will retry automatically on its next boot once the " +
+      "Playwright CDN is reachable.",
+  );
 }
 
 /**
@@ -173,12 +168,10 @@ function ensureChromiumInstalled(): Promise<void> {
   */
   chromiumBootstrap = (async () => {
     try {
-      // `node:fs` and `node:child_process` are required HERE rather than
-      // imported at the top of the file, for the same reason Playwright is:
-      // this whole function is unreachable on mobile, and a static import would
-      // still be evaluated.
+      // `node:fs` is required HERE rather than imported at the top of the file,
+      // for the same reason Playwright is: this whole function is unreachable on
+      // mobile, and a static import would still be evaluated.
       const fs = require("node:fs") as typeof import("node:fs");
-      const { spawn } = require("node:child_process") as typeof import("node:child_process");
 
       /*
         THE PACKAGED-EXE PATH FIX. Must happen BEFORE the first
@@ -204,48 +197,41 @@ function ensureChromiumInstalled(): Promise<void> {
         "[Scraper] Downloading it now in the background (first run only — this can take a minute)…",
       );
 
-      const version = bundledPlaywrightVersion();
-      // Sanitized: only ever `playwright` or `playwright@<x.y.z>` (from package.json).
-      const spec = version && /^[\w.-]+$/.test(version) ? `playwright@${version}` : "playwright";
-      const onWindows = (process as { platform?: string }).platform === "win32";
-      // Windows needs the shell to reach npx.cmd. A single command string (no
-      // args array + shell:true) avoids Node's DEP0190 deprecation warning.
-      const child = onWindows
-        ? spawn(`npx --yes ${spec} install chromium`, {
-            cwd: process.cwd(),
-            stdio: "ignore",
-            detached: true,
-            shell: true,
-          })
-        : spawn("npx", ["--yes", spec, "install", "chromium"], {
-            cwd: process.cwd(),
-            stdio: "ignore",
-            detached: true,
-          });
+      /*
+        THE INSTALLER IS NOW PROGRAMMATIC. It used to be
+        `npx --yes playwright install chromium` spawned as a detached child,
+        which fails inside a `pkg` snapshot (no node_modules for npx to resolve)
+        and on any Windows host with no global Node.js (no npx on PATH at all) —
+        both producing "exit code 1" and a silent fall back to the lightweight
+        fetch scraper.
 
-      await new Promise<void>((resolve) => {
-        child.once("error", (error: Error) => {
-          reportBootstrapFailure(error.message);
-          resolve();
-        });
-        child.once("exit", (code, signal) => {
-          if (code === 0) {
-            // Verified rather than trusted: an installer that exits 0 having
-            // written nothing must not leave the node believing it has a
-            // browser, because that is the state where every scrape throws.
-            const landed = chromiumExecutablePath();
-            if (landed && fs.existsSync(landed)) {
-              console.log("[Scraper] Chromium download finished — scraping is ready.");
-            } else {
-              reportBootstrapFailure("the installer reported success but no browser was found");
-            }
-          } else {
-            reportBootstrapFailure(`exit code ${code ?? signal ?? "unknown"}`);
-          }
-          resolve();
-        });
-        child.unref();
+        `installChromium` drives playwright-core's own registry in-process and
+        falls back to a direct CDN download + unzip when that cannot run. It
+        never spawns a shell, and it verifies the executable afterwards rather
+        than trusting an exit code.
+      */
+      const { installChromium } = require("./browserInstaller") as typeof import("./browserInstaller");
+      const result = await installChromium({
+        browsersPath: resolveBrowserInstallDir() || undefined,
+        executablePath: chromiumExecutablePath,
       });
+
+      if (result.ok) {
+        console.log(
+          `[Scraper] Chromium download finished (${result.method}) — scraping is ready.`,
+        );
+        return;
+      }
+
+      // Verified rather than trusted: an installer that reports success having
+      // written nothing must not leave the node believing it has a browser,
+      // because that is the state where every scrape throws.
+      const landed = chromiumExecutablePath();
+      if (landed && fs.existsSync(landed)) {
+        console.log("[Scraper] Chromium download finished — scraping is ready.");
+        return;
+      }
+      reportBootstrapFailure(result.detail);
     } catch (error) {
       reportBootstrapFailure(error instanceof Error ? error.message : String(error));
     }
@@ -324,10 +310,10 @@ export class ScraperService {
     /*
       THE CHROMIUM BOOTSTRAP IS SKIPPED ON MOBILE — THE CRITICAL LINE FOR THE APK.
 
-      `ensureChromiumInstalled()` shells out to `npx playwright install chromium`.
-      Inside the Capacitor WebView there is no `child_process`, so that spawn
-      throws — and it throws from a CONSTRUCTOR, i.e. while the Orchestrator is
-      still being built. The failure took the node down at boot on a tablet,
+      `ensureChromiumInstalled()` reaches for `node:child_process` and installs
+      the browser. Inside the Capacitor WebView there is no `child_process`, so
+      that throws — and it throws from a CONSTRUCTOR, i.e. while the Orchestrator
+      is still being built. The failure took the node down at boot on a tablet,
       before a single task ran. Guarding it here is what lets the APK start at
       all; the mobile path in `scrape()` then takes over with no Chromium.
     */

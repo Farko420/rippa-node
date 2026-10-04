@@ -49,6 +49,21 @@ export interface UpdateStamp {
   version?: string;
   /** ISO-8601 instant the install completed. */
   at?: string;
+  /**
+   * The GitHub Actions RUN ID this binary was installed from.
+   *
+   * WHY THIS EXISTS. OTA is now artifact-driven, and a workflow run ID is
+   * strictly increasing where a version string is not: two builds can share a
+   * `package.json` version, and a SemVer comparison then correctly refuses to
+   * update even though the newer build is genuinely newer. Recording the run ID
+   * gives the updater an unambiguous "is the remote newer than me" signal that
+   * version-string coincidence cannot defeat.
+   *
+   * Optional and additive — a stamp written by an older build simply has none,
+   * and the updater treats that as "build unknown", falling back to the version
+   * comparison it has always used.
+   */
+  runId?: number;
 }
 
 /**
@@ -75,11 +90,26 @@ export function readUpdateStamp(): UpdateStamp | null {
     const record = parsed as Record<string, unknown>;
     const version = typeof record.version === "string" ? record.version : undefined;
     const at = typeof record.at === "string" ? record.at : undefined;
+    const runId = typeof record.runId === "number" && Number.isFinite(record.runId) ? record.runId : undefined;
     if (!version && !at) return null;
-    return { version, at };
+    return { version, at, ...(runId !== undefined ? { runId } : {}) };
   } catch {
     return null;
   }
+}
+
+/**
+ * The workflow run ID of the build this node is currently running, or `null`.
+ *
+ * `null` means "unknown" — a stamp written by a build predating artifact OTA,
+ * or no stamp at all — and every caller must treat it as "fall back to the
+ * version comparison" rather than as "install unconditionally". Getting that
+ * distinction wrong in the permissive direction would restart the fleet on
+ * every single poll.
+ */
+export function installedRunId(): number | null {
+  const runId = readUpdateStamp()?.runId;
+  return typeof runId === "number" && Number.isFinite(runId) ? runId : null;
 }
 
 /**
@@ -91,10 +121,18 @@ export function readUpdateStamp(): UpdateStamp | null {
  *
  * @returns the stamp written, or `null` when it could not be persisted.
  */
-export function recordUpdateApplied(version: string = APP_VERSION, at?: string): UpdateStamp | null {
+export function recordUpdateApplied(
+  version: string = APP_VERSION,
+  at?: string,
+  runId?: number,
+): UpdateStamp | null {
   const stamp: UpdateStamp = {
     version: String(version || APP_VERSION).trim(),
     at: at ?? new Date().toISOString(),
+    // Preserved across a re-stamp: `reconcileUpdateStamp` re-stamps a build it
+    // did not install, and dropping the run ID there would make the updater
+    // believe it has never seen a build and re-download the same one forever.
+    ...(runId ?? readUpdateStamp()?.runId ? { runId: runId ?? readUpdateStamp()?.runId } : {}),
   };
   try {
     const target = updateStampPath();

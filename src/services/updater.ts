@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
+import extract from "extract-zip";
 import { APP_VERSION, isVersionNewer, isVersionOlder } from "../version";
 import { ensureNodeIdentity } from "../config/nodeAuth";
 import type { PeerEndpoint } from "../config/nodeAuth";
@@ -91,12 +92,17 @@ export {
 import {
   GITHUB_REPO,
   RELEASE_ASSET_NAME,
-  currentReleaseAssetName,
   githubHeaders,
   releaseDownloadUrl,
   resolveGitHubAssetDownload,
   resolveGitHubToken,
 } from "../update/githubAsset";
+import {
+  fetchLatestArtifactBuild,
+  WORKFLOW_EXE_NAME,
+  workflowZipHeaders,
+} from "../update/actionsArtifact";
+import { installedRunId, recordUpdateApplied } from "../update/updateStamp";
 
 /** How often the Master polls GitHub for a newer release. */
 const CHECK_INTERVAL_MS = 60 * 60_000; // hourly
@@ -120,6 +126,23 @@ export interface ReleaseInfo {
   /** Optional hex SHA-256, verified when present. */
   sha256?: string;
   notes?: string;
+  /**
+   * GitHub Actions run this build came from, when it came from one.
+   *
+   * THIS IS THE PRIMARY FRESHNESS SIGNAL. Run IDs increase strictly with every
+   * deployment, so "is the remote newer than what I am running" is a numeric
+   * comparison rather than a SemVer one — which matters because two CI builds
+   * routinely share a `package.json` version, and a version-only updater then
+   * correctly declines to update a node that is genuinely behind.
+   */
+  runId?: number;
+  /**
+   * True when `downloadUrl` serves a ZIP that must be UNPACKED before it is an
+   * executable. The Actions artifact endpoint always does; a release asset
+   * never does, and treating one as the other installs a zip as `rippa-node.exe`
+   * and bricks the node on the next boot.
+   */
+  isZip?: boolean;
 }
 
 /** Wire command the Master sends to each satellite. */
@@ -283,6 +306,71 @@ function logNoReleases(repo: string): void {
   );
 }
 
+/**
+ * RESOLVES THE LATEST DEPLOYMENT — artifact first, release as the fallback.
+ *
+ * THE ARTIFACT PATH IS THE DEFAULT, and the release path is the fallback, which
+ * is the opposite of the old ordering and is the whole point of this change:
+ *
+ *   1. `GET /actions/runs?branch=main&status=success` → newest successful run →
+ *      `GET /actions/runs/{id}/artifacts` → the `rippa-node-windows` artifact.
+ *      Every push to main publishes one of these, so the fleet now tracks every
+ *      commit rather than only operator-tagged SemVer releases.
+ *   2. `GET /releases/latest`, exactly as before — used when there is no token,
+ *      the Actions API is unreachable, or the newest run published no artifact.
+ *
+ * A `null` here means "there is nothing to install", and must never be
+ * conflated with "the check failed" — the caller logs those differently because
+ * one is normal and the other is an operator problem.
+ */
+export async function fetchLatestDeployment(repo = GITHUB_REPO): Promise<ReleaseInfo | null> {
+  const build = await fetchLatestArtifactBuild({ repo });
+  if (!build) return fetchLatestRelease(repo);
+
+  /*
+    THE VERSION IS NOT TRUSTED FROM THE ARTIFACT — IT IS DISPLAY ONLY.
+
+    The workflow run's title is a commit message and need not carry a version at
+    all. `APP_VERSION` is the safe label: the freshness decision is made on
+    `runId`, and a human-readable version that happens to equal the local one
+    cannot wedge that decision.
+  */
+  const version = build.version ?? APP_VERSION;
+  console.log(
+    `[Updater] Latest deployment is workflow run ${build.runId}` +
+      `${build.headSha ? ` (${build.headSha.slice(0, 7)})` : ""} → artifact "${build.artifactName}".`,
+  );
+
+  return {
+    tag: `run-${build.runId}`,
+    version,
+    downloadUrl: build.zipUrl,
+    runId: build.runId,
+    isZip: true,
+    notes: `workflow run ${build.runId} (${build.artifactName})`,
+  };
+}
+
+/**
+ * True when `candidate` is a build this node should install.
+ *
+ * THE RUN ID DECIDES WHEN BOTH SIDES HAVE ONE. That is the case this epic
+ * exists for: two builds from the same `package.json` version are different
+ * binaries, and only the run ID can tell them apart.
+ *
+ * WHEN EITHER SIDE LACKS A RUN ID, THIS FALLS BACK TO THE SEMVER COMPARISON IT
+ * HAS ALWAYS USED — never to "yes, install it". A node whose own build is
+ * unknown, or a remote build from a pre-artifact workflow, must not be
+ * restarted on every poll; that is the failure mode the permissive default
+ * would produce.
+ */
+export function isDeploymentNewer(candidate: ReleaseInfo, localRunId: number | null): boolean {
+  if (typeof localRunId === "number" && typeof candidate.runId === "number") {
+    return candidate.runId > localRunId;
+  }
+  return isVersionNewer(candidate.version);
+}
+
 /** Reads the first `count` bytes of a file. */
 async function readFirstBytes(filePath: string, count: number): Promise<Buffer> {
   const handle = await fs.promises.open(filePath, "r");
@@ -403,7 +491,7 @@ export class SwarmUpdater {
 
     let release: ReleaseInfo | null = null;
     try {
-      release = await fetchLatestRelease();
+      release = await fetchLatestDeployment();
     } catch (error) {
       // 404 is handled inside fetchLatestRelease and returns null, so anything
       // reaching here is a genuine fault (rate limit, 5xx, DNS, timeout) and is
@@ -417,7 +505,7 @@ export class SwarmUpdater {
       // silently finds nothing is indistinguishable from one ignoring the
       // command. Name the repo so the cause is one glance away.
       console.log(
-        `[Updater] No release asset found for ${GITHUB_REPO} — ` +
+        `[Updater] No deployable build found for ${GITHUB_REPO} — ` +
           "nothing to update. Check RIPPA_GITHUB_REPO if this node was told to update.",
       );
       return false;
@@ -425,9 +513,9 @@ export class SwarmUpdater {
     this.latest = release;
 
     /*
-      THE DOWNGRADE GUARD, BEFORE THE VERSION GATE.
+      THE DOWNGRADE GUARD, BEFORE THE FRESHNESS GATE.
 
-      `force` means "install this exact release even though it is the one I am
+      `force` means "install this exact build even though it is the one I am
       already running" — the repair for a corrupt or half-swapped install. It does
       NOT mean "install anything the cloud points at": without this check, a
       `FORCE_UPDATE` on a v1.0.15 node would happily install an advertised
@@ -437,30 +525,40 @@ export class SwarmUpdater {
 
       The comparison is a strict "older than", so re-installing the SAME version
       — the actual point of a forced update — still works.
+
+      NOTE THIS STILL COMPARES VERSIONS, not run IDs: a run ID is not
+      "older than" anything, it is simply newer or equal, so there is no
+      downgrade direction for it to protect against.
     */
     const allowDowngrade = options.allowDowngrade === true;
     if (!allowDowngrade && isVersionOlder(release.version, APP_VERSION)) {
       console.warn(
-        `[Updater] Refusing to downgrade: the latest release is v${release.version} but this ` +
+        `[Updater] Refusing to downgrade: the latest build is v${release.version} but this ` +
           `node runs v${APP_VERSION}. Pass allow_downgrade to force it if that is intended.`,
       );
       return false;
     }
 
-    if (!force && !isVersionNewer(release.version)) {
-      console.log(`[Updater] Fleet is up to date (v${APP_VERSION}).`);
+    if (!force && !isDeploymentNewer(release, installedRunId())) {
+      console.log(
+        `[Updater] Fleet is up to date (v${APP_VERSION}` +
+          `${typeof release.runId === "number" ? `, run ${release.runId}` : ""}).`,
+      );
       return false;
     }
-    if (!force && release.version === this.lastAttempted) {
+    // The attempt marker is the RUN ID when there is one: the version alone
+    // cannot distinguish two builds of the same release, and retrying a failed
+    // install of a superseded run is pure waste on a 126 MB download.
+    const attemptKey = release.runId !== undefined ? `run-${release.runId}` : release.version;
+    if (!force && this.lastAttempted === attemptKey) {
       console.warn(
-        `[Updater] v${release.version} already attempted and did not complete — ` +
-          "waiting for a newer build.",
+        `${attemptKey} already attempted and did not complete — waiting for a newer build.`,
       );
       return false;
     }
 
     this.updating = true;
-    this.lastAttempted = release.version;
+    this.lastAttempted = attemptKey;
     try {
       // Update this node first. On success the process exits inside
       // applyToSelf(), so the broadcast below only runs when the local swap was
@@ -615,6 +713,23 @@ export class SwarmUpdater {
       console.log(`[Updater] Verified download — ${TEMP_UPDATE_FILE} (${formatMb(size)}).`);
 
       const targetExe = currentExecutable();
+
+      /*
+        THE RUN ID IS RECORDED BEFORE THE HANDOFF, not after the swap.
+
+        The watchdog stamps the version once the new binary is actually in
+        place, but the run ID has to be written by the process that DECIDED to
+        install it — this one knows which run it downloaded, and after
+        `completeHandoff` nothing in this process runs again. Writing it here is
+        what stops the next boot's poll from seeing the same run as "newer" and
+        downloading it a second time.
+      */
+      recordUpdateApplied(
+        release.version,
+        undefined,
+        release.runId,
+      );
+
       /*
         THE HANDOFF IS A SUPERVISOR DECISION. Under the Watchdog this exits 43
         and the watchdog puts the new build in place and boots it; a standalone
@@ -648,9 +763,91 @@ export class SwarmUpdater {
    * never receives this node's repo token or API key.
    */
   private async download(release: ReleaseInfo, partialPath: string): Promise<void> {
-    const headers: Record<string, string> = { Accept: "application/octet-stream" };
-    let downloadUrl = release.downloadUrl;
+    /*
+      THE ARTIFACT PATH IS A ZIP AND MUST BE UNPACKED BEFORE IT IS STAGED.
 
+      `actions/artifacts/{id}/zip` always serves an archive, never a bare exe.
+      Staging it verbatim would hand the swap a zip named `temp_update.exe`,
+      which fails the checks below and bricks the node on the next boot. So an
+      artifact download is streamed to its own scratch file, unpacked, and the
+      exe inside is copied to `partialPath` — after which the size, PE-magic and
+      checksum verification runs unchanged, on the real executable.
+    */
+    const scratch = path.join(path.dirname(partialPath), "artifact");
+    const zipPath = `${partialPath}.zip`;
+    const unpackDir = path.join(scratch, "unpacked");
+
+    if (release.isZip) {
+      fs.rmSync(scratch, { recursive: true, force: true });
+      fs.mkdirSync(unpackDir, { recursive: true });
+      try {
+        await this.stream(release.downloadUrl, workflowZipHeaders(), zipPath);
+        await extract(zipPath, { dir: unpackDir });
+        const exe = this.findExeIn(unpackDir);
+        if (!exe) {
+          throw new Error(
+            `the workflow artifact published no ${WORKFLOW_EXE_NAME} — it contained: ` +
+              `${describeEntries(unpackDir)}`,
+          );
+        }
+        /*
+          COPY, NOT MOVE. The staging directory and its scratch child can sit on
+          different volumes, where `renameSync` throws EXDEV — which reads as a
+          mysterious "update aborted" on exactly the machines that need it most.
+        */
+        fs.copyFileSync(exe, partialPath);
+        console.log(`[Updater] Unpacked ${path.basename(exe)} from the workflow artifact.`);
+      } finally {
+        // Pure intermediate state: leaving 126 MB of it behind on every failed
+        // attempt is how the persistent data directory fills up.
+        fs.rmSync(scratch, { recursive: true, force: true });
+        fs.rmSync(zipPath, { force: true });
+      }
+    } else {
+      await this.stream(release.downloadUrl, await this.releaseExeHeaders(release), partialPath);
+    }
+
+    await this.verifyStagedExe(release, partialPath);
+  }
+
+  /**
+   * Finds the compiled node inside an unpacked artifact.
+   *
+   * The exact name wins, then any `.exe` EXCLUDING the watchdog — installing the
+   * supervisor over the worker is a silent, total failure: the machine comes back
+   * running a supervisor that spawns no worker and reports the node offline.
+   */
+  private findExeIn(dir: string): string | null {
+    const files: string[] = [];
+    const walk = (current: string, depth: number): void => {
+      if (depth > 4) return;
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        const full = path.join(current, entry.name);
+        if (entry.isDirectory()) walk(full, depth + 1);
+        else files.push(full);
+      }
+    };
+    walk(dir, 0);
+
+    const exes = files.filter((file) => file.toLowerCase().endsWith(".exe"));
+    const exact = exes.find(
+      (file) => path.basename(file).toLowerCase() === WORKFLOW_EXE_NAME.toLowerCase(),
+    );
+    if (exact) return exact;
+    return exes.find((file) => !/watchdog/i.test(path.basename(file))) ?? null;
+  }
+
+  /**
+   * Resolves the release-asset download to an AUTHENTICATED endpoint.
+   *
+   * A GitHub-hosted release URL goes through `resolveGitHubAssetDownload` for
+   * exactly the reason the Mothership updater does: this repository is PRIVATE,
+   * so `.../releases/latest/download/rippa-node.exe` answers 404 to every
+   * anonymous request — byte-identical to "no asset by that name". The log
+   * lines are kept so a failure reports WHY, not only that it happened.
+   */
+  private async releaseExeHeaders(release: ReleaseInfo): Promise<Record<string, string>> {
+    const headers: Record<string, string> = { Accept: "application/octet-stream" };
     const diagnostics: string[] = [];
     const authenticated = await resolveGitHubAssetDownload(release.downloadUrl, {
       logPrefix: "[Updater]",
@@ -658,44 +855,70 @@ export class SwarmUpdater {
       allowPrerelease: process.env.RIPPA_GITHUB_ALLOW_PRERELEASE === "true",
     });
     if (authenticated) {
-      downloadUrl = authenticated.url;
       Object.assign(headers, authenticated.headers);
     } else {
       headers["User-Agent"] = "rippa-node-updater";
     }
-    const cause = (): string => (diagnostics.length ? ` ${diagnostics.join(" ")}` : "");
+    this.diagnostics = diagnostics;
+    return headers;
+  }
+
+  /** Diagnostics collected by the most recent header resolution, for errors. */
+  private diagnostics: string[] = [];
+
+  /**
+   * Streams `url` to `target`, mapping GitHub's status codes to NAMED causes.
+   *
+   * Shared by both download routes so the artifact and release paths report
+   * identically — an operator debugging a stalled update should not have to know
+   * which one fed it.
+   *
+   * NO SIZE OR CHECKSUM VERIFICATION HAPPENS HERE. On the artifact route the file
+   * streamed is a ZIP, and the size ceiling that protects against a
+   * run-away download must still apply to it (hence `MAX_UPDATE_BYTES` below),
+   * while the MZ magic and SHA-256 checks only make sense on the exe inside —
+   * so they live in `verifyStagedExe`.
+   */
+  private async stream(
+    url: string,
+    headers: Record<string, string>,
+    target: string,
+  ): Promise<void> {
+    const cause = (): string => (this.diagnostics.length ? ` ${this.diagnostics.join(" ")}` : "");
 
     let response;
     try {
-      response = await axios.get(downloadUrl, {
+      response = await axios.get(url, {
         responseType: "stream",
         timeout: DOWNLOAD_TIMEOUT_MS,
         headers,
-        // 404 is the private-repo-without-a-token signature, so it is surfaced
-        // as a named cause rather than as a generic HTTP failure.
+        // Out-of-band errors are mapped below; here anything 2xx is a body.
         validateStatus: (status) => status >= 200 && status < 300,
       });
     } catch (error) {
-      if (axios.isAxiosError(error) && error.response?.status === 404) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status === 404) {
         throw new Error(
-          `HTTP 404 downloading ${downloadUrl} — the asset "${currentReleaseAssetName()}" ` +
-            "does not exist under that exact name on the latest release, or the " +
+          `HTTP 404 downloading ${url} — the artifact or asset does not exist ` +
+            "(workflow artifacts are DELETED once their retention window ends), or the " +
             `repository is private and no GITHUB_TOKEN is configured.${cause()}`,
         );
       }
-      if (
-        axios.isAxiosError(error) &&
-        (error.response?.status === 401 || error.response?.status === 403)
-      ) {
+      if (status === 401 || status === 403) {
         throw new Error(
-          `HTTP ${error.response?.status} downloading ${downloadUrl} — GitHub rejected the ` +
-            `configured token (expired, revoked, or no access to this repository).${cause()}`,
+          `HTTP ${status} downloading ${url} — GitHub rejected the configured token ` +
+            `(expired, revoked, or lacking access to this repository).${cause()}`,
+        );
+      }
+      if (status === 410) {
+        throw new Error(
+          `HTTP 410 downloading ${url} — the artifact has expired and GitHub no ` +
+            `longer serves it.${cause()}`,
         );
       }
       throw error;
     }
 
-    const hash = createHash("sha256");
     let bytes = 0;
     await pipeline(
       response.data,
@@ -703,18 +926,33 @@ export class SwarmUpdater {
         for await (const chunk of source) {
           bytes += chunk.length;
           if (bytes > MAX_UPDATE_BYTES) {
-            throw new Error("download exceeded the maximum plausible exe size");
+            throw new Error("download exceeded the maximum plausible build size");
           }
-          hash.update(chunk);
           yield chunk;
         }
       },
-      fs.createWriteStream(partialPath),
+      fs.createWriteStream(target),
     );
 
     if (bytes < MIN_UPDATE_BYTES) {
+      throw new Error(`download is only ${bytes} bytes — expected at least ${formatMb(MIN_UPDATE_BYTES)}`);
+    }
+  }
+
+  /**
+   * Checks that what is staged is a REAL Windows executable and, when the
+   * publisher supplied one, that it is the expected bytes.
+   *
+   * This is what makes the zip route trustworthy: the artifact endpoint could
+   * return a 200 with an HTML error page, a truncated archive, or a superseded
+   * binary, and the only thing standing between any of those and a bricked node
+   * is the MZ magic read here.
+   */
+  private async verifyStagedExe(release: ReleaseInfo, partialPath: string): Promise<void> {
+    const stat = fs.statSync(partialPath);
+    if (stat.size < MIN_UPDATE_BYTES) {
       throw new Error(
-        `download is only ${bytes} bytes — expected at least ${formatMb(MIN_UPDATE_BYTES)}`,
+        `staged build is only ${stat.size} bytes — expected at least ${formatMb(MIN_UPDATE_BYTES)}`,
       );
     }
 
@@ -725,7 +963,7 @@ export class SwarmUpdater {
     }
 
     if (release.sha256) {
-      const digest = hash.digest("hex");
+      const digest = await sha256File(partialPath);
       if (digest.toLowerCase() !== release.sha256.toLowerCase()) {
         throw new Error(`checksum mismatch (expected ${release.sha256}, got ${digest})`);
       }
@@ -749,6 +987,47 @@ export class SwarmUpdater {
 
 function formatMb(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Streams a file through SHA-256 and returns the hex digest.
+ *
+ * A separate pass rather than a hash fed by the download stream, because the
+ * artifact route hashes the EXTRACTED EXE — a file that never passed through the
+ * download stream at all.
+ */
+async function sha256File(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  await pipeline(fs.createReadStream(filePath), async function* (source: AsyncIterable<Buffer>) {
+    for await (const chunk of source) {
+      hash.update(chunk);
+      yield chunk;
+    }
+  }, async function* (source: AsyncIterable<Buffer>) {
+    // Drain so the read stream is fully consumed even though we emit nothing.
+    for await (const _ of source) {
+      /* discard */
+    }
+  });
+  return hash.digest("hex");
+}
+
+/** Names inside a directory, for an error message. Never throws. */
+function describeEntries(dir: string): string {
+  try {
+    const names: string[] = [];
+    const walk = (current: string, depth: number): void => {
+      if (depth > 4) return;
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        names.push(entry.name);
+        if (entry.isDirectory()) walk(path.join(current, entry.name), depth + 1);
+      }
+    };
+    walk(dir, 0);
+    return names.length ? names.slice(0, 20).join(", ") : "(nothing)";
+  } catch {
+    return "(could not be listed)";
+  }
 }
 
 /** Body the Master sends in a `SWARM_UPDATE_TRIGGER`. */

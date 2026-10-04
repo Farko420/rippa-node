@@ -1418,6 +1418,104 @@ check("the claimed task then executes", seen.some((s) => s[0] === "handle" && s[
 check("node status switched to 'working'", seen.some((s) => s[0] === "status" && s[1] === "working"));
 check("the result is reported back upstream", seen.some((s) => s[0] === "result" && s[1] === "success"));
 
+// ===========================================================================
+// ARTIFACT-DRIVEN OTA — the latest SUCCESSFUL BUILD, not the latest tag.
+//
+// This is the behaviour that replaces the old "wait for a SemVer release" rule:
+// every push to main publishes a workflow artifact, and the fleet installs the
+// newest successful one by comparing monotonic RUN IDs.
+// ===========================================================================
+const actions = await load("dist/update/actionsArtifact.js");
+
+check(
+  "the runs query targets main and asks only for successful runs",
+  actions.workflowRunsApiUrl("Farko420/rippa-node", "main") ===
+    "https://api.github.com/repos/Farko420/rippa-node/actions/runs?branch=main&status=success&per_page=10",
+  actions.workflowRunsApiUrl("Farko420/rippa-node", "main"),
+);
+
+check(
+  "the artifact list endpoint is built from the run id",
+  actions.workflowRunArtifactsApiUrl("o/r", 4242) ===
+    "https://api.github.com/repos/o/r/actions/runs/4242/artifacts",
+);
+
+check(
+  "the download endpoint is the artifact zip (always an archive)",
+  actions.workflowArtifactZipApiUrl("o/r", 99) ===
+    "https://api.github.com/repos/o/r/actions/artifacts/99/zip",
+);
+
+// THE CORE REGRESSION GUARD: the newest SUCCESSFUL run wins even when a newer
+// run exists that failed. Installing a failed build's partial artifact is
+// exactly the failure this ordering exists to prevent.
+const RUNS = {
+  workflow_runs: [
+    { id: 30, status: "completed", conclusion: "failure", head_sha: "aaa" },
+    { id: 29, status: "completed", conclusion: "success", head_sha: "bbb", display_title: "fix: scraper" },
+    { id: 28, status: "in_progress", conclusion: null, head_sha: "ccc" },
+    { id: 20, status: "completed", conclusion: "success", head_sha: "ddd" },
+  ],
+};
+check(
+  "the newest SUCCESSFUL run wins, skipping newer failed/in-flight runs",
+  actions.pickNewestSuccessfulRun(RUNS)?.id === 29,
+  JSON.stringify(actions.pickNewestSuccessfulRun(RUNS)),
+);
+check(
+  "an empty or malformed runs payload yields no run (not a crash)",
+  actions.pickNewestSuccessfulRun({ workflow_runs: [] }) === null &&
+    actions.pickNewestSuccessfulRun(null) === null &&
+    actions.pickNewestSuccessfulRun({}) === null,
+);
+
+// The workflow uploads SEVERAL artifacts; picking the APK over the worker, or
+// the watchdog over the worker, is a silent total failure.
+const ARTIFACTS = {
+  artifacts: [
+    { id: 1, name: "rippa-satellite-apk" },
+    { id: 2, name: "rippa-node-windows", size_in_bytes: 5 },
+  ],
+};
+check(
+  "the exact windows artifact is chosen over the APK",
+  actions.selectWorkflowArtifact(ARTIFACTS)?.id === 2,
+  JSON.stringify(actions.selectWorkflowArtifact(ARTIFACTS)),
+);
+check(
+  "an EXPIRED artifact is skipped (GitHub lists it but 410s the download)",
+  actions.selectWorkflowArtifact({
+    artifacts: [{ id: 5, name: "rippa-node-windows", expired: true }],
+  }) === null,
+);
+check(
+  "a renamed artifact still resolves via the .zip/.exe fallbacks",
+  actions.selectWorkflowArtifact({ artifacts: [{ id: 6, name: "build.zip" }] })?.id === 6,
+);
+
+// THE FRESHNESS RULE. Run IDs decide when both sides have one — this is the
+// whole point, because two CI builds routinely share a package.json version.
+const dep = (runId, version) => ({ tag: "t", version, downloadUrl: "https://x/y.zip", runId });
+check(
+  "a newer run id installs even when the VERSION is identical",
+  updater.isDeploymentNewer(dep(31, "1.0.24"), 30) === true,
+);
+check(
+  "the same run id is not an update (no restart loop)",
+  updater.isDeploymentNewer(dep(30, "1.0.24"), 30) === false,
+);
+check(
+  "an OLDER run id is refused even when the version looks newer",
+  updater.isDeploymentNewer(dep(29, "9.9.9"), 30) === false,
+);
+const version = await load("dist/version.js");
+check(
+  "with no local run id it falls back to SemVer (never a blind install)",
+  updater.isDeploymentNewer(dep(null, "9.9.9"), 30) === true &&
+    updater.isDeploymentNewer({ tag: "t", version: "1.0.24", downloadUrl: "https://x" }, null) ===
+      version.isVersionNewer("1.0.24"),
+);
+
 // The idlers above are console noise from the node itself; the summary is the
 // result. The idle forager's "runPass is not a function" line is this harness's
 // stub forager being deliberately minimal, not a product fault.
