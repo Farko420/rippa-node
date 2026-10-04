@@ -779,6 +779,31 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
   var otaVersion = document.getElementById('otaVersion');
   var otaStatus = document.getElementById('otaStatus');
 
+  /*
+     THE COMPARISON THIS PAGE NEEDS, INLINED.
+
+     renderOta() runs inside the WebView with no bundler and no import, so the
+     shared isVersionOlder() in src/version-compare.ts is NOT in scope here.
+     Deliberately a strict numeric [major, minor, patch] walk rather than a
+     string compare, because '1.0.9' sorts BELOW '1.0.28' as text.
+
+     Returns false for anything unparseable, so a malformed advertised version
+     reads as 'not behind' and falls through to the ordinary wording -- the safe
+     direction, since that path never claims a downgrade was found.
+  */
+  function isVersionOlder(candidate, current) {
+    function parts(value) {
+      var m = /^v?(\\d+)\\.(\\d+)\\.(\\d+)/.exec(String(value == null ? '' : value).trim());
+      return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+    }
+    var next = parts(candidate);
+    var mine = parts(current);
+    if (!next || !mine) return false;
+    for (var i = 0; i < 3; i += 1) {
+      if (next[i] !== mine[i]) return next[i] < mine[i];
+    }
+    return false; // equal is not older
+  }
   function renderOta(check) {
     if (!check) return;
     var installed = check.currentVersion || '';
@@ -786,8 +811,31 @@ const MOBILE_INDEX_HTML = `<!DOCTYPE html>
 
     if (check.state === 'available') {
       if (otaStatus) {
-        otaStatus.textContent = 'v' + installed + ' \u2192 v' + check.remoteVersion +
-          ' is available. Use the Update & Install button above.';
+        /*
+           DO NOT CALL A STALE ADVERTISED NUMBER AN "UPDATE".
+
+           /api/node/latest-apk is tried first and reports its version as a
+           PRESENTATIONAL LABEL: the download URL is authoritative, but the
+           number beside it is a last-resort constant whenever
+           LATEST_APK_VERSION is unpinned. A forced check deliberately ignores
+           the version gate so an operator can reinstall the published build,
+           which is right, but rendering that as a v1.0.32 -> v1.0.28 arrow reads
+           as a downgrade being offered and leaves the operator unsure whether
+           to press the button.
+
+           So the wording follows the DIRECTION of travel. An advertised number
+           behind the installed one means the label is stale, and the honest
+           sentence says the published APK is available WITHOUT claiming it is
+           newer. The version gate itself is untouched: an unforced poll still
+           returns "current" for an older remote, which is the real fix.
+        */
+        var behind = isVersionOlder(check.remoteVersion, installed);
+        otaStatus.textContent = behind
+          ? 'The Mothership publishes an APK but reports v' + check.remoteVersion +
+            ', which is behind this device. The published build can still be' +
+            ' installed below, but it is not reported as newer.'
+          : 'v' + installed + ' \u2192 v' + check.remoteVersion +
+            ' is available. Use the Update & Install button above.';
         otaStatus.style.color = 'var(--warn)';
       }
       // renderUpdate() has already raised the banner; nothing more to do here.

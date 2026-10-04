@@ -6,7 +6,8 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { execSync } from "node:child_process";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { ROOT, check, results } from "./verify-harness.mjs";
 
 /** Imports a compiled module by path. Windows ESM needs a file:// URL, not a drive letter. */
@@ -1280,11 +1281,75 @@ if (mothershipPresent) {
     advertisedFallback === nodeManifest.version,
     `${advertisedFallback} vs ${nodeManifest.version}`,
   );
+  // The APK route has its OWN last-resort label, and it is the one a tablet
+  // actually reads: `/api/node/latest-apk` is the FIRST route the mobile worker
+  // tries. When `LATEST_APK_VERSION` is unpinned this constant is the number an
+  // operator sees next to a working download URL, so a stale value here is what
+  // renders "v1.0.32 -> v1.0.28 is available" on an already-current device.
+  const advertisedApkFallback =
+    /const FALLBACK_APK_VERSION = "([^"]+)"/.exec(mothershipFeed)?.[1];
+  check(
+    `the Mothership's APK fallback version (${advertisedApkFallback}) matches package.json (${nodeManifest.version})`,
+    advertisedApkFallback === nodeManifest.version,
+    `${advertisedApkFallback} vs ${nodeManifest.version}`,
+  );
   // The advertised URL must name the asset the workflow actually publishes, because
   // `/releases/latest/download/<asset>` is a literal filename lookup.
   check(
     "the Mothership advertises the exact published asset name",
     /const ROLLING_DOWNLOAD_URL =[\s\S]*?releases\/latest\/download\/rippa-node\.exe/.test(mothershipFeed),
+  );
+}
+
+// --- THE APK's OWN PACKAGE ID, PINNED --------------------------------------
+/*
+ * `MobileBridge.assertItIsThisApp()` REFUSES any APK whose package name is not
+ * this app's, and reports it as "Refusing to install <other>: this updater only
+ * installs com.rippaadventures.node". That message is the guard WORKING: the
+ * running app is ours, and the file it downloaded was built under someone else's
+ * ID. Android also refuses such an install outright (a different ID is a
+ * different app, and an update must keep the ID), so the refusal is correct and
+ * must stay.
+ *
+ * What this pins is the OTHER half: that nothing in the build config reintroduces
+ * the foreign ID in the first place. A stray `com.codelink.app` in an
+ * applicationId or a capacitor appId would build an APK that this very gate then
+ * refuses to install — a self-inflicted, entirely silent update outage.
+ */
+{
+  const gradle = readFileSync(path.join(ROOT, "mobile", "android", "app", "build.gradle"), "utf8");
+  const capacitor = readFileSync(path.join(ROOT, "mobile", "capacitor.config.json"), "utf8");
+
+  check(
+    "the APK's applicationId and namespace are com.rippaadventures.node",
+    gradle.includes('applicationId "com.rippaadventures.node"') &&
+      gradle.includes('namespace "com.rippaadventures.node"'),
+  );
+  check("the capacitor appId is com.rippaadventures.node", /"appId"\s*:\s*"com\.rippaadventures\.node"/.test(capacitor));
+
+  // The negative case, over every text file in the repo, because the ID can leak
+  // in through a file nothing else here reads.
+  const tracked = execSync(
+    "git ls-files",
+    { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+  )
+    .split(/\r?\n/)
+    .filter(Boolean);
+  const offenders = tracked.filter((file) => {
+    if (!/\.(ts|js|mjs|json|xml|gradle|html|java|kt|yml|yaml|md|properties)$/i.test(file)) return false;
+    // This file necessarily CONTAINS the pattern it searches for, so it would
+    // otherwise report itself as the offender on every run.
+    if (path.resolve(ROOT, file) === path.resolve(fileURLToPath(import.meta.url))) return false;
+    try {
+      return /com\.codelink\.app/.test(readFileSync(path.join(ROOT, file), "utf8"));
+    } catch {
+      return false;
+    }
+  });
+  check(
+    "no source file reintroduces the foreign com.codelink.app package",
+    offenders.length === 0,
+    offenders.join(", "),
   );
 }
 
