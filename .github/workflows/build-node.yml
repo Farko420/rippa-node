@@ -170,6 +170,43 @@ jobs:
           "version=$newVersion" >> $env:GITHUB_OUTPUT
 
       # -------------------------------------------------------------------------
+      # THE ENGINE REGRESSION SUITE — runs BEFORE anything is packaged.
+      #
+      # WHY IT MUST SIT HERE, NOT AFTER `npm run package`. `scripts/package.mjs`
+      # step 5 PRUNES every `.js`/`.map` out of `dist/` once the .exe has been
+      # frozen into it, because the packaged binary must not ship loose source.
+      # After that step there is no compiled JavaScript left in dist/ to import,
+      # so these suites would fail with a bare module-not-found — a failure that
+      # reads like a broken test rather than a step in the wrong place. Hence:
+      # build and test first, package second.
+      #
+      # WHAT IT COVERS. `test:engine` is the CLI allow-list/padlock checks, the
+      # health probe against a fake Ollama, and the managed-port publish
+      # (verify-managed-ollama-origin.mjs) asserting that the port this node BINDS
+      # is the port it REPORTS — env.OLLAMA_URL, getStatus().port, getPort() and
+      # the health badge must all resolve to the managed origin, not the 11434
+      # default. That last case was invisible to CI until recently: the health
+      # suite deliberately exercises the UNMANAGED path, so the managed publish
+      # had NO coverage and a node could serve perfectly while reporting itself
+      # OFFLINE to the Mothership and 502-ing every /v1/chat request.
+      #
+      # NO OLLAMA BINARY IS NEEDED. Every suite stands up its own fake HTTP
+      # server; the managed-origin suite binds the real managed port 11435 to
+      # that fake. So this step needs no model download and no GPU, and costs
+      # seconds.
+      #
+      # FAILING HERE IS THE POINT. This gates the release: a regression stops the
+      # build before it can publish a broken binary, rather than after the fleet
+      # has already pulled it.
+      #
+      # `npm run test:engine` re-runs `npm run build` itself, so this step needs
+      # no separate compile — and running the build here is what guarantees the
+      # dist/ the suites import is current rather than a stale local artefact.
+      - name: Engine regression suite
+        shell: pwsh
+        run: npm run test:engine
+
+      # -------------------------------------------------------------------------
       # PKG BINARY CACHE.
       #
       # `pkg` downloads a ~100 MB base Node.js binary per (target, platform)
