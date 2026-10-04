@@ -255,6 +255,42 @@
     </service>
 
     <!--
+      THE QUICK SETTINGS TILE — "is the fleet tablet still running?" without
+      opening the app.
+
+      THE SHADE IS THE POINT, NOT THE APP. This node lives on a tablet nobody
+      walks over to, and the only question that matters from another room is
+      whether it is still foraging. The app answers it well but requires
+      unlocking a WebView; the notification shade answers it in one swipe.
+
+      `android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"` is NOT
+      optional decoration. Android only lists a TileService that holds it, and
+      the platform itself is the only app that can — so it is simultaneously
+      what registers the tile and what keeps every other app out.
+
+      `android:exported="true"` is REQUIRED and looks like it contradicts the
+      line above, so it is worth stating plainly: exported=true is what lets
+      SYSTEMUI (a different UID) bind this service at all. The tile is not an
+      open door, because BIND_QUICK_SETTINGS_TILE is a signature-level guard
+      that SystemUI holds and a third-party app does not. exported=false would
+      compile, install, and silently never appear in the shade.
+
+      `@mipmap/ic_launcher` / `android:label` are what the shade tile itself is
+      drawn with; without a label the tile renders as an unlabelled icon, which
+      is worse than no tile for an operator scanning the shade.
+    -->
+    <service
+        android:name=".RippaNodeTileService"
+        android:exported="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Rippa Node"
+        android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+      <intent-filter>
+        <action android:name="android.service.quicksettings.action.QS_TILE" />
+      </intent-filter>
+    </service>
+
+    <!--
       BOOT RECEIVER: brings the service back after a reboot or an app update.
 
       The node is expected to survive "someone left the tablet on the desk", and

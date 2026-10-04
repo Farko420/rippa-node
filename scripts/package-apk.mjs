@@ -1581,8 +1581,10 @@ fs.mkdirSync(javaTarget, { recursive: true });
 */
 for (const file of [
   "RippaNodeService.java",
+  "RippaNodeTileService.java",
   "RippaNodePlugin.java",
   "RippaNodeBootReceiver.java",
+  "NodeIdentityStore.java",
   "MainActivity.java",
   "MobileBridge.java",
 ]) {

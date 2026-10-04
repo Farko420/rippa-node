@@ -694,6 +694,22 @@ jobs:
       # Update button do nothing — both are invisible until a human is holding the
       # device. Skips cleanly when aapt2 is absent rather than failing on a missing
       # tool.
+      #
+      # THE LAST THREE NEEDLES COVER THE PLATFORM-INTEGRATION FEATURES, AND EACH ONE
+      # SHIPS BROKEN WHEN IT IS MISSING:
+      #
+      #   RippaNodeTileService          the class is only half the tile — without its
+      #                                 <service> declaration it compiles, installs
+      #                                 and simply never appears in the shade.
+      #   BIND_QUICK_SETTINGS_TILE      the guard Android checks before listing a
+      #                                 tile at all; absent means silently unlisted.
+      #   RECEIVE_BOOT_COMPLETED        without it the node does not come back after a
+      #                                 reboot, which is indistinguishable from the
+      #                                 node having stopped voluntarily.
+      #
+      # Asserting these against the BUILT APK rather than the source overlay is the
+      # whole point: the overlay is copied in at package time and a merge can drop a
+      # declaration without any tool in the chain complaining.
       - name: Verify the APK manifest
         run: |
           set -euo pipefail
@@ -703,7 +719,7 @@ jobs:
             exit 0
           fi
           DUMP="$("$AAPT" dump xmltree --file AndroidManifest.xml "${{ steps.apk.outputs.path }}" | tr -d '\r')"
-          for NEEDLE in WAKE_LOCK FOREGROUND_SERVICE RippaNodeService REQUEST_INSTALL_PACKAGES FileProvider; do
+          for NEEDLE in WAKE_LOCK FOREGROUND_SERVICE RippaNodeService REQUEST_INSTALL_PACKAGES FileProvider RippaNodeTileService BIND_QUICK_SETTINGS_TILE RECEIVE_BOOT_COMPLETED; do
             if ! grep -q "$NEEDLE" <<<"$DUMP"; then
               echo "::error::APK manifest is missing $NEEDLE"
               exit 1

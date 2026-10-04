@@ -72,7 +72,7 @@ public class RippaNodeService extends android.app.Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        createNotificationChannel();
+        createNotificationChannel(this);
         acquireWakeLock();
         serviceRunning = true;
     }
@@ -99,7 +99,7 @@ public class RippaNodeService extends android.app.Service {
         // Started in the foreground IMMEDIATELY, before any work: on Android 12+
         // a service that does work first and calls startForeground() afterwards
         // can be killed for a "contextless start".
-        startForeground(NOTIFICATION_ID, buildNotification(title, message));
+        startForeground(NOTIFICATION_ID, buildNotification(this, title, message));
 
         // START_STICKY, not START_NOT_STICKY: if Android kills this under memory
         // pressure it is restarted with a null intent. An autonomous overnight
@@ -165,11 +165,11 @@ public class RippaNodeService extends android.app.Service {
      * live on a channel. Created once and reused: recreating it on every start
      * would discard any importance setting the user chose.
      */
-    private void createNotificationChannel() {
+    private static void createNotificationChannel(Context context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             return;
         }
-        NotificationManager manager = getSystemService(NotificationManager.class);
+        NotificationManager manager = context.getSystemService(NotificationManager.class);
         if (manager == null) {
             return;
         }
@@ -195,8 +195,8 @@ public class RippaNodeService extends android.app.Service {
      * intent with SINGLE_TOP delivers `onNewIntent` to the live Activity and the
      * operator lands on the dashboard they were already looking at.
      */
-    private android.app.PendingIntent dashboardIntent(int requestCode) {
-        Intent launch = new Intent(this, MainActivity.class);
+    private static android.app.PendingIntent dashboardIntent(Context context, int requestCode) {
+        Intent launch = new Intent(context, MainActivity.class);
         launch.setAction(Intent.ACTION_MAIN);
         launch.addCategory(Intent.CATEGORY_LAUNCHER);
         // SINGLE_TOP routes to the running Activity instead of rebuilding it.
@@ -208,7 +208,7 @@ public class RippaNodeService extends android.app.Service {
             // hijackable by another app.
             flags |= android.app.PendingIntent.FLAG_IMMUTABLE;
         }
-        return android.app.PendingIntent.getActivity(this, requestCode, launch, flags);
+        return android.app.PendingIntent.getActivity(context, requestCode, launch, flags);
     }
 
     /**
@@ -221,9 +221,9 @@ public class RippaNodeService extends android.app.Service {
      * code would let the second getActivity() call REPLACE the first, which
      * silently turns the action button into a duplicate of the body tap.
      */
-    private Notification buildNotification(String title, String message) {
+    private static Notification buildNotification(Context context, String title, String message) {
         NotificationCompat.Builder builder =
-                new NotificationCompat.Builder(this, CHANNEL_ID)
+                new NotificationCompat.Builder(context, CHANNEL_ID)
                         .setContentTitle(title)
                         .setContentText(message)
                         .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
@@ -231,7 +231,7 @@ public class RippaNodeService extends android.app.Service {
                         .setOngoing(true)
                         .setSilent(true)
                         .setCategory(NotificationCompat.CATEGORY_SERVICE)
-                        .setContentIntent(dashboardIntent(0))
+                        .setContentIntent(dashboardIntent(context, 0))
                         // The explicit quick-navigation button. `setContentIntent`
                         // alone only makes the body tappable; on a tablet whose
                         // notification is collapsed, an operator has to expand it
@@ -239,7 +239,7 @@ public class RippaNodeService extends android.app.Service {
                         .addAction(
                                 android.R.drawable.ic_menu_view,
                                 "Open dashboard",
-                                dashboardIntent(1));
+                                dashboardIntent(context, 1));
         return builder.build();
     }
 
