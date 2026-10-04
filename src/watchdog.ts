@@ -16,6 +16,7 @@ import { type GhostConfig, waitForStartCommand } from "./update/ghostMode";
 import {
   HANDOFF_STAMP,
   TEMP_UPDATE_FILE,
+  installDir,
   releaseHandoffClaim,
   stagingDir,
 } from "./update/swapHandoff";
@@ -796,12 +797,20 @@ function loadGhostConfig(): GhostConfig | null {
  * NEVER THROWS, and returns an empty object for a missing or malformed file: a
  * corrupt config must not be able to prevent the node from booting normally, and
  * the caller falls back to the environment when this comes back empty.
+ *
+ * CANDIDATES ARE ABSOLUTE, AND THAT IS THE POINT. This used to consult
+ * `process.cwd()`, which is whatever folder Windows happened to launch the
+ * watchdog from — the Startup folder via the silent `.vbs`, an install folder by
+ * hand, or the system32 of a scheduled task. The persistent staging directory is
+ * the only location a node actually writes its config to, so it is the only one
+ * consulted here; the install directory is kept as a legacy fallback for a node
+ * that predates the move to app-data.
  */
 function readConfigFileValues(): Record<string, string> {
-  const candidates = [
-    path.join(stagingDir(), "config.json"),
-    path.join(process.cwd(), "config.json"),
-  ];
+  const candidates = [path.join(stagingDir(), "config.json")];
+  const legacy = installDir();
+  if (legacy) candidates.push(path.join(legacy, "config.json"));
+
   for (const candidate of candidates) {
     try {
       if (!fs.existsSync(candidate)) continue;

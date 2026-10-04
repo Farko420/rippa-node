@@ -2,7 +2,12 @@ import { exec } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { config as loadDotenv } from "dotenv";
-import { ensureDataDir, resolveInstallDir } from "../utils/paths";
+import {
+  CONFIG_BACKUP_SUFFIX,
+  CONFIG_TEMP_SUFFIX,
+  ensureDataDir,
+  resolveInstallDir,
+} from "../utils/paths";
 // TYPE-ONLY import: erased at compile time, so this creates no runtime cycle
 // even though `nodeAuth` imports this module for its fs/validation helpers.
 import type { PeerEndpoint } from "./nodeAuth";
@@ -433,15 +438,67 @@ export function normalizeCloudLinkCode(value: string): string {
 }
 
 /**
+ * Parses `config.json` as a plain object, falling back to the recovery backup.
+ *
+ * WHY THE FALLBACK IS THE ACTUAL FIX. `readConfig` and `readConfigLenient` both
+ * return `null` for "missing OR corrupt", and every caller treats `null` as a
+ * first-run machine: `ensureConfiguration` seeds defaults from the environment,
+ * and `nodeAuth.persist` writes a config built from `{}`. That second step is
+ * what made the loss PERMANENT — it replaces whatever was on disk with a
+ * defaults-only object. If a torn write can still be recovered here, the node
+ * keeps the operator's settings instead of silently resetting them.
+ *
+ * A missing file with no backup is a genuine first boot and still returns `null`.
+ * The restore is best-effort: if the live file is unwritable, the recovered
+ * values are still returned so this process runs correctly.
+ */
+function readConfigObject(root: string): ConfigInput | null {
+  const file = configFilePath(root);
+  const parse = (candidate: string): ConfigInput | null => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(candidate, "utf8")) as ConfigInput | null;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  };
+
+  const direct = parse(file);
+  if (direct) return direct;
+
+  const backup = `${file}${CONFIG_BACKUP_SUFFIX}`;
+  const recovered = parse(backup);
+  if (!recovered) return null;
+
+  console.warn(
+    `[Config] ${file} is missing or unreadable — recovered the last known-good ` +
+      `configuration from ${backup}.`,
+  );
+  try {
+    promoteTempFile(
+      stageConfigFile(file, JSON.stringify(recovered, null, 2) + "\n"),
+      file,
+    );
+  } catch (error) {
+    console.warn(
+      `[Config] Could not restore ${file} from its backup (the recovered values ` +
+        `are still in use for this process):`,
+      error instanceof Error ? error.message : error,
+    );
+  }
+  return recovered;
+}
+
+/**
  * Reads `config.json` silently.
  * Returns null when the file is missing, corrupt, or has no usable NODE_API_KEY
  * (the GUI treats each of those as "not set up yet").
  */
 export function readConfig(root: string = resolveAppRoot()): RippaNodeConfig | null {
   try {
-    const raw = fs.readFileSync(configFilePath(root), "utf8");
-    const parsed = JSON.parse(raw) as ConfigInput | null;
-    if (!parsed || typeof parsed !== "object") return null;
+    const parsed = readConfigObject(root);
+    if (!parsed) return null;
     const normalized = normalizeConfig(parsed);
     if (normalized.NODE_API_KEY.length < 8) return null;
     return normalized;
@@ -453,9 +510,8 @@ export function readConfig(root: string = resolveAppRoot()): RippaNodeConfig | n
 /** Reads `config.json` even when incomplete (for prefilling the GUI form). */
 export function readConfigLenient(root: string = resolveAppRoot()): RippaNodeConfig | null {
   try {
-    const raw = fs.readFileSync(configFilePath(root), "utf8");
-    const parsed = JSON.parse(raw) as ConfigInput | null;
-    if (!parsed || typeof parsed !== "object") return null;
+    const parsed = readConfigObject(root);
+    if (!parsed) return null;
     return normalizeConfig(parsed);
   } catch {
     return null;
@@ -536,15 +592,105 @@ export function applyConfigToEnv(cfg: ConfigInput | RippaNodeConfig | null, forc
   }
 }
 
-/** Writes config.json (0600 permissions on POSIX; best effort on Windows). */
+/**
+ * PROMOTES A COMPLETE `.tmp` FILE OVER `target` — the atomic half of a write.
+ *
+ * `fs.renameSync` within a single directory is atomic on both NTFS and POSIX, so
+ * a reader (including the next boot after a power cut) observes either the whole
+ * previous file or the whole new one, never a truncated prefix.
+ */
+function promoteTempFile(temporary: string, target: string): void {
+  try {
+    fs.renameSync(temporary, target);
+  } catch (error) {
+    try {
+      fs.rmSync(temporary, { force: true });
+    } catch {
+      /* the temp file is disposable; never mask the real write error */
+    }
+    throw error;
+  }
+}
+
+/**
+ * True when `file` holds a JSON object worth preserving as the recovery backup.
+ *
+ * PARSEABLE IS NOT SUFFICIENT. A machine that has already been through this bug
+ * holds a perfectly valid config.json full of nothing but defaults and an empty
+ * `NODE_API_KEY`. Promoting that to "the last known-good configuration" would
+ * make the very next torn write recover straight back into the wiped state — the
+ * backup would faithfully preserve the damage. So a file only qualifies once it
+ * actually carries the operator's credentials.
+ */
+function isUsableConfigFile(file: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const key = (parsed as Record<string, unknown>)["NODE_API_KEY"];
+  return typeof key === "string" && key.trim().length >= 8;
+}
+
+/** Serializes a config and stages it at `file.tmp`, ready to be promoted. */
+function stageConfigFile(file: string, payload: string): string {
+  const temporary = `${file}${CONFIG_TEMP_SUFFIX}`;
+  const handle = fs.openSync(temporary, "w", 0o600);
+  try {
+    fs.writeFileSync(handle, payload, { encoding: "utf8" });
+    // fsync BEFORE the rename. Without it the rename can be durable while the
+    // bytes it points at are not, which is the same data loss by another route.
+    fs.fsyncSync(handle);
+  } catch (error) {
+    try {
+      fs.rmSync(temporary, { force: true });
+    } catch {
+      /* already reporting the real failure */
+    }
+    throw error;
+  } finally {
+    fs.closeSync(handle);
+  }
+  return temporary;
+}
+
+/**
+ * Writes config.json so that an interrupted write can never destroy it.
+ *
+ * WHY THIS IS NOT A PLAIN `writeFileSync`. `fs.writeFileSync` opens the target
+ * with O_TRUNC and then streams the bytes in. A reboot, a power cut or a
+ * watchdog kill inside that window leaves a truncated `config.json` on disk —
+ * which is precisely the reported bug: the next boot cannot parse it, concludes
+ * the node was never configured, and then OVERWRITES the wreckage with defaults
+ * via `normalizeConfig`. The operator's Mothership URL and API key are gone for
+ * good, and a fresh node code is minted on top of the grave.
+ *
+ * So the payload is staged in `config.json.tmp`, flushed to the platter, and
+ * only then renamed over the target. The previous good file is retained as
+ * `config.json.bak` first, which is what `readConfigObject` falls back to.
+ *
+ * 0600 on POSIX; best effort on Windows, where the ACL is inherited instead.
+ */
 export function writeConfig(root: string, cfg: ConfigInput | RippaNodeConfig): string {
   const file = configFilePath(root);
   const normalized = normalizeConfig(cfg as ConfigInput);
   fs.mkdirSync(root, { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(normalized, null, 2) + "\n", {
-    encoding: "utf8",
-    mode: 0o600,
-  });
+
+  // Retain the last KNOWN-GOOD config before touching the live file. Guarded on
+  // parseability so a previous torn write cannot be promoted to "the backup".
+  if (isUsableConfigFile(file)) {
+    try {
+      fs.copyFileSync(file, `${file}${CONFIG_BACKUP_SUFFIX}`);
+    } catch {
+      /* best-effort: losing the backup must not block the write itself */
+    }
+  }
+
+  const payload = JSON.stringify(normalized, null, 2) + "\n";
+  promoteTempFile(stageConfigFile(file, payload), file);
+
   try {
     fs.chmodSync(file, 0o600);
   } catch {

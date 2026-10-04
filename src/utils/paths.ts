@@ -31,6 +31,22 @@ const POSIX_DIR_NAME = ".rippa-node";
 export const LEGACY_BACKUP_SUFFIX = ".legacy_backup";
 
 /**
+ * SUFFIXES FOR THE CONFIG FILE'S DURABILITY ARTEFACTS.
+ *
+ * WHY THEY LIVE HERE AND NOT IN configManager. `config.json` is written by the
+ * config layer, but it is also READ by the watchdog — which deliberately
+ * imports no config code, because it must boot and supervise even when the
+ * config is unreadable. This module is a leaf (node builtins only), so both
+ * sides can share the names without the watchdog dragging in dotenv.
+ *
+ * `.bak` — the last config known to be VALID. It is what makes a torn write
+ *          recoverable instead of permanent.
+ * `.tmp` — where a write is assembled before it is promoted into place.
+ */
+export const CONFIG_BACKUP_SUFFIX = ".bak";
+export const CONFIG_TEMP_SUFFIX = ".tmp";
+
+/**
  * Files that used to live next to the executable and are now copied into the
  * persistent directory. SQLite's `-wal` / `-shm` sidecars are listed because a
  * WAL-mode database copied without them silently loses every write that had not
