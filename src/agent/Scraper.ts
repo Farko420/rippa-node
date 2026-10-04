@@ -1,7 +1,8 @@
 import "../pkgNativeShim"; // must load before playwright (exe loader shims)
-import type { Browser, Page } from "playwright";
+import type { Browser, BrowserContext, Page } from "playwright";
 import { describeRuntime, supportsBrowserScraping } from "../platform";
 import { scrapeMobile } from "./MobileScraper";
+import type { ResourceGovernor } from "../services/resourceGovernor";
 import { hasSubscribers, publishScrape, publishViewport } from "../services/engineTelemetry";
 
 /**
@@ -304,6 +305,19 @@ export class ScraperService {
    */
   private canUseBrowser: boolean;
 
+  /**
+   * RESOURCE GOVERNOR — bounds how much browser work this node does.
+   *
+   * Optional: without one the scraper behaves exactly as before (one context at
+   * a time is never exceeded here because the priority tier already serialised),
+   * which keeps this class constructible standalone in the verification harness.
+   */
+  private governor: ResourceGovernor | null = null;
+  /** Browser contexts open right now, across every concurrent scrape. */
+  private activeContexts = 0;
+  /** Callers parked on "a browser slot just freed up", in FIFO order. */
+  private readonly browserWaiters: Array<() => void> = [];
+
   constructor() {
     this.canUseBrowser = supportsBrowserScraping();
 
@@ -333,6 +347,33 @@ export class ScraperService {
   /** True when Playwright is in use; false when the mobile fallback is active. */
   isBrowserBacked(): boolean {
     return this.canUseBrowser;
+  }
+
+  /** Wires the Resource Governor in. Called by the Orchestrator. */
+  setGovernor(governor: ResourceGovernor | null): void {
+    this.governor = governor;
+  }
+
+  /**
+   * BLOCKS UNTIL A BROWSER SLOT IS FREE — the Governor's concurrency ceiling,
+   * applied to Playwright contexts rather than to task scheduling.
+   *
+   * Context count is bounded separately from `TaskEngine.inFlight` on purpose:
+   * a single priority task can drive several scrapes, so the two limits are
+   * layered, not duplicated. Waiters are woken FIFO so no caller is starved.
+   */
+  private async acquireBrowserSlot(): Promise<void> {
+    const limit = Math.max(1, this.governor?.getCurrentLimits().max_concurrent_tasks ?? 1);
+    while (this.activeContexts >= limit) {
+      await new Promise<void>((resolve) => this.browserWaiters.push(resolve));
+    }
+    this.activeContexts += 1;
+  }
+
+  /** Hands a browser slot back and wakes the next waiter, if any. */
+  private releaseBrowserSlot(): void {
+    this.activeContexts = Math.max(0, this.activeContexts - 1);
+    this.browserWaiters.shift()?.();
   }
 
   /**
@@ -461,14 +502,47 @@ export class ScraperService {
       );
       return scrapeMobile(url);
     }
-    const context = await browser.newContext({
-      // en-AU + a stock desktop UA keeps the parse honest for AU-targeted pages.
-      locale: "en-AU",
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      viewport: { width: 1366, height: 768 },
-    });
+    /*
+      RESOURCE GOVERNOR — MEMORY GUARD.
+
+      Opening a Chromium context is the single heaviest thing this node does, so
+      it is exactly what the Governor exists to bound. When the host is already
+      over its configured RAM limit, the browser is skipped for this pass and the
+      lightweight scraper is used instead — pausing the heavy tier is the point,
+      so the machine is never pushed into swap just to keep foraging.
+    */
+    if (this.governor?.isMemoryExceeded()) {
+      publishScrape(
+        "idle",
+        "[GOVERNOR] Memory limit exceeded — using lightweight fetch scraper.",
+        url,
+      );
+      return scrapeMobile(url);
+    }
+
+    /*
+      RESOURCE GOVERNOR — CONCURRENCY GATE.
+
+      Wait for a free browser slot BEFORE opening the context, so no more than
+      the Governor's `max_concurrent_tasks` contexts are ever open at once. The
+      slot is handed back in the `finally` below (success and failure alike), and
+      also on a context-launch error, so a failed launch cannot leak a slot.
+    */
+    await this.acquireBrowserSlot();
+    let context: BrowserContext;
+    try {
+      context = await browser.newContext({
+        // en-AU + a stock desktop UA keeps the parse honest for AU-targeted pages.
+        locale: "en-AU",
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        viewport: { width: 1366, height: 768 },
+      });
+    } catch (contextError) {
+      this.releaseBrowserSlot();
+      throw contextError;
+    }
 
     try {
       const page = await context.newPage();
@@ -518,6 +592,8 @@ export class ScraperService {
     } finally {
       // One context per scrape: cookies/storage never leak between sources.
       await context.close().catch(() => undefined);
+      // Hand the Governor's browser slot back, whatever the outcome.
+      this.releaseBrowserSlot();
     }
   }
 

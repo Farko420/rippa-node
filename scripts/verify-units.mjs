@@ -1516,6 +1516,66 @@ check(
       version.isVersionNewer("1.0.24"),
 );
 
+// --- 8k. THE RESOURCE GOVERNOR'S TWO HALVES OF THE DEVICE SHADOW -------------
+/*
+ * THE NODE HALF IS ASSERTED FOR REAL in verify-governor.mjs (presets, schedules,
+ * the pushed-config parser, and the engine's concurrency ceiling). This section
+ * pins the CLOUD half, which lives in the sibling "Rippa Adventures"
+ * repository and is therefore skipped on a standalone Node clone — the same
+ * rule 8f and 8j follow.
+ *
+ * WHY BOTH HALVES ARE ASSERTED TOGETHER. The node can apply a config perfectly
+ * and still have the fleet screen show it as un-applied if the cloud never
+ * reads the echo, and the cloud can hold a perfect desired config that no node
+ * ever receives if the heartbeat reply forgets to carry it. Shipping one half
+ * looks like a working feature that silently does nothing, which is why the
+ * pairing is checked rather than each side alone.
+ */
+if (mothershipPresent) {
+  const mothershipNodePower = readFileSync(
+    path.join(ROOT, "..", "Rippa Adventures", "src", "lib", "node-power.ts"),
+    "utf8",
+  );
+  const mothershipServer = readFileSync(
+    path.join(ROOT, "..", "Rippa Adventures", "src", "lib", "swarm.server.ts"),
+    "utf8",
+  );
+  const mothershipMigrate = readFileSync(
+    path.join(ROOT, "..", "Rippa Adventures", "src", "lib", "d1-ensure.server.ts"),
+    "utf8",
+  );
+  const nodeHeartbeat = readFileSync(path.join(ROOT, "src", "network", "SwarmClient.ts"), "utf8");
+  const nodeSync = readFileSync(path.join(ROOT, "src", "services", "powerConfigSync.ts"), "utf8");
+
+  check(
+    "the Mothership owns the same closed set of power modes",
+    /POWER_MODES = \["auto", "low", "medium", "high", "custom"\]/.test(mothershipNodePower),
+  );
+  check(
+    "the cloud echoes the desired config ONLY while the node is out of sync",
+    mothershipServer.includes("isPowerConfigInSync(desiredStamp, powerConfigAppliedAt)") &&
+      mothershipServer.includes("power_config: desiredConfig"),
+  );
+  check(
+    "the cloud records the node's applied stamp with COALESCE (old firmware cannot blank it)",
+    mothershipServer.includes("power_config_applied_at = COALESCE(?, power_config_applied_at)"),
+  );
+  check(
+    "the boot chain adds the three shadow columns behind a PRAGMA guard",
+    mothershipMigrate.includes('addColumnIfMissing("power_config", "power_config TEXT")') &&
+      mothershipMigrate.includes('addColumnIfMissing("power_config_updated_at"') &&
+      mothershipMigrate.includes('addColumnIfMissing("power_config_applied_at"'),
+  );
+  check(
+    "the node echoes the stamp it applied on every heartbeat",
+    nodeHeartbeat.includes("power_config_applied_at: this.readPowerConfigApplied()"),
+  );
+  check(
+    "the node reads the stamp WITHOUT parsing it (opaque token, no clock coupling)",
+    nodeSync.includes("power_config_updated_at") && !/Date\.parse\(\s*rawStamp/.test(nodeSync),
+  );
+}
+
 // The idlers above are console noise from the node itself; the summary is the
 // result. The idle forager's "runPass is not a function" line is this harness's
 // stub forager being deliberately minimal, not a product fault.

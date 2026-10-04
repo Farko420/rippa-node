@@ -11,6 +11,7 @@ import {
   type OllamaTelemetry,
 } from "../services/heartbeat";
 import { parseMeshKeySync, type MeshKeySyncDirective } from "../services/meshKeySync";
+import { parsePowerConfig, type PowerConfigHandler } from "../services/powerConfigSync";
 import { APP_VERSION } from "../version";
 
 /**
@@ -92,6 +93,16 @@ export interface HeartbeatPayload {
   last_updated_at: ReturnType<typeof buildHeartbeatTelemetry>["last_updated_at"];
   /** Embedded Ollama AI status — server state, model, port, active task. */
   ollama: OllamaTelemetry;
+  /**
+   * THE POWER-CONFIG STAMP THIS NODE LAST APPLIED, or null when it never has.
+   *
+   * THE DEVICE-SHADOW ECHO. The Mothership holds the DESIRED stamp it last
+   * wrote; this is the node echoing back the one it actually applied, verbatim
+   * and unparsed. While the two differ the heartbeat reply re-sends the desired
+   * config; the moment they agree the cloud goes quiet. Equality, never
+   * ordering — so a node whose clock is wrong cannot wedge the sync.
+   */
+  power_config_applied_at: string | null;
 }
 
 export interface SwarmTask {
@@ -144,6 +155,16 @@ export type TaskDispatchHandler = (tasks: SwarmTask[]) => void;
  * to the whole fleet, and a rejection here must never turn a successful
  * heartbeat into a reported failure.
  */
+
+/**
+ * Fired when the Mothership sends a power configuration update (mode, schedule,
+ * limits). Wired by index.ts to the Orchestrator and configManager.
+ *
+ * Re-exported from ./powerConfigSync, where the parser lives, so callers that
+ * reach for `SwarmClient`'s type keep working unchanged.
+ */
+export type { PowerConfigHandler };
+
 export type MeshKeySyncHandler = (directive: MeshKeySyncDirective) => void;
 
 /**
@@ -423,6 +444,9 @@ export class SwarmClient {
   /** Fired when the Mothership pushes work down the heartbeat channel. */
   private taskDispatch: TaskDispatchHandler | null = null;
   /** Fired when the heartbeat reply carries a mesh-key rotation instruction. */
+   /** Fired when the heartbeat reply carries a power configuration update. */
+   private powerConfigSync: PowerConfigHandler | null = null;
+
   private meshKeySync: MeshKeySyncHandler | null = null;
   /**
    * Set once the Mothership has answered 404/405 on the quarantine route, after
@@ -444,6 +468,15 @@ export class SwarmClient {
   private connectedSatellites: () => string[] = () => [];
   /** The host's own task counters, reported as `efficiency_score`. */
   private efficiency: () => EfficiencyInput = () => ({ succeeded: 0, total: 0 });
+  /**
+   * The power-config stamp this node last applied, or null.
+   *
+   * Supplied by the host because the authoritative record is the persisted
+   * `config.json`, not anything this client keeps. Defaults to null so a node
+   * that has never been governed reports "nothing applied" rather than holding
+   * the cloud in a permanent re-send loop over a stamp it never received.
+   */
+  private powerConfigApplied: () => string | null = () => null;
   /** Remote-command executor hooks, supplied by the host. */
   private commandHandlers: CommandHandlers | null = null;
 
@@ -523,10 +556,30 @@ export class SwarmClient {
     connectedSatellites?: () => string[];
     efficiency?: () => EfficiencyInput;
     commandHandlers?: CommandHandlers;
+    /** The power-config stamp this node last applied (the shadow echo). */
+    powerConfigApplied?: () => string | null;
   }): void {
     if (sources.connectedSatellites) this.connectedSatellites = sources.connectedSatellites;
     if (sources.efficiency) this.efficiency = sources.efficiency;
     if (sources.commandHandlers) this.commandHandlers = sources.commandHandlers;
+    if (sources.powerConfigApplied) this.powerConfigApplied = sources.powerConfigApplied;
+  }
+
+  /**
+   * Reads the applied power-config stamp, tolerating a provider that throws.
+   *
+   * A heartbeat must never fail because a telemetry provider misbehaved — the
+   * same rule the CPU/RAM providers follow — so a throwing provider degrades to
+   * null ("the node did not say"), which at worst costs one redundant config
+   * re-send and never a missing heartbeat.
+   */
+  private readPowerConfigApplied(): string | null {
+    try {
+      const stamp = this.powerConfigApplied();
+      return typeof stamp === "string" && stamp.trim() ? stamp.trim() : null;
+    } catch {
+      return null;
+    }
   }
 
   async sendHeartbeat(): Promise<void> {
@@ -568,6 +621,10 @@ export class SwarmClient {
       // queueing a command this node would only refuse as a downgrade.
       version: APP_VERSION,
       ...buildHeartbeatTelemetry(connectedSatellites, efficiency),
+      // THE SHADOW ECHO. Snapshotted inside the try below would be too late —
+      // this is read synchronously with the rest of the payload, so a value the
+      // host updates concurrently cannot end up half-applied.
+      power_config_applied_at: this.readPowerConfigApplied(),
     };
 
     try {
@@ -633,6 +690,22 @@ export class SwarmClient {
         }
       }
 
+       /*
+         POWER CONFIGURATION UPDATE. Checked after commands so governor updates
+         reach the node promptly, dispatched fire-and-forget so a handler that
+         throws cannot retroactively mark this heartbeat as failed.
+       */
+       const powerConfig = parsePowerConfig(data);
+       if (powerConfig && this.powerConfigSync) {
+         console.log(`[Swarm] Power config update received (mode: ${powerConfig.config.mode}).`);
+         try {
+           this.powerConfigSync(powerConfig);
+         } catch (error) {
+           console.warn(`[Swarm] Power config sync handler failed — ${describeError(error)}`);
+         }
+       }
+
+
       /*
         WORK PUSHED DOWN THE HEARTBEAT. Checked last so a release advertisement
         and a forced update are never delayed behind a task dispatch, and
@@ -685,6 +758,17 @@ export class SwarmClient {
    */
   setMeshKeySyncHandler(handler: MeshKeySyncHandler | null): void {
     this.meshKeySync = handler;
+  }
+
+  /**
+   * Registers the handler fired when the Mothership sends a power configuration update.
+   *
+   * Wired by index.ts to persist the new power config to the local config.json.
+   * The handler is dispatched fire-and-forget: a throwing handler must not turn a
+   * successful heartbeat into a reported failure.
+   */
+  setPowerConfigHandler(handler: PowerConfigHandler | null): void {
+    this.powerConfigSync = handler;
   }
 
   /**

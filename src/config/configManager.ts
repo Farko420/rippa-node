@@ -10,6 +10,7 @@ import type { PeerEndpoint } from "./nodeAuth";
 // module, so pulling the code FORMAT back out of nodeAuth would be a cycle. This
 // leaf module has no dependencies of its own and both sides import it safely.
 import { normalizeCloudLinkCode as normalizeLinkCode } from "./nodeCode";
+import type { PowerConfig } from "../services/resourceGovernor";
 
 /**
  * FIRST-RUN SETUP / CONFIGURATION MANAGER.
@@ -127,6 +128,25 @@ export interface RippaNodeConfig {
   ai_enabled?: boolean;
   ai_endpoint?: string | null;
   active_model?: string | null;
+   /**
+    * RESOURCE GOVERNOR CONFIGURATION.
+    *
+    * Defines the power mode (auto/low/medium/high/custom) and any time-based
+    * overrides. Pushed by the Mothership via the heartbeat response and stored
+    * locally so the node can manage its resource usage without constant uplink
+    * polling. Updated whenever the Mothership detects a configuration change.
+    */
+   power_config?: PowerConfig;
+   /**
+    * THE STAMP OF THE POWER CONFIG THIS NODE APPLIED (0079 shadow echo).
+    *
+    * Echoed from the Mothership's `power_config_updated_at` and reported back on
+    * every heartbeat; the cloud keeps re-sending the desired config until this
+    * matches. OPAQUE — never parsed or compared for order, only equality, so the
+    * node needs no clock agreement with the cloud.
+    */
+   power_config_updated_at?: string;
+
   ai_model?: string | null;
 }
 
@@ -303,6 +323,22 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
     ai_endpoint: nullableString(record["ai_endpoint"]),
     active_model: nullableString(record["active_model"]),
     ai_model: nullableString(record["ai_model"]),
+    /*
+      RESOURCE GOVERNOR CONFIG — see the interface note on `power_config`.
+      Carried through like SATELLITE_REGISTRY: a GUI save rebuilds the object
+      from this function WITHOUT merging, so a config the Mothership pushed onto
+      the node would otherwise be wiped the next time an operator clicked Save,
+      silently reverting the machine to its default power mode.
+    */
+    power_config: normalizePowerConfig(record["power_config"]),
+    /*
+      THE SHADOW ECHO STAMP, carried through for the same reason `power_config`
+      is: `writeConfig` normalises and writes what this function returns WITHOUT
+      merging, so a field not named here is silently DELETED on the next GUI
+      save. Losing it would make the node re-report "nothing applied" and the
+      Mothership would re-push the same config on every heartbeat forever.
+    */
+    power_config_updated_at: pickString(record, "power_config_updated_at") || undefined,
   };
 }
 
@@ -317,6 +353,49 @@ function nullableString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Keeps only a well-formed `power_config` when normalising config.json.
+ *
+ * Returns `undefined` (NOT `{}`) when there is nothing usable, so an unset
+ * config round-trips as the absence of a value — the same rule the AI fallback
+ * fields follow. An unrecognised mode is DROPPED rather than coerced to a
+ * default: silently rewriting an operator's typo ('turbo') to 'medium' would
+ * hide the mistake and change the machine's behaviour without saying so.
+ */
+function normalizePowerConfig(value: unknown): PowerConfig | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+
+  const allowed = ["auto", "low", "medium", "high", "custom"] as const;
+  const mode = record["mode"];
+  if (typeof mode !== "string" || !(allowed as readonly string[]).includes(mode)) {
+    return undefined;
+  }
+
+  // Schedule windows are validated on the way in; a malformed HH:MM is dropped
+  // rather than stored, because the Governor would silently ignore it anyway.
+  const schedule: NonNullable<PowerConfig["schedule"]> = Array.isArray(record["schedule"])
+    ? (record["schedule"] as unknown[])
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
+        .map((entry) => ({
+          start: typeof entry["start"] === "string" ? entry["start"] : "",
+          end: typeof entry["end"] === "string" ? entry["end"] : "",
+          mode: (typeof entry["mode"] === "string" ? entry["mode"] : "low") as "low" | "medium" | "high",
+        }))
+        .filter((entry) => /^\d{1,2}:\d{2}$/.test(entry.start) && /^\d{1,2}:\d{2}$/.test(entry.end))
+    : [];
+
+  const threads = Number(record["custom_cpu_threads"]);
+  const ram = Number(record["custom_ram_gb"]);
+
+  return {
+    mode: mode as PowerConfig["mode"],
+    ...(Number.isFinite(threads) && threads > 0 ? { custom_cpu_threads: Math.floor(threads) } : {}),
+    ...(Number.isFinite(ram) && ram > 0 ? { custom_ram_gb: Math.floor(ram) } : {}),
+    ...(schedule.length > 0 ? { schedule } : {}),
+  };
 }
 
 /** Keeps only well-formed peer entries when normalising config.json. */

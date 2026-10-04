@@ -297,6 +297,15 @@ async function main(): Promise<void> {
         return { succeeded, total };
       },
       commandHandlers: adminCommands,
+      /*
+        THE SHADOW ECHO. Read from the persisted config on every beat rather
+        than cached in memory, because the authoritative record of what this
+        node APPLIED is `config.json` — the same file the Mothership's push is
+        written to. A cached copy would go stale the moment a GUI save rewrote
+        the file behind it, and the cloud would then re-send a config this node
+        had already applied (or worse, believe it had applied one it had not).
+      */
+      powerConfigApplied: () => readCurrentConfig()?.power_config_updated_at ?? null,
     });
 
     /*
@@ -320,6 +329,22 @@ async function main(): Promise<void> {
           }`,
         );
       });
+    });
+
+    /*
+       POWER CONFIGURATION SYNC.
+
+       The Mothership can push resource governor updates (power mode, schedules, limits)
+       on any heartbeat reply, and this hook applies it: the node persists the new
+       config to config.json and wires the Orchestrator to apply the limits.
+    */
+    let powerConfigHandler:
+      | ((pushed: import("./services/powerConfigSync").PushedPowerConfig) => void)
+      | null = null;
+    swarm.setPowerConfigHandler((pushed) => {
+      if (powerConfigHandler) {
+        powerConfigHandler(pushed);
+      }
     });
 
     swarm.startHeartbeat();
@@ -360,6 +385,53 @@ async function main(): Promise<void> {
       */
       otaUpdater,
     );
+
+    // Wire power configuration syncing to the orchestrator: a push from the
+    // Mothership now reaches the Governor through this handler.
+    powerConfigHandler = (pushed: import("./services/powerConfigSync").PushedPowerConfig) => {
+      try {
+        orchestrator?.setPowerConfig(pushed.config);
+        /*
+          PERSIST THE PUSH, so the mode survives a restart. It must also survive
+          an ordinary GUI Save, which is why `normalizeConfig` carries
+          `power_config` through (see configManager) — without that, the next
+          operator click would silently revert this machine to its default mode.
+
+          THE STAMP IS PERSISTED WITH IT, and that is the other half of the
+          device shadow: the node reports this value back on every heartbeat,
+          and the Mothership stops re-sending the moment the two agree. Storing
+          the config WITHOUT the stamp would leave the node looking permanently
+          out of sync — re-applying the same mode on every beat forever.
+        */
+        const { readConfigLenient, writeConfig, resolveAppRoot } = require(
+          "./config/configManager",
+        ) as typeof import("./config/configManager");
+        const current = readConfigLenient();
+        if (current) {
+          writeConfig(resolveAppRoot(), {
+            ...current,
+            power_config: pushed.config,
+            ...(pushed.stamp ? { power_config_updated_at: pushed.stamp } : {}),
+          });
+        }
+      } catch (error) {
+        console.warn(
+          `[Boot] Power config update failed — ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    };
+
+    /*
+      APPLY THE SAVED MODE AT BOOT. The Governor is constructed with the default
+      (auto); this restores whatever the Mothership last pushed so a restart does
+      not quietly un-govern the machine until the next heartbeat arrives.
+    */
+    const savedPowerConfig = readCurrentConfig()?.power_config;
+    if (savedPowerConfig) {
+      orchestrator.setPowerConfig(savedPowerConfig);
+    }
     orchestrator.start();
     setOrchestratorRef(orchestrator);
 

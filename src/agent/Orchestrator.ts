@@ -9,6 +9,7 @@ import { healTask } from "../services/taskManager";
 import { startLocalAiDiscovery, type LocalAiStatus } from "../services/localAi";
 import { AutonomousForager } from "../services/autonomousForager";
 import { TaskEngine, type TaskOutcome } from "../services/taskEngine";
+import { ResourceGovernor, DEFAULT_POWER_CONFIG, type PowerConfig } from "../services/resourceGovernor";
 import {
   adminCommandForTaskType,
   executePendingCommands,
@@ -104,6 +105,9 @@ export class Orchestrator {
   /** Latest local-AI capability, consumed by the self-healing loop. */
   private localAiStatus: LocalAiStatus | null = null;
   /** Cancels the periodic local-AI probe. */
+   /** Resource Governor — manages CPU/RAM/concurrency limits. */
+   private readonly governor: ResourceGovernor;
+
   private stopLocalAi: (() => void) | null = null;
 
   constructor(
@@ -124,6 +128,14 @@ export class Orchestrator {
     */
     ota?: OtaUpdater,
   ) {
+
+    // Initialize the Resource Governor with default config (will be updated by heartbeat)
+    this.governor = new ResourceGovernor(DEFAULT_POWER_CONFIG);
+    // Wire the Governor into the Ollama client so thread limits are applied to all requests
+    this.ollama.setGovernor(this.governor);
+    // Wire it into the scraper so Playwright contexts and memory use are bounded too.
+    this.scraper.setGovernor(this.governor);
+
     this.ota = ota ?? new OtaUpdater(swarm);
 
     this.forager = new AutonomousForager({
@@ -134,6 +146,8 @@ export class Orchestrator {
     this.engine = new TaskEngine({
       swarm,
       forager: this.forager,
+      // The Governor caps how many priority tasks run concurrently (see drain).
+      governor: this.governor,
       handlePriorityTask: (task) => this.handleTask(task),
     });
 
@@ -189,6 +203,23 @@ export class Orchestrator {
 
   isRunning(): boolean {
     return this.running;
+  }
+
+  /**
+   * Returns the active Resource Governor instance.
+   * Allows external code to query current resource limits.
+   */
+  getGovernor(): ResourceGovernor {
+    return this.governor;
+  }
+
+  /**
+   * Updates the power configuration from the Mothership.
+   * Called whenever the heartbeat carries a new power_config directive.
+   */
+  setPowerConfig(config: PowerConfig): void {
+    this.governor.updateConfig(config);
+    console.log(`[Orchestrator] ${this.governor.describe()}`);
   }
 
   /** The scraper service — exposed for the dashboard's self-heal action. */

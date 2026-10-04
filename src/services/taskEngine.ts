@@ -1,5 +1,6 @@
 import { AutonomousForager, PreemptedError, type PreemptionProbe } from "./autonomousForager";
 import { clearCurrentProcess, setCurrentProcess } from "./heartbeat";
+import type { ResourceGovernor } from "./resourceGovernor";
 import type { SwarmClient, SwarmTask } from "../network/SwarmClient";
 
 /**
@@ -70,6 +71,14 @@ export interface TaskEngineDeps {
   /** Executes a priority task to completion. Must never throw. */
   handlePriorityTask: PriorityTaskHandler;
   forager: AutonomousForager;
+  /**
+   * RESOURCE GOVERNOR — caps how many priority tasks may run at once.
+   *
+   * Optional so the engine stays constructible without one (the verification
+   * harness builds it standalone). When absent the engine runs one task at a
+   * time, exactly as it did before the Governor existed.
+   */
+  governor?: ResourceGovernor;
   /** Overridable for tests; defaults to the 15s Mothership poll. */
   priorityPollMs?: number;
   /** Overridable for tests; defaults to the gap between foraging passes. */
@@ -104,6 +113,12 @@ export class TaskEngine {
   /** Guards against two polls in flight when a heartbeat also pushes work. */
   private polling = false;
   /**
+   * Priority tasks executing right now. Bounded by the Resource Governor's
+   * `max_concurrent_tasks`; this is the number {@link atCapacity} compares
+   * against, and what makes "delay pulling new work" observable from outside.
+   */
+  private inFlight = 0;
+  /**
    * Waiters parked on "a priority task just arrived". Open by {@link dispatch}.
    *
    * A LIST, NOT A SINGLE GATE, and that is the fix for a subtle deadlock: the
@@ -126,6 +141,28 @@ export class TaskEngine {
   constructor(private readonly deps: TaskEngineDeps) {
     this.priorityPollMs = deps.priorityPollMs ?? PRIORITY_POLL_MS;
     this.idleGapMs = deps.idleGapMs ?? IDLE_PASS_GAP_MS;
+  }
+
+  /**
+   * HOW MANY PRIORITY TASKS MAY RUN AT ONCE — the Resource Governor's ceiling,
+   * floored at 1 so a misconfigured zero cannot wedge the queue forever.
+   *
+   * Without a Governor this returns 1, which restores the pre-Governor
+   * behaviour exactly: a strictly serial priority tier.
+   */
+  private concurrencyLimit(): number {
+    const max = this.deps.governor?.getCurrentLimits().max_concurrent_tasks ?? 1;
+    return Math.max(1, Math.floor(max));
+  }
+
+  /** True when the node is already running as much as it is allowed to. */
+  private atCapacity(): boolean {
+    return this.inFlight >= this.concurrencyLimit();
+  }
+
+  /** Priority tasks in flight right now — surfaced for telemetry/tests. */
+  inFlightCount(): number {
+    return this.inFlight;
   }
 
   /** The live tier, for the heartbeat and the Control Center. */
@@ -231,7 +268,14 @@ export class TaskEngine {
       // Polled BEFORE the sleep, so a node that boots into a backlog starts work
       // immediately instead of spending fifteen seconds letting the idle tier
       // scrape a page it was never meant to be scraping.
-      if (!this.polling && !this.isProcessingPriority) {
+      //
+      // THE CAPACITY GATE IS THE GOVERNOR'S "delay pulling new work": while a
+      // priority task is queued or running the tier is already saturated, and
+      // asking the Mothership for more work this node cannot yet run is how a
+      // local machine ends up monopolised. `!isProcessingPriority` already
+      // covers this in practice; `!atCapacity()` makes the rule explicit and
+      // keeps it correct if the two ever diverge.
+      if (!this.polling && !this.isProcessingPriority && !this.atCapacity()) {
         this.polling = true;
         try {
           this.dispatch(await this.deps.swarm.fetchTasks());
@@ -398,11 +442,23 @@ export class TaskEngine {
     this.draining = true;
 
     try {
-      while (this.running && this.queue.length > 0) {
-        const task = this.queue.shift();
-        if (!task) break;
-        await this.runPriorityTask(task);
+      /*
+        CONCURRENCY (RESOURCE GOVERNOR). This used to be a single loop that ran
+        one task at a time. The Governor now decides how many may run in
+        parallel — Low: 1, Medium: 2, High: one per core — so the drain spawns
+        that many workers, each pulling from the SAME queue until it is empty.
+
+        Preemption is untouched. `isProcessingPriority` stays raised for as long
+        as ANY worker is running or any task is still queued (it is only cleared
+        in the `finally` below, once the queue is empty), so the idle forager
+        yields for the whole busy window exactly as before.
+      */
+      const workers: Promise<void>[] = [];
+      const count = this.concurrencyLimit();
+      for (let i = 0; i < count; i += 1) {
+        workers.push(this.runWorker());
       }
+      await Promise.all(workers);
     } finally {
       this.draining = false;
       if (this.queue.length === 0 && this.isProcessingPriority) {
@@ -417,6 +473,35 @@ export class TaskEngine {
         clearCurrentProcess();
         this.releaseForager();
         this.reportResume();
+      } else if (this.queue.length > 0 && this.running) {
+        /*
+          WORK ARRIVED IN THE MICROTASK WINDOW. With one loop this could not
+          happen — the loop re-checked the queue synchronously. With workers the
+          queue is emptied, the worker returns, and `Promise.all` resolves a
+          microtask later; a `dispatch` landing in that gap would be swallowed
+          because `draining` is still true. Re-draining picks that task up
+          instead of stranding it until the next poll.
+        */
+        void this.drain();
+      }
+    }
+  }
+
+  /**
+   * One drain worker: pulls tasks from the shared queue until it is empty.
+   *
+   * The `inFlight` counter is what the Governor's limit is measured against,
+   * and what {@link atCapacity} reads to decide whether new work may be pulled.
+   */
+  private async runWorker(): Promise<void> {
+    while (this.running) {
+      const task = this.queue.shift();
+      if (!task) return;
+      this.inFlight += 1;
+      try {
+        await this.runPriorityTask(task);
+      } finally {
+        this.inFlight -= 1;
       }
     }
   }

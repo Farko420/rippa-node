@@ -2,6 +2,7 @@ import os from "node:os";
 import axios, { type AxiosInstance } from "axios";
 import { z } from "zod";
 import { env } from "../config";
+import type { ResourceGovernor } from "../services/resourceGovernor";
 import {
   clearEngineActivity,
   noteEngineActivity,
@@ -113,6 +114,9 @@ interface ChatResponse {
 
 export class OllamaClient {
   private readonly client: AxiosInstance;
+  /** Optional resource governor for injecting thread limits into API calls. */
+  private governor: ResourceGovernor | null = null;
+
   private resolvedModel: string | null = null;
 
   constructor(baseUrl: string = env.OLLAMA_URL ?? DEFAULT_OLLAMA_URL) {
@@ -121,6 +125,25 @@ export class OllamaClient {
       timeout: REQUEST_TIMEOUT_MS,
       headers: { "Content-Type": "application/json" },
     });
+  }
+
+  /**
+   * Sets the Resource Governor reference.
+   * Called by the Orchestrator to wire in thread limits.
+   */
+  setGovernor(governor: ResourceGovernor | null): void {
+    this.governor = governor;
+  }
+
+  /**
+   * Returns the current Ollama thread limit from the Governor.
+   * Falls back to the system CPU count if no Governor is wired.
+   */
+  private getThreadLimit(): number {
+    if (this.governor) {
+      return this.governor.getCurrentLimits().ollama_num_threads;
+    }
+    return os.cpus().length;
   }
 
   /**
@@ -179,6 +202,8 @@ export class OllamaClient {
         options: {
           temperature: 0.1, // deterministic extraction
           num_ctx: 8192,
+          // RESOURCE GOVERNOR: inject thread limit for CPU-constrained environments
+          num_thread: this.getThreadLimit(),
         },
         // AGGRESSIVE VRAM UNLOADING — flush this model out of VRAM almost
         // immediately after replying, so Playwright/GPU work is never starved.
