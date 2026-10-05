@@ -93,6 +93,8 @@ export {
 import {
   GITHUB_REPO,
   RELEASE_ASSET_NAME,
+  assetNameFromDownloadUrl,
+  currentReleaseAssetName,
   githubHeaders,
   releaseAssetDownloadUrl,
   releaseDownloadUrl,
@@ -1179,11 +1181,29 @@ export async function handleUpdateTrigger(
   );
 
   // Fire and forget: respond now, swap in the background.
+  /*
+    REBUILD THE DOWNLOAD URL FROM THE TRIGGER'S EXACT TAG.
+
+    The trigger carries `tag` and `downloadUrl` as SEPARATE fields, and the URL
+    may name a tag the release no longer answers to — a stale `"latest"` baked
+    into `browser_download_url` by GitHub, or a sender whose code still passes
+    the pre-baked string through verbatim. Rebuilding here by the same rule the
+    Master uses (`releaseAssetDownloadUrl`) means a satellite upgrades even when
+    the Master that told it about the build runs an older binary, and the URL
+    can never disagree with the `version` the satellite just accepted. Passes
+    non-GitHub URLs through byte-for-byte, so CDN and Mothership links are
+    untouched.
+  */
+  const exactDownloadUrl = releaseAssetDownloadUrl(
+    trigger.tag,
+    assetNameFromDownloadUrl(trigger.downloadUrl) ?? currentReleaseAssetName(),
+    trigger.downloadUrl,
+  );
   void updater
     .applyToSelf({
       tag: trigger.tag,
       version: trigger.version,
-      downloadUrl: trigger.downloadUrl,
+      downloadUrl: exactDownloadUrl,
       ...(trigger.sha256 ? { sha256: trigger.sha256 } : {}),
     })
     .catch((error) => {

@@ -838,6 +838,62 @@ check(
     "https://example.invalid/node.exe",
   ) === "https://example.invalid/node.exe",
 );
+// The filename the parsed release advertises is the one the rebuilt URL must
+// name — the tag is interpolated, the asset name is preserved (a renamed asset
+// like `rippa-node-1.0.16.exe` must still be fetched by ITS OWN name).
+const renamedTagRelease = updater.parseLatestRelease({
+  tag_name: "v1.0.37",
+  name: "rippa-node 1.0.37",
+  assets: [
+    {
+      name: "rippa-node-1.0.16.exe",
+      browser_download_url:
+        "https://github.com/Farko420/rippa-node/releases/download/latest/rippa-node-1.0.16.exe",
+    },
+  ],
+});
+check(
+  "a renamed asset keeps its own filename under the exact tag",
+  renamedTagRelease?.downloadUrl ===
+    "https://github.com/Farko420/rippa-node/releases/download/v1.0.37/rippa-node-1.0.16.exe",
+  renamedTagRelease?.downloadUrl,
+);
+// The SATELLITE side: a trigger whose URL still names a stale tag (an old
+// Master passing browser_download_url verbatim) must upgrade by the same rule,
+// or mixed-version fleets keep 404ing on exactly this path.
+{
+  const seen = [];
+  const fakeUpdater = {
+    applyToSelf: async (release) => {
+      seen.push(release);
+      return false; // stand down before any destructive step
+    },
+  };
+  const parsed = updater.parseUpdateTrigger({
+    command: "SWARM_UPDATE_TRIGGER",
+    // NEWER than any version under test: the accept path is what hands a
+    // downloadUrl to applyToSelf, and a trigger for the RUNNING build is
+    // correctly refused by the downgrade guard instead.
+    version: "9.9.9",
+    tag: "v9.9.9",
+    downloadUrl:
+      "https://github.com/Farko420/rippa-node/releases/download/latest/rippa-node.exe",
+    issuedBy: "master",
+    issuedAt: new Date().toISOString(),
+  });
+  const verdict = await updater.handleUpdateTrigger(fakeUpdater, parsed);
+  check(
+    "a stale-tagged trigger is accepted for the newer version",
+    verdict.accepted === true,
+    JSON.stringify(verdict),
+  );
+  check(
+    "a stale-tagged trigger is rebuilt onto the trigger's exact tag",
+    seen[0]?.downloadUrl ===
+      "https://github.com/Farko420/rippa-node/releases/download/v9.9.9/rippa-node.exe",
+    seen[0]?.downloadUrl,
+  );
+}
 
 // GITHUB_TOKEN is what makes a PRIVATE repo readable: GitHub answers 404 to every
 // unauthenticated request, which is indistinguishable from "no release yet". The
