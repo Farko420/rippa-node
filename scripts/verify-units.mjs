@@ -791,6 +791,54 @@ check(
   updater.parseLatestRelease({ tag_name: "latest", name: "rippa-node 1.0.16", assets: [] }) === null,
 );
 
+// THE EXACT TAG IS INTERPOLATED INTO THE DOWNLOAD URL.
+// `browser_download_url` bakes in whatever tag segment was current at upload
+// time — the rolling release literally advertises
+// `.../releases/download/latest/rippa-node.exe` — but GitHub's download route
+// requires the release's EXACT tag in the path. A payload whose `tag_name`
+// says `v1.0.37` must never ship a `latest` (or any stale) URL to the fleet.
+const staleTagRelease = updater.parseLatestRelease({
+  tag_name: "v1.0.37",
+  name: "rippa-node 1.0.37",
+  assets: [
+    {
+      name: "rippa-node.exe",
+      browser_download_url:
+        "https://github.com/Farko420/rippa-node/releases/download/latest/rippa-node.exe",
+    },
+  ],
+});
+check(
+  "the download URL is rebuilt from the exact release tag, not the stale segment",
+  staleTagRelease?.downloadUrl ===
+    "https://github.com/Farko420/rippa-node/releases/download/v1.0.37/rippa-node.exe",
+  staleTagRelease?.downloadUrl,
+);
+check(
+  "the /releases/latest/download/ shortcut is rebuilt onto the exact tag too",
+  updater.releaseAssetDownloadUrl(
+    "v1.0.37",
+    "rippa-node.exe",
+    "https://github.com/o/r/releases/latest/download/rippa-node.exe",
+  ) === "https://github.com/o/r/releases/download/v1.0.37/rippa-node.exe",
+);
+check(
+  "a tag containing a slash keeps its path separators (encoded per segment)",
+  updater.releaseAssetDownloadUrl(
+    "release/1.0.37",
+    "rippa-node.exe",
+    "https://github.com/o/r/releases/download/latest/rippa-node.exe",
+  ) === "https://github.com/o/r/releases/download/release/1.0.37/rippa-node.exe",
+);
+check(
+  "a non-GitHub download URL is passed through byte-for-byte",
+  updater.releaseAssetDownloadUrl(
+    "v1.0.37",
+    "rippa-node.exe",
+    "https://example.invalid/node.exe",
+  ) === "https://example.invalid/node.exe",
+);
+
 // GITHUB_TOKEN is what makes a PRIVATE repo readable: GitHub answers 404 to every
 // unauthenticated request, which is indistinguishable from "no release yet". The
 // accepted names are asserted so the CI secret name cannot silently stop working.
@@ -1257,6 +1305,25 @@ check(
       "the metadata lookup goes to the releases API",
       askedFor === "https://api.github.com/repos/Farko420/rippa-node/releases/latest",
       askedFor,
+    );
+
+    // THE UPDATER HALF OF THE SAME 404. `resolveGitHubAssetDownload` was
+    // already resolving this endpoint and logging it — but SwarmUpdater kept
+    // only the HEADERS and streamed the ORIGINAL github.com URL, which 404s
+    // on a private repo even WITH the token attached. The resolved URL must
+    // reach the stream, so it is returned together with the headers.
+    const swarm = Object.create(updater.SwarmUpdater.prototype);
+    const target = await swarm.resolveReleaseDownload({ downloadUrl: SHORTCUT });
+    check(
+      "the swarm updater streams the resolved API asset endpoint, not the original URL",
+      target.url === "https://api.github.com/repos/Farko420/rippa-node/releases/assets/9",
+      target.url,
+    );
+    check(
+      "the swarm updater's request carries octet-stream and the bearer token",
+      target.headers.Accept === "application/octet-stream" &&
+        target.headers.Authorization === "Bearer ghp_private_repo",
+      JSON.stringify(target.headers),
     );
 
     // An already-resolved API asset URL must not trigger a pointless re-lookup.
@@ -1769,7 +1836,14 @@ if (mothershipPresent) {
   );
   check(
     "the Mothership exposes the same target-version answer to the pre-check",
-    /export function resolveTargetNodeVersion\(\): string \{/.test(mothershipFeed),
+    /*
+      ACCEPTS BOTH SIGNATURES. The sibling repo shipped this resolver as a plain
+      `function … : string` when the check was written and later made it async
+      (`Promise<string | null>` — a DB-backed read). The guarantee being pinned
+      is that the ANSWER is exported for the pre-check, not its arity, so a
+      signature change there must not read as a missing export here.
+    */
+    /export (?:async )?function resolveTargetNodeVersion\(/.test(mothershipFeed),
   );
 }
 

@@ -127,6 +127,68 @@ export function releaseDownloadUrl(repo = GITHUB_REPO, asset = RELEASE_ASSET_NAM
 }
 
 /**
+ * The download URL for one asset, built from the EXACT release tag.
+ *
+ * WHY THE URL IS REBUILT RATHER THAN TRUSTED.
+ *
+ * GitHub bakes a tag segment into `browser_download_url` at asset-upload time,
+ * and the advertised string can carry a segment the release no longer answers
+ * to — this fleet's rolling release literally advertises
+ * `.../releases/download/latest/rippa-node.exe` while operators talk about the
+ * build by its version tag (`v1.0.37`). GitHub's download route requires
+ * `.../releases/download/<TAG>/<asset>` with the release's EXACT current tag;
+ * any other segment is a hard 404 on the fetch.
+ *
+ * The tag therefore comes from `release.tag_name` — the same field the version
+ * comparison used — so the URL and the advertised version can never disagree,
+ * and a hardcoded or stale `"latest"` can never reach the fleet.
+ *
+ * ONLY GITHUB'S OWN DOWNLOAD URLS ARE REWRITTEN. A CDN link, a test fixture or
+ * a Mothership-supplied URL is returned byte-for-byte unchanged: its path shape
+ * is not ours to reinterpret. Tags are encoded per `/`-separated segment, so a
+ * slash inside a tag stays a path separator (as GitHub serves it) while every
+ * other character is percent-encoded.
+ */
+export function releaseAssetDownloadUrl(
+  tag: string,
+  assetName: string,
+  browserDownloadUrl: string,
+): string {
+  const source = (browserDownloadUrl ?? "").trim();
+  const exactTag = (tag ?? "").trim();
+  const name = (assetName ?? "").trim();
+  if (!source || !exactTag || !name) return source;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(source);
+  } catch {
+    return source;
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  if (host !== "github.com" && host !== "www.github.com") return source;
+
+  // `<owner>/<repo>/releases/(latest/)download/<name>` — and nothing else
+  // under `/releases/` (a tag page, a compare URL) names an asset.
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  if (segments.length < 4 || segments[2] !== "releases") return source;
+  const isDownloadPath =
+    segments[3] === "download" || (segments[3] === "latest" && segments[4] === "download");
+  if (!isDownloadPath) return source;
+
+  const encode = (value: string): string =>
+    value
+      .split("/")
+      .map((segment) => encodeURIComponent(segment))
+      .join("/");
+  return (
+    `https://github.com/${segments[0]}/${segments[1]}/releases/` +
+    `download/${encode(exactTag)}/${encode(name)}`
+  );
+}
+
+/**
  * The asset name, read from the environment at CALL time.
  *
  * {@link RELEASE_ASSET_NAME} captures the environment when this module is first

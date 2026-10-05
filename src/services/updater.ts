@@ -85,6 +85,7 @@ export {
   currentReleaseAssetName,
   githubHeaders,
   isGitHubUrl,
+  releaseAssetDownloadUrl,
   releaseDownloadUrl,
   resolveGitHubToken,
 } from "../update/githubAsset";
@@ -93,6 +94,7 @@ import {
   GITHUB_REPO,
   RELEASE_ASSET_NAME,
   githubHeaders,
+  releaseAssetDownloadUrl,
   releaseDownloadUrl,
   resolveGitHubAssetDownload,
   resolveGitHubToken,
@@ -236,7 +238,22 @@ export function parseLatestRelease(payload: unknown): ReleaseInfo | null {
   return {
     tag,
     version,
-    downloadUrl: asset.browser_download_url,
+    /*
+      THE URL IS BUILT FROM THE EXACT TAG, not taken verbatim from
+      `browser_download_url`. That string embeds whatever tag segment was
+      current when the asset was uploaded — this fleet's rolling release
+      advertises `.../releases/download/latest/rippa-node.exe` — while GitHub's
+      download route only serves `.../releases/download/<TAG>/...` for the
+      release's EXACT tag. Rebuilding from `tag` (the same field the version
+      came from) keeps a stale or hardcoded segment from ever reaching the
+      fleet, and the satellites a Master triggers receive a URL naming the
+      version they were told to install.
+    */
+    downloadUrl: releaseAssetDownloadUrl(
+      tag,
+      asset.name ?? RELEASE_ASSET_NAME,
+      asset.browser_download_url,
+    ),
     ...(sha256 ? { sha256: sha256.toLowerCase() } : {}),
     ...(body.trim() ? { notes: body.trim().slice(0, 500) } : {}),
   };
@@ -804,7 +821,11 @@ export class SwarmUpdater {
         fs.rmSync(zipPath, { force: true });
       }
     } else {
-      await this.stream(release.downloadUrl, await this.releaseExeHeaders(release), partialPath);
+      // URL AND HEADERS travel together: on this PRIVATE repo the resolved
+      // api.github.com asset endpoint is the ONLY URL that returns bytes —
+      // the original github.com URL 404s even with the token attached.
+      const target = await this.resolveReleaseDownload(release);
+      await this.stream(target.url, target.headers, partialPath);
     }
 
     await this.verifyStagedExe(release, partialPath);
@@ -838,15 +859,33 @@ export class SwarmUpdater {
   }
 
   /**
-   * Resolves the release-asset download to an AUTHENTICATED endpoint.
+   * Resolves the release-asset download to an AUTHENTICATED endpoint —
+   * RETURNING THE RESOLVED URL, not only its headers.
    *
    * A GitHub-hosted release URL goes through `resolveGitHubAssetDownload` for
    * exactly the reason the Mothership updater does: this repository is PRIVATE,
-   * so `.../releases/latest/download/rippa-node.exe` answers 404 to every
-   * anonymous request — byte-identical to "no asset by that name". The log
-   * lines are kept so a failure reports WHY, not only that it happened.
+   * so `.../releases/download/<tag>/rippa-node.exe` answers 404 to every
+   * request against github.com — WITH a token attached (verified live: 404 both
+   * anonymously and with `Authorization: Bearer`). GitHub only streams a
+   * private asset from the `api.github.com` asset endpoint with
+   * `Accept: application/octet-stream`. That 404 is byte-identical to "no asset
+   * by that name", so the resolver's log lines are kept in `diagnostics` and a
+   * failure reports WHY, not only that it happened.
+   *
+   * THE URL MUST TRAVEL WITH THE HEADERS. The first version of this method kept
+   * only `authenticated.headers` and made `download()` stream the ORIGINAL
+   * `release.downloadUrl` — so the resolver logged the working
+   * `api.github.com/.../releases/assets/<id>` endpoint and the stream then
+   * 404'd on the dead github.com URL anyway. Both come back together now,
+   * mirroring `update/OtaUpdater.download`, which never had the bug.
+   *
+   * When resolution returns null (no token, non-GitHub host) the advertised URL
+   * is used unchanged — correct for a public repo, and it keeps a signed CDN
+   * link from ever receiving this node's repo token.
    */
-  private async releaseExeHeaders(release: ReleaseInfo): Promise<Record<string, string>> {
+  private async resolveReleaseDownload(
+    release: ReleaseInfo,
+  ): Promise<{ url: string; headers: Record<string, string> }> {
     const headers: Record<string, string> = { Accept: "application/octet-stream" };
     const diagnostics: string[] = [];
     const authenticated = await resolveGitHubAssetDownload(release.downloadUrl, {
@@ -856,11 +895,14 @@ export class SwarmUpdater {
     });
     if (authenticated) {
       Object.assign(headers, authenticated.headers);
-    } else {
-      headers["User-Agent"] = "rippa-node-updater";
+      this.diagnostics = diagnostics;
+      // The resolved endpoint is the ONLY URL that streams a private asset's
+      // bytes — the original browser URL 404s even with this very token.
+      return { url: authenticated.url, headers };
     }
+    headers["User-Agent"] = "rippa-node-updater";
     this.diagnostics = diagnostics;
-    return headers;
+    return { url: release.downloadUrl, headers };
   }
 
   /** Diagnostics collected by the most recent header resolution, for errors. */
