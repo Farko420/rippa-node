@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+<title>Command Center — Rippa AI Intake</title>
+<style>
+  [hidden] { display: none !important; }
+</style>
+<link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="command-center.css" />
+</head>
+<body class="cc-body">
+<div class="bg"></div>
+
+<!-- SHELL — visible immediately so the page is never blank while polling. -->
+<div id="ccApp" class="cc-shell" hidden>
+  <header class="cc-header">
+    <div class="logo">◈</div>
+    <div class="cc-head-text">
+      <h1>Command Center</h1>
+      <p class="sub" id="ccSub">AI training intake thread</p>
+    </div>
+    <a id="ccSetupLink" class="ghost" href="/">⚙ Setup</a>
+    <button id="ccLock" type="button" class="ghost">🔒 Lock</button>
+  </header>
+
+  <div id="ccAlert" class="alert hidden"></div>
+
+  <main class="cc-main">
+    <!-- THREAD CONTAINER -->
+    <section class="cc-panel cc-thread-container">
+      <h2>Intake Thread</h2>
+      <div id="messageList" class="cc-message-list" role="log" aria-label="Messages"></div>
+      <p id="threadEmpty" class="cc-empty">No messages yet. Start a conversation or drop files to begin.</p>
+    </section>
+
+    <!-- BATCH SUMMARY (optional modal trigger) -->
+    <section class="cc-panel cc-batch-panel" id="batchPanel" hidden>
+      <h3>Batch Status</h3>
+      <div id="batchBadge" class="batch-badge"></div>
+      <button id="batchModalBtn" type="button" class="ghost" style="margin-top: 10px; width: 100%;">View Details</button>
+    </section>
+
+    <!-- BATCH DETAIL MODAL -->
+    <div id="batchModal" class="cc-modal" hidden>
+      <div class="cc-modal-overlay" id="batchModalOverlay"></div>
+      <div class="cc-modal-card">
+        <button id="batchModalX" type="button" class="cc-modal-x">×</button>
+        <h2>Batch Detail</h2>
+        <div id="batchDetail" class="cc-modal-body"></div>
+      </div>
+    </div>
+  </main>
+
+  <!-- COMPOSER FOOTER -->
+  <footer class="cc-footer">
+    <div class="cc-dropzone" id="dropzone" role="button" tabindex="0" aria-label="Drop files or click to upload">
+      <textarea
+        id="messageInput"
+        class="cc-textarea"
+        placeholder="Type a message or drop files/folders/ZIPs…"
+        rows="1"></textarea>
+      <div class="cc-composer-actions">
+        <div class="cc-attach-menu">
+          <button id="attachBtn" type="button" class="ghost" title="Attach files">📎</button>
+          <div id="attachDropdown" class="cc-attach-dropdown" hidden>
+            <button id="attachFiles" type="button" class="cc-attach-item">📄 Files</button>
+            <button id="attachFolder" type="button" class="cc-attach-item">📁 Folder</button>
+            <button id="attachZip" type="button" class="cc-attach-item">📦 ZIP</button>
+          </div>
+        </div>
+        <button id="sendBtn" type="button" class="primary">Send</button>
+      </div>
+    </div>
+    <input id="filesInput" type="file" multiple hidden />
+    <input id="folderInput" type="file" webkitdirectory multiple hidden />
+    <input id="zipInput" type="file" accept=".zip" hidden />
+  </footer>
+</div>
+
+<!-- LOCK SCREEN (shown when not authenticated) -->
+<div id="lockScreen" class="lock-screen">
+  <div class="lock-card">
+    <div class="logo big">🔒</div>
+    <h1>Node Locked</h1>
+    <p class="sub" id="lockSub">Enter the Master passkey to access the Command Center.</p>
+    <input id="unlockPin" type="password" inputmode="numeric" autocomplete="current-password"
+      placeholder="Enter Passkey" />
+    <button id="unlockBtn" type="button" class="primary">Unlock</button>
+    <p id="unlockError" class="hint" style="color: var(--bad); margin-top: 10px; display: none;"></p>
+  </div>
+</div>
+
+<script src="app.js"></script>
+<script src="command-center.js"></script>
+</body>
+</html>

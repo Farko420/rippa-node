@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck",
     "test:brain-parity": "tsx scripts/brain-parity-check.ts .parity/bundle.json",
-    "test:verify": "npm run build && node scripts/verify-units.mjs && node scripts/verify-fixes.mjs && node scripts/verify-watchdog.mjs && node scripts/verify-governor.mjs",
+    "test:verify": "npm run build && node scripts/verify-units.mjs && node scripts/verify-fixes.mjs && node scripts/verify-watchdog.mjs && node scripts/verify-governor.mjs && node scripts/verify-ingestion.mjs",
+    "test:ingestion": "npm run build && node scripts/verify-ingestion.mjs",
     "test:governor": "npm run build && node scripts/verify-governor.mjs",
     "test:fleet": "npm run build && node scripts/verify-fleet-roles.mjs",
     "test:paths": "tsx scripts/verify-paths.mts",
@@ -23,6 +24,7 @@
     "test:engine": "npm run build && node scripts/verify-engine-cli.mjs && node scripts/verify-engine-health.mjs && node scripts/verify-managed-ollama-origin.mjs && node scripts/verify-ollama-pull.mjs",
     "test:engine:routes": "node scripts/verify-engine-routes.mjs && node scripts/verify-engine-ui.mjs",
     "build:webgui": "node scripts/build-webgui.mjs",
+    "verify:command-center": "npm run build && node scripts/verify-command-center.mjs",
     "package": "npm run build:webgui && node scripts/package.mjs",
     "build:watchdog": "tsc -p tsconfig.json && node scripts/build-watchdog.mjs",
     "watchdog": "tsx src/watchdog.ts",
@@ -72,7 +74,10 @@
       "public/styles.css",
       "public/dashboard.html",
       "public/dashboard.css",
-      "public/dashboard.js"
+      "public/dashboard.js",
+      "public/command-center.html",
+      "public/command-center.css",
+      "public/command-center.js"
     ]
   }
 }

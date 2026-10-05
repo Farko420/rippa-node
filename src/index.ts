@@ -55,6 +55,7 @@ async function main(): Promise<void> {
   const { closeDeepBrain, initializeDeepBrain } = require("./db/database") as typeof import("./db/database");
   const serverModule = require("./server") as typeof import("./server");
   const { startServer, onConfigChange, getDispatcher, getSwarmUpdater, setOrchestratorRef } = serverModule;
+  const { startCommandCenter, stopCommandCenter } = serverModule as typeof import("./server");
   const { SwarmClient } = require("./network/SwarmClient") as typeof import("./network/SwarmClient");
   const { SyncManager } = require("./network/SyncManager") as typeof import("./network/SyncManager");
   const { BrainDeltaSync } = require("./network/BrainDeltaSync") as typeof import("./network/BrainDeltaSync");
@@ -448,6 +449,11 @@ async function main(): Promise<void> {
     }
     orchestrator.start();
     setOrchestratorRef(orchestrator);
+    // The Command Center batch queue runs on the MASTER only — it reads the
+    // Deep Brain and the batch folders, neither of which exists on a
+    // satellite. `startCommandCenter` degrades silently otherwise, but the
+    // role check here keeps the intent explicit at the call site.
+    if (env.NODE_ROLE === "master") startCommandCenter();
 
     // A Master advertises itself on the LAN so satellite nodes can find it
     // without a hand-typed IP. Satellites never broadcast.
@@ -469,6 +475,7 @@ async function main(): Promise<void> {
     beacon.stop(); // release the UDP discovery port before rebinding
     dispatcher.stop();
     swarmUpdater.stop();
+    stopCommandCenter(); // the batch poll loop; in-flight analysis finishes on its own
     if (orchestrator) {
       await orchestrator.stop();
       orchestrator = null;

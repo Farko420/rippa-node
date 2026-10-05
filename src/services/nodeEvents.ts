@@ -12,6 +12,9 @@
  *   2. BRAIN SYNC PROGRESS. Ingesting a bundle takes as long as the file is big;
  *      the browser cannot learn how far along it is from a single 200 response
  *      that arrives when the work is already finished.
+ *   3. COMMAND CENTER MESSAGES. The Master posts batch-analysis results back
+ *      into the admin's chat thread whenever ITS OWN queue decides — again
+ *      nothing the browser requested, so it comes down the same one channel.
  *
  * So the node publishes here, and `GET /api/system/events` streams it to every
  * connected dashboard over Server-Sent Events. SSE (rather than WebSocket)
@@ -25,7 +28,7 @@
  */
 
 /** What kind of thing happened. */
-export type NodeEventKind = "admin_command" | "brain_sync" | "info";
+export type NodeEventKind = "admin_command" | "brain_sync" | "command_center" | "info";
 
 export interface NodeEvent {
   /** Monotonic per-process id, so a client can drop duplicates on reconnect. */

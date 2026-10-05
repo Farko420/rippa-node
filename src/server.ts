@@ -64,6 +64,21 @@ import {
   subscribeTelemetry,
 } from "./services/engineTelemetry";
 import { runEngineCommand } from "./services/engineCli";
+import {
+  appendMessage,
+  CommandBatchProcessor,
+  deleteBatch,
+  ensureCommandCenterSchema,
+  ensureThread,
+  findBatchFolder,
+  getBatch,
+  listMessages,
+  listRecentBatches,
+  postAssistantMessage,
+  stageIntake,
+  sweepOrphanBatchFolders,
+  walkBatchFiles,
+} from "./services/commandCenter";
 
 /**
  * THE INTERROGATION ENDPOINT — where the cloud-based Rippa AI pings the
@@ -126,6 +141,9 @@ interface OrchestratorScraperRef {
     selfHeal: () => Promise<{ healed: boolean; message: string }>;
     isBrowserBacked: () => boolean;
   };
+  getOllama: () => {
+    extractFacts: (text: string) => Promise<{ fact_summary: string; category: string } | null>;
+  };
 }
 
 let orchestratorRef: OrchestratorScraperRef | null = null;
@@ -133,6 +151,11 @@ let orchestratorRef: OrchestratorScraperRef | null = null;
 /** Registers the live Orchestrator so API routes can reach its scraper. */
 export function setOrchestratorRef(orchestrator: OrchestratorScraperRef | null): void {
   orchestratorRef = orchestrator;
+  // The Command Center processor's model comes from the same registration —
+  // no second ref, no second lifecycle to keep in sync with stop/start.
+  setOrchestratorLlmRef(
+    orchestrator ? { extractFacts: (text: string) => orchestrator.getOllama().extractFacts(text) } : null,
+  );
 }
 
 /**
@@ -156,6 +179,61 @@ let brainSyncRef: BrainSyncRef | null = null;
 /** Registers the live trickle-sync so the Control Center can see and force it. */
 export function setBrainSyncRef(sync: BrainSyncRef | null): void {
   brainSyncRef = sync;
+}
+
+/**
+ * Narrow view of the live Orchestrator's Ollama client, so the Command Center
+ * routes can reach local inference without importing the agent graph.
+ *
+ * Declared as an interface (not the class) for the same reason as
+ * `OrchestratorScraperRef` above: routes stay exercisable in isolation, and
+ * the processor's structural `extractFacts` dep means the server never needs
+ * the concrete type here.
+ */
+interface OrchestratorLlmRef {
+  extractFacts: (text: string) => Promise<{ fact_summary: string; category: string } | null>;
+}
+
+let orchestratorLlmRef: OrchestratorLlmRef | null = null;
+
+/** Registers the live local model for Command Center batch analysis. */
+export function setOrchestratorLlmRef(llm: OrchestratorLlmRef | null): void {
+  orchestratorLlmRef = llm;
+}
+
+/**
+ * The Command Center batch processor — one per server, started for the
+ * Master's boot path and fed the live model through `setOrchestratorLlmRef`.
+ * Satellites never start it (their route handlers refuse first anyway).
+ */
+const commandBatchProcessor = new CommandBatchProcessor({
+  isModelWired: () => orchestratorLlmRef !== null,
+  extractFacts: async (text: string) => {
+    if (!orchestratorLlmRef) return null;
+    try {
+      const fact = await orchestratorLlmRef.extractFacts(text);
+      if (!fact || typeof fact.fact_summary !== "string") return null;
+      return { fact_summary: fact.fact_summary, category: String(fact.category ?? "description") };
+    } catch {
+      return null;
+    }
+  },
+});
+
+/** Starts the Command Center queue consumer (Master-only; called by boot). */
+export function startCommandCenter(): void {
+  try {
+    ensureCommandCenterSchema();
+  } catch {
+    return; // satellite / pre-init — the routes degrade to clean 400s.
+  }
+  sweepOrphanBatchFolders();
+  commandBatchProcessor.start();
+}
+
+/** Stops the Command Center queue consumer (shutdown path). */
+export function stopCommandCenter(): void {
+  commandBatchProcessor.stop();
 }
 
 /**
@@ -608,6 +686,10 @@ export function createApp(): Express {
     if (replay?.blocking) res.write(`data: ${JSON.stringify(replay)}\n\n`);
     const brain = latestNodeEvent("brain_sync");
     if (brain) res.write(`data: ${JSON.stringify(brain)}\n\n`);
+    // The Command Center thread follows the same rule: a late-joining chat
+    // view replays the latest analysis post rather than opening on silence.
+    const ccLatest = latestNodeEvent("command_center");
+    if (ccLatest) res.write(`data: ${JSON.stringify(ccLatest)}\n\n`);
 
     const unsubscribe = subscribeNodeEvents((event) => {
       res.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -1256,6 +1338,150 @@ export function createApp(): Express {
       return;
     }
     res.json({ success: true, satellite: detail });
+  });
+
+  /*
+    THE COMMAND CENTER ROUTES — the Master's conversational intake workspace.
+
+    All six are PIN-gated and master-only. The PIN gate is the same session
+    gate every other dashboard route uses (LAN strangers stay out); the
+    master-only guard is about MEANING, not secrecy — a satellite has no Deep
+    Brain and no batch folders, so every one of these would throw. The guard
+    turns that into a clean 400 naming the Master node.
+
+    TWO BODY SHAPES, not one. The thread endpoints speak JSON (the global
+    parser already handles that). The INTAKE endpoint speaks raw multipart
+    bytes — files, not fields — so it registers `express.raw` SCOPED TO ITS
+    OWN PATH first (the same scoping discipline as the /api/brain JSON limit:
+    a 2 GB global body cap on a Pi would be a heap-exhaustion invitation).
+  */
+  app.use("/api/command-center/intake", express.raw({ limit: "2gb", type: "multipart/*" }));
+
+  /** Master-only guard shared by every Command Center route below. */
+  const requireMasterBrain = (res: Response): boolean => {
+    try {
+      getDeepBrain();
+      ensureCommandCenterSchema();
+      return true;
+    } catch {
+      res.status(400).json({
+        success: false,
+        message:
+          "This node has no local brain (satellites are stateless). Run the Command Center on the Master node.",
+      });
+      return false;
+    }
+  };
+
+  // GET /api/command-center/thread?threadId=… — open a thread + its messages.
+  app.get("/api/command-center/thread", requireDashboardAuth, (req: Request, res: Response) => {
+    if (!requireMasterBrain(res)) return;
+    const threadId = ensureThread(String(req.query["threadId"] ?? ""), "Command Center");
+    res.json({ success: true, threadId, messages: listMessages(threadId), batches: listRecentBatches(10) });
+  });
+
+  // POST /api/command-center/message — a plain-text user turn (no files).
+  app.post("/api/command-center/message", requireDashboardAuth, (req: Request, res: Response) => {
+    if (!requireMasterBrain(res)) return;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const text = String(body["text"] ?? "").trim().slice(0, 4000);
+    if (!text) {
+      res.status(400).json({ success: false, message: "No message text was received." });
+      return;
+    }
+    const threadId = ensureThread(String(body["threadId"] ?? ""), text.slice(0, 80) || "Command Center");
+    appendMessage(threadId, "user", text);
+    const reply = postAssistantMessage(
+      threadId,
+      "Noted — I'll keep that with this thread. Drop photos, a folder, tracks or a ZIP here and I'll stage it as a batch for Master analysis.",
+    );
+    res.json({ success: true, threadId, reply });
+  });
+
+  // POST /api/command-center/intake — multipart prompt + files → PENDING batch.
+  app.post("/api/command-center/intake", requireDashboardAuth, async (req: Request, res: Response) => {
+    if (!requireMasterBrain(res)) return;
+    const contentType = String(req.headers["content-type"] ?? "");
+    if (!/^multipart\/form-data/i.test(contentType)) {
+      res.status(400).json({ success: false, message: "Expected a multipart/form-data upload." });
+      return;
+    }
+    const rawBody = req.body as unknown;
+    if (!Buffer.isBuffer(rawBody) || rawBody.length === 0) {
+      res.status(400).json({ success: false, message: "No file contents were received." });
+      return;
+    }
+    try {
+      const staged = await stageIntake(contentType, rawBody, String(req.query["threadId"] ?? ""));
+      if (!staged.batchId) {
+        // NOTHING KEPT is a 422, not a 500: the upload worked, the CONTENT
+        // was all system litter or unsupported types. The ignored list says so.
+        res.status(422).json({
+          success: false,
+          threadId: staged.threadId,
+          message:
+            staged.ignored.length > 0
+              ? `Nothing to ingest — ${staged.ignored.length} file(s) were system files or unsupported types. Try JPG/PNG/WEBP photos, GPX/KML tracks, TXT/MD/PDF documents, or a ZIP of those.`
+              : "Nothing to ingest — no files were attached.",
+          ignored: staged.ignored.map((file) => file.filename),
+        });
+        return;
+      }
+      const reply = postAssistantMessage(
+        staged.threadId,
+        `📦 **Batch staged: ${staged.kept.length} file${staged.kept.length === 1 ? "" : "s"}**` +
+          `${staged.zipExpanded ? " (ZIP expanded)" : ""}` +
+          `${staged.ignored.length > 0 ? ` — ${staged.ignored.length} skipped (system/unsupported)` : ""}\n` +
+          `Status: \`PENDING_MASTER_ANALYSIS\`. I'll post the EXIF/GPS + vision analysis back here when the Master works through the queue.`,
+        staged.batchId,
+      );
+      res.json({
+        success: true,
+        threadId: staged.threadId,
+        batchId: staged.batchId,
+        kept: staged.kept,
+        ignored: staged.ignored.map((file) => file.filename),
+        zipExpanded: staged.zipExpanded,
+        reply,
+      });
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        message: `Intake failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  });
+
+  // GET /api/command-center/batches — recent batches, newest first.
+  app.get("/api/command-center/batches", requireDashboardAuth, (_req: Request, res: Response) => {
+    if (!requireMasterBrain(res)) return;
+    res.json({ success: true, batches: listRecentBatches(20) });
+  });
+
+  // GET /api/command-center/batch/:id — one batch + its staged file list.
+  app.get("/api/command-center/batch/:id", requireDashboardAuth, (req: Request, res: Response) => {
+    if (!requireMasterBrain(res)) return;
+    const batch = getBatch(String(req.params["id"] ?? ""));
+    if (!batch) {
+      res.status(404).json({ success: false, message: "Unknown batch." });
+      return;
+    }
+    const folder = findBatchFolder(batch.id);
+    const files = folder
+      ? walkBatchFiles(folder).map((entry) => ({ name: entry.rel, size: entry.size }))
+      : [];
+    res.json({ success: true, batch, files });
+  });
+
+  // DELETE /api/command-center/batch/:id — drop a batch (bytes + row).
+  app.delete("/api/command-center/batch/:id", requireDashboardAuth, (req: Request, res: Response) => {
+    if (!requireMasterBrain(res)) return;
+    const id = String(req.params["id"] ?? "");
+    if (!deleteBatch(id)) {
+      res.status(404).json({ success: false, message: "Unknown batch." });
+      return;
+    }
+    res.json({ success: true, message: "Batch deleted." });
   });
 
   // ── AI FALLBACK PROVIDER SETTINGS ───────────────────────────────────────────
@@ -1977,6 +2203,18 @@ export function createApp(): Express {
         return;
       }
       res.redirect("/");
+    });
+    // The Command Center is a dedicated conversational view; same deal — the
+    // PIN gate lives on the API routes (and the page degrades to a locked
+    // notice), so serving the file itself is safe. A missing file falls back
+    // to the dashboard rather than a hard 404.
+    app.get("/admin/command-center", (_req: Request, res: Response) => {
+      const ccFile = path.join(publicDir, "command-center.html");
+      if (fs.existsSync(ccFile)) {
+        res.sendFile(ccFile);
+        return;
+      }
+      res.redirect("/dashboard");
     });
     console.log(`[API] Serving Local Web GUI from ${publicDir}`);
   } else {

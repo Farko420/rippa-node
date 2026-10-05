@@ -8,6 +8,7 @@ import { executeSkill } from "../services/skillExecutor";
 import { healTask } from "../services/taskManager";
 import { startLocalAiDiscovery, type LocalAiStatus } from "../services/localAi";
 import { AutonomousForager } from "../services/autonomousForager";
+import { IngestionEngine } from "../services/ingestionEngine";
 import { TaskEngine, type TaskOutcome } from "../services/taskEngine";
 import { ResourceGovernor, DEFAULT_POWER_CONFIG, type PowerConfig } from "../services/resourceGovernor";
 import {
@@ -99,6 +100,8 @@ export class Orchestrator {
   private readonly forager: AutonomousForager;
   /** The dual-tier scheduler that owns both queues. */
   private readonly engine: TaskEngine;
+  /** The fleet research ingestion pipeline (payload GC lives inside it). */
+  private readonly ingestion: IngestionEngine;
   private readonly ota: OtaUpdater;
   private otaTask: ScheduledTask | null = null;
   private otaFirstCheck: NodeJS.Timeout | null = null;
@@ -150,6 +153,10 @@ export class Orchestrator {
       governor: this.governor,
       handlePriorityTask: (task) => this.handleTask(task),
     });
+    // The heavy-research queue. Its temp workspaces (downloaded ZIPs, extracted
+    // photos, PDFs) are wiped on success, on failure, and swept after a crash —
+    // see services/ingestionEngine for the three-layer guarantee.
+    this.ingestion = new IngestionEngine({ swarm, ollama: this.ollama });
 
     // A version advertised on the heartbeat reply triggers an immediate
     // update attempt instead of waiting for the next scheduled check.
@@ -181,6 +188,7 @@ export class Orchestrator {
     }
     this.running = true;
     this.engine.start();
+    this.ingestion.start();
     console.log(
       "[Orchestrator] Dual-tier engine started — Mothership tasks preempt autonomous foraging.",
     );
@@ -191,6 +199,7 @@ export class Orchestrator {
   async stop(): Promise<void> {
     this.running = false;
     this.stopOtaUpdates();
+    this.ingestion.stop();
     // Stop probing for a local AI server alongside everything else.
     if (this.stopLocalAi) {
       this.stopLocalAi();
@@ -225,6 +234,11 @@ export class Orchestrator {
   /** The scraper service — exposed for the dashboard's self-heal action. */
   getScraper(): ScraperService {
     return this.scraper;
+  }
+
+  /** The local-model client — exposed for Command Center batch analysis. */
+  getOllama(): OllamaClient {
+    return this.ollama;
   }
 
   /** The tier the node is in right now — "priority" or "idle". */

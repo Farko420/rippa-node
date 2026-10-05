@@ -34,7 +34,7 @@ const publicDir = path.join(root, "public");
 const pkgJsonPath = path.join(root, "package.json");
 
 /** Files without which the dashboard cannot render at all. */
-const REQUIRED = ["index.html", "app.js", "styles.css", "dashboard.html", "dashboard.js", "dashboard.css"];
+const REQUIRED = ["index.html", "app.js", "styles.css", "dashboard.html", "dashboard.js", "dashboard.css", "command-center.html", "command-center.css", "command-center.js"];
 
 function fail(message) {
   console.error(`[WebGUI] BUILD FAILED — ${message}`);
