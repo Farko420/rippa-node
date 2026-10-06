@@ -20,6 +20,13 @@
 
 <!-- SHELL — visible immediately so the page is never blank while polling. -->
 <div id="ccApp" class="cc-shell" hidden>
+  <!-- REMOTE MODE BANNER — Satellite-as-Remote-Control. Revealed by
+       dashboard.js from /api/mesh/remote-status; names the connected Master
+       so Remote vs Local operation is never ambiguous. -->
+  <div id="remoteModeBanner" class="cc-ota" hidden style="border-color: var(--acc);">
+    <span class="ota-dot" style="background: var(--acc);"></span>
+    <span id="remoteModeLabel">Remote Mode</span>
+  </div>
   <header class="cc-header">
     <div class="logo">◈</div>
     <div class="cc-head-text">
@@ -43,6 +50,7 @@
     <button type="button" class="cc-nav-item" data-view="viewOllama">⚙ Embedded AI</button>
     <button type="button" class="cc-nav-item" data-view="viewScraper">🕷 Playwright Scraper</button>
     <button type="button" class="cc-nav-item" data-view="viewMesh">🛰 Mesh Network</button>
+    <button type="button" class="cc-nav-item" data-view="viewRemote" id="navRemote" hidden>🎛 Remote Command</button>
     <hr style="margin: 12px 0; border: none; border-top: 1px solid var(--line);">
     <a href="/admin/node-fleet-command" style="display: block; padding: 10px 16px; color: var(--txt); text-decoration: none; font-size: 13px; border-radius: 6px; margin: 4px 0; transition: all 0.2s ease;">
       📊 Node Fleet Command
@@ -345,6 +353,35 @@
         <div class="tile"><span class="tile-label">Online</span><strong id="meshOnline">—</strong></div>
       </div>
       <p id="meshMessage" class="hint" hidden></p>
+    </section>
+  </div>
+
+  <!-- REMOTE COMMAND — Satellite-as-Remote-Control. Visible only in Remote
+       Mode (revealed by dashboard.js from /api/mesh/remote-status). Heavy
+       tasks triggered here POST /api/mesh/offload, which the Satellite
+       proxies to the Master as a Tier 0 swarm task. -->
+  <div id="viewRemote" class="cc-view" hidden>
+    <section class="cc-panel">
+      <div class="ollama-head">
+        <h2>🎛 Remote Command</h2>
+        <span id="remoteModeBadge" class="status-badge status-active">Remote Mode</span>
+      </div>
+      <p class="hint" id="remoteMasterLine">Connected Master: —</p>
+      <p class="hint">
+        This Satellite is a remote control for its Master. Fleet, Review Queue
+        and heavy processing below all execute on the Master — this node only
+        sends the command.
+      </p>
+      <div class="cc-control" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
+        <input id="remoteTaskLabel" type="text" placeholder="Build Profile for X…" style="flex:2 1 260px;" />
+        <select id="remoteTaskLoad" style="flex:0 0 130px;">
+          <option value="heavy">Heavy (Tier 0)</option>
+          <option value="normal">Normal</option>
+          <option value="lite">Lite</option>
+        </select>
+        <button id="remoteTaskSend" type="button" class="save cc-run" style="width:auto;">Offload to Master</button>
+      </div>
+      <p id="remoteTaskMessage" class="hint" hidden></p>
     </section>
   </div>
 

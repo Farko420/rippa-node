@@ -20,6 +20,11 @@ import {
   type PeerEndpoint,
 } from "./config/nodeAuth";
 import { SwarmDispatcher, type LoadClass, type TaskOutcome } from "./services/swarmDispatcher";
+import {
+  forwardToMaster,
+  isRemoteProxyRequest,
+} from "./services/remoteProxy";
+import { verifyMeshKey } from "./config/nodeAuth";
 import { getBrainCounts, getSyncCursor, ingestBrainBundle } from "./services/brainIngest";
 import { latestNodeEvent, publishNodeEvent, subscribeNodeEvents } from "./services/nodeEvents";
 import { getDeepBrain } from "./db/database";
@@ -335,6 +340,49 @@ export function hasDashboardSession(req: Request): boolean {
 }
 
 /**
+ * Reads the caller's mesh credential from X-Mesh-Key or Bearer.
+ * Shared by the mesh node-to-node routes AND the Satellite remote-proxy
+ * bridge below (both already spoke "either header" before this epic).
+ */
+function meshKeyOfRequest(req: Request): string {
+  const dedicated = String((req.headers["x-mesh-key"] as string | undefined) ?? "").trim();
+  if (dedicated) return dedicated;
+  const auth = String((req.headers["authorization"] as string | undefined) ?? "").trim();
+  const bearer = /^Bearer\s+(.+)$/i.exec(auth);
+  return bearer ? bearer[1].trim() : "";
+}
+
+/**
+ * True when this request is a Satellite remote-control forward that the
+ * Master should honour WITHOUT the operator's dashboard PIN.
+ *
+ * DEFENCE IN DEPTH: the Satellite marker header must be present AND the
+ * presented mesh key must verify against this Master's persisted key.
+ * Local-only routes are never honoured via mesh key, even with the marker.
+ */
+function isSatelliteRemoteProxy(req: Request, proxyablePath: string): boolean {
+  if (!isRemoteProxyRequest(req as unknown as { headers?: Record<string, unknown> })) return false;
+  const clean = String(proxyablePath || "").split("?")[0];
+  // Local-only routes are never honoured via mesh key, even with the marker.
+  if (
+    clean === "/api/system/config" ||
+    clean.startsWith("/api/system/config/") ||
+    clean === "/api/config" ||
+    clean.startsWith("/api/config/") ||
+    clean === "/api/mesh/pair-with-master" ||
+    clean === "/api/mesh/identity" ||
+    clean === "/api/mesh/self-heal" ||
+    clean === "/api/node/restart" ||
+    clean === "/api/node/shutdown"
+  ) {
+    return false;
+  }
+  const key = meshKeyOfRequest(req);
+  if (!key) return false;
+  return verifyMeshKey(key);
+}
+
+/**
  * PIN gate for `/api/system/*` (except the auth + status probes below) and the
  * main dashboard view. Setup can proceed unauthenticated until the node has a
  * complete config.json; afterwards the LAN passkey is required.
@@ -355,6 +403,20 @@ export function requireDashboardAuth(req: Request, res: Response, next: NextFunc
   if (hasDashboardSession(req)) {
     next();
     return;
+  }
+  // SATELLITE REMOTE-CONTROL BRIDGE: a paired Satellite forwards its
+  // operator's dashboard calls with the mesh key + proxy marker. The Master
+  // honours those WITHOUT the operator's PIN (the Satellite already checked
+  // it) — but ONLY for allow-listed Master-owned paths. Everything else
+  // still 401s.
+  try {
+    const proxyPath = String((req.originalUrl || req.url || "").split("?")[0] || req.path || "");
+    if (isSatelliteRemoteProxy(req, proxyPath)) {
+      next();
+      return;
+    }
+  } catch {
+    /* fall through to the 401 below */
   }
   res.status(401).json({
     success: false,
@@ -534,7 +596,49 @@ export function createApp(): Express {
     "/api/brain",
     express.json({ limit: "256mb", type: ["application/json", "application/*+json"] }),
   );
+  // Raw multipart bodies must be captured BEFORE express.json() runs: the
+  // global JSON parser would otherwise consume (and reject) the file bytes,
+  // leaving req.body empty so there is nothing left to forward to the Master.
+  // Scoped to the single intake path; every other route keeps the JSON parser.
+  app.use("/api/command-center/intake", express.raw({ limit: "2gb", type: "multipart/*" }));
   app.use(express.json());
+
+  /*
+    SATELLITE REMOTE-PROXY MIDDLEWARE — the Satellite-as-Remote-Control epic.
+
+    When THIS node runs as a `satellite`, Master-owned dashboard routes must
+    NOT execute locally (there is no Deep Brain, no fleet registry, no triage
+    tables here). Instead the request is forwarded to the paired Master and
+    the Master's response is relayed back, so the Satellite UI feels local
+    while the Master takes the compute load.
+
+    PLACEMENT IS LOAD-BEARING:
+    - AFTER express.json() (and the early intake express.raw) so req.body is
+      parsed and re-sendable — JSON rides as JSON, multipart rides as a Buffer.
+    - BEFORE every /api/admin, /api/mesh/snapshot, /api/brain and
+      /api/command-center route below, so no Master-only guard runs first.
+
+    forwardToMaster is a closed allow-list: local-only routes (config writes,
+    pairing, identity, self-heal, restart/shutdown) fall through and keep
+    running against THIS node.
+  */
+  app.use(async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const handled = await forwardToMaster(
+        req as unknown as Parameters<typeof forwardToMaster>[0],
+        res as unknown as Parameters<typeof forwardToMaster>[1],
+      );
+      if (handled) return;
+    } catch (error) {
+      res.status(502).json({
+        success: false,
+        remoteMode: true,
+        message: `Remote proxy failed — ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return;
+    }
+    next();
+  });
 
   // Liveness probe for the Mothership / local monitoring.
   app.get("/health", (_req: Request, res: Response) => {
@@ -1175,6 +1279,32 @@ export function createApp(): Express {
     res.json({ success: true, ...dispatcher.getSnapshot() });
   });
 
+  // GET /api/mesh/remote-status — Remote Mode probe for Satellite dashboards.
+  //
+  // The Satellite UI calls this on boot to decide whether to paint the
+  // "Remote Mode — connected to Master <code>" banner and to enable the
+  // Remote Command section. Local-only (never proxied): a Satellite answers
+  // from its own pairing record; a Master reports remoteMode:false.
+  app.get("/api/mesh/remote-status", requireDashboardAuth, (_req: Request, res: Response) => {
+    const pairing = getPairing();
+    const role = env.NODE_ROLE;
+    if (role !== "satellite") {
+      res.json({ success: true, remoteMode: false, role });
+      return;
+    }
+    res.json({
+      success: true,
+      remoteMode: true,
+      role,
+      masterCode: pairing?.masterCode ?? "",
+      masterUrl: pairing?.masterUrl ?? env.MASTER_LOCAL_URL ?? "",
+      paired: Boolean(pairing),
+      message: pairing
+        ? `Remote Mode — connected to Master ${pairing.masterCode}.`
+        : "Remote Mode — not paired yet. Set the Master Node URL in Setup.",
+    });
+  });
+
   // ── MASTER BRAIN PARITY ──────────────────────────────────────────────────
 
   /*
@@ -1352,12 +1482,9 @@ export function createApp(): Express {
 
     TWO BODY SHAPES, not one. The thread endpoints speak JSON (the global
     parser already handles that). The INTAKE endpoint speaks raw multipart
-    bytes — files, not fields — so it registers `express.raw` SCOPED TO ITS
-    OWN PATH first (the same scoping discipline as the /api/brain JSON limit:
-    a 2 GB global body cap on a Pi would be a heap-exhaustion invitation).
+    bytes — captured by the early express.raw middleware above (before the
+    remote proxy, so Satellites forward file bytes to the Master intact).
   */
-  app.use("/api/command-center/intake", express.raw({ limit: "2gb", type: "multipart/*" }));
-
   /** Master-only guard shared by every Command Center route below. */
   const requireMasterBrain = (res: Response): boolean => {
     try {
@@ -1556,6 +1683,11 @@ export function createApp(): Express {
   });
 
   // POST /api/mesh/task — Master assigns a shared task (auto-provisions P2P).
+  //
+  // SATELLITE REMOTE-CONTROL NOTE: satellites never reach this handler — the
+  // remote-proxy middleware above forwards their POST to the paired Master.
+  // Heavy work triggered from a Satellite UI ("Build Profile for X") therefore
+  // lands here on the MASTER, which takes the compute load.
   app.post("/api/mesh/task", requireDashboardAuth, async (req: Request, res: Response) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const load = String(body["load"] ?? "normal") as LoadClass;
@@ -1564,13 +1696,67 @@ export function createApp(): Express {
       return;
     }
     const assignees = Array.isArray(body["assignees"]) ? (body["assignees"] as string[]) : undefined;
+    // Tier marker: Satellite-offloaded work is Tier 0 / high-priority. The
+    // label prefix survives into the swarm registry + UI so an operator can
+    // see the task was remote-triggered rather than locally created.
+    const remoteTier = String(body["tier"] ?? body["priority"] ?? "").trim();
+    const requestedLabel = String(body["label"] ?? "Shared swarm task");
+    const label =
+      isRemoteProxyRequest(req as unknown as { headers?: Record<string, unknown> }) &&
+      !/^\[(tier 0|remote)\]/i.test(requestedLabel)
+        ? `[Tier 0/Remote] ${requestedLabel}`
+        : requestedLabel;
+    void remoteTier;
     try {
       const task = await dispatcher.assignSharedTask({
-        label: String(body["label"] ?? "Shared swarm task"),
+        label,
         load,
         ...(assignees ? { assignees } : {}),
       });
-      res.json({ success: true, task });
+      res.json({ success: true, task, remoteOffload: true });
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // POST /api/mesh/offload — explicit heavy-task offload endpoint.
+  //
+  // This is the Tier 0 path the Satellite "Remote Command" UI calls when the
+  // operator triggers heavy processing ("Build Profile for X", manual scrape).
+  // On a Satellite the remote-proxy middleware forwards it to the Master;
+  // on the Master it lands here and is dispatched as a high-priority (heavy)
+  // shared swarm task, so the Master takes the compute load while the
+  // Satellite acts purely as the controller.
+  app.post("/api/mesh/offload", requireDashboardAuth, async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const labelRaw = String(body["label"] ?? body["placeName"] ?? body["target"] ?? "").trim();
+    if (!labelRaw) {
+      res.status(400).json({ success: false, message: "label (or placeName/target) is required." });
+      return;
+    }
+    const load = String(body["load"] ?? "heavy") as LoadClass;
+    if (!["heavy", "normal", "lite"].includes(load)) {
+      res.status(400).json({ success: false, message: "load must be heavy, normal or lite." });
+      return;
+    }
+    const assignees = Array.isArray(body["assignees"]) ? (body["assignees"] as string[]) : undefined;
+    const label = /^\[(tier 0|remote)\]/i.test(labelRaw) ? labelRaw : `[Tier 0/Remote] ${labelRaw}`;
+    try {
+      const task = await dispatcher.assignSharedTask({
+        label,
+        load,
+        ...(assignees ? { assignees } : {}),
+      });
+      res.json({
+        success: true,
+        task,
+        tier: 0,
+        offloaded: true,
+        message: `Offloaded "${labelRaw}" to the Master as a Tier 0 (${load}) swarm task.`,
+      });
     } catch (error) {
       res.status(400).json({
         success: false,

@@ -1451,7 +1451,7 @@ function setText(id, value) {
 }
 
 function showView(viewId) {
-  ["viewFleet", "viewOllama", "viewScraper", "viewMesh"].forEach((id) => {
+  ["viewFleet", "viewOllama", "viewScraper", "viewMesh", "viewRemote"].forEach((id) => {
     const el = $(id);
     if (el) el.hidden = id !== viewId;
   });
@@ -2226,6 +2226,82 @@ if (setupBtn) {
   a ReferenceError inside the listener instead of assigning anything.
 */
 
+/* ------------------------------------------------------------------
+   SATELLITE REMOTE MODE — banner + Remote Command offload.
+
+   refreshRemoteMode() probes GET /api/mesh/remote-status (local-only, never
+   proxied) and, on a Satellite, reveals the Remote Command nav item and
+   stamps every page with "Remote Mode — Master <code>". Masters leave the
+   nav hidden and render unchanged.
+
+   wireRemoteOffload() POSTs /api/mesh/offload (Tier 0 / heavy by default).
+   On a Satellite the proxy middleware forwards it to the paired Master, so
+   the Master takes the compute load while this node stays a controller.
+------------------------------------------------------------------- */
+async function refreshRemoteMode() {
+  let status = null;
+  try {
+    const res = await api("/api/mesh/remote-status");
+    status = res.data;
+  } catch (err) {
+    return; // Master on an older build, or offline — stay in local mode.
+  }
+  if (!status || status.remoteMode !== true) return;
+  const masterId = status.masterCode || status.masterUrl || "Master";
+  const nav = $("navRemote");
+  if (nav) nav.hidden = false;
+  const line = $("remoteMasterLine");
+  if (line) line.textContent = "Connected Master: " + masterId + (status.paired === false ? " (not paired yet — set the Master URL in Setup)" : "");
+  const banner = $("remoteModeBanner");
+  if (banner) {
+    banner.hidden = false;
+    const label = $("remoteModeLabel");
+    if (label) label.textContent = "Remote Mode — Master " + masterId;
+  }
+  const sub = $("ccSub");
+  if (sub && !sub.dataset.remoteStamped) {
+    sub.dataset.remoteStamped = "1";
+    sub.textContent = (sub.textContent || "Live swarm topology") + " · Remote Mode (" + masterId + ")";
+  }
+  // Fleet/Review links already render Master data via the proxy — no hiding.
+}
+
+function wireRemoteOffload() {
+  const btn = $("remoteTaskSend");
+  if (!btn || btn.dataset.wired === "1") return;
+  btn.dataset.wired = "1";
+  btn.addEventListener("click", async () => {
+    const labelEl = $("remoteTaskLabel");
+    const loadEl = $("remoteTaskLoad");
+    const msg = $("remoteTaskMessage");
+    const label = ((labelEl && labelEl.value) || "").trim();
+    if (!label) {
+      if (msg) { msg.textContent = "Type what to build first (e.g. Build Profile for X)."; msg.hidden = false; }
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const res = await api("/api/mesh/offload", {
+        method: "POST",
+        body: JSON.stringify({ label, load: (loadEl && loadEl.value) || "heavy", tier: 0 }),
+      });
+      if (msg) {
+        msg.textContent = res.data && res.data.success
+          ? (res.data.message || "Offloaded to the Master as a Tier 0 task.")
+          : ("Offload failed: " + ((res.data && res.data.message) || "unknown error"));
+        msg.hidden = false;
+      }
+      if (labelEl && res.data && res.data.success) labelEl.value = "";
+      // A successful offload shows up in the (proxied) fleet snapshot.
+      try { await refresh(); } catch (err) { /* snapshot will catch up */ }
+    } catch (err) {
+      if (msg) { msg.textContent = "Offload failed: " + (err && err.message ? err.message : err); msg.hidden = false; }
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
 /*
  * CONTROL CENTER STARTUP — idempotent, and called by app.js.
 
@@ -2286,6 +2362,13 @@ function startControlCenter() {
   // Polls for the life of the page; no teardown hook is needed because the
   // document is discarded wholesale when the operator navigates away.
   setInterval(() => void refresh(), REFRESH_MS);
+
+  // SATELLITE REMOTE MODE — reveals the Remote Command nav + banner.
+  // The Satellite proxies Fleet/Review/Master calls to its Master, so the
+  // same pages now render live Master data here; the banner names the
+  // connected Master so Remote vs Local is never ambiguous.
+  void refreshRemoteMode();
+  wireRemoteOffload();
 
   // --- PHASE 2: Review Queue Badge Polling -----
   async function updateReviewBadge() {

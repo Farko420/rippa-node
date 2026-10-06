@@ -277,6 +277,10 @@
 -->
 <div id="dashboardContainer" hidden>
 <div id="ccApp" class="cc-shell">
+  <div id="remoteModeBanner" class="cc-ota" hidden style="border-color: var(--acc);">
+    <span class="ota-dot" style="background: var(--acc);"></span>
+    <span id="remoteModeLabel">Remote Mode</span>
+  </div>
   <header class="cc-header">
     <div class="logo">&#9672;</div>
     <div class="cc-head-text">
@@ -309,6 +313,7 @@
     <button type="button" class="cc-nav-item" data-view="viewOllama">&#9881; Embedded AI</button>
     <button type="button" class="cc-nav-item" data-view="viewScraper">&#128375; Playwright Scraper</button>
     <button type="button" class="cc-nav-item" data-view="viewMesh">&#128752; Mesh Network</button>
+    <button type="button" class="cc-nav-item" data-view="viewRemote" id="navRemote" hidden>&#127905; Remote Command</button>
   </nav>
 
   <div id="viewFleet" class="cc-view">
@@ -572,6 +577,31 @@
         <div class="tile"><span class="tile-label">Online</span><strong id="meshOnline">&mdash;</strong></div>
       </div>
       <p id="meshMessage" class="hint" hidden></p>
+    </section>
+  </div>
+
+  <div id="viewRemote" class="cc-view" hidden>
+    <section class="cc-panel">
+      <div class="ollama-head">
+        <h2>&#127905; Remote Command</h2>
+        <span id="remoteModeBadge" class="status-badge status-active">Remote Mode</span>
+      </div>
+      <p class="hint" id="remoteMasterLine">Connected Master: &mdash;</p>
+      <p class="hint">
+        This Satellite is a remote control for its Master. Fleet, Review Queue
+        and heavy processing below all execute on the Master — this node only
+        sends the command.
+      </p>
+      <div class="cc-control" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
+        <input id="remoteTaskLabel" type="text" placeholder="Build Profile for X…" style="flex:2 1 260px;" />
+        <select id="remoteTaskLoad" style="flex:0 0 130px;">
+          <option value="heavy">Heavy (Tier 0)</option>
+          <option value="normal">Normal</option>
+          <option value="lite">Lite</option>
+        </select>
+        <button id="remoteTaskSend" type="button" class="save cc-run" style="width:auto;">Offload to Master</button>
+      </div>
+      <p id="remoteTaskMessage" class="hint" hidden></p>
     </section>
   </div>
 
