@@ -12,9 +12,10 @@
  *     — the ordinary way to cut a release — matched no trigger at all. No build,
  *     no release, and a green page because nothing ran.
  *   * `release: types: [published]` while the workflow itself PUBLISHES a
- *     release. That is a self-trigger, and it settles only because
- *     `softprops/action-gh-release` updates the existing release rather than
- *     creating a second one. That is the action's behaviour, not GitHub's.
+ *     release. That is a self-trigger, and it is guarded by the release
+ *     AUTHOR (`github-actions[bot]`) rather than a tag name, because tags
+ *     are now minted per run (`v1.0.<run_number>`) and no fixed tag
+ *     identifies "ours" anymore.
  *   * `fail_on_unmatched_files: false`. Deliberate — it stops a packaging path
  *     rename from aborting the run — but it means a renamed binary publishes a
  *     release with NO .exe asset and still reports success. And
@@ -204,24 +205,57 @@ check("contents: write is granted", doc.permissions?.contents === "write", JSON.
 const publish = (job.steps ?? []).find((s) => s.uses?.startsWith("softprops/action-gh-release"));
 check("the release step uses action-gh-release@v2", publish?.uses === "softprops/action-gh-release@v2", publish?.uses);
 check("it uploads .exe files", /\.exe/.test(publish?.with?.files ?? ""), publish?.with?.files);
-check("it publishes to the rolling 'latest' tag", publish?.with?.tag_name === "latest", publish?.with?.tag_name);
+/*
+  RUN-NUMBER IDENTITY. The epic ties every artifact to `github.run_number`:
+  package.json is stamped `1.0.<run_number>` BEFORE the compile (so the
+  snapshot src/version.ts reads inside the shipped exe carries it), and the
+  release tag and title derive from the SAME run number so they can never
+  disagree. A patch+1 bump or a tag-derived version would reintroduce exactly
+  the local / Release / Mothership skew this pipeline exists to remove.
+*/
+check(
+  "the release tag is the run-number tag, not a fixed rolling tag",
+  publish?.with?.tag_name === "${{ steps.release_tag.outputs.tag }}",
+  publish?.with?.tag_name,
+);
+const releaseTagStep = (job.steps ?? []).find((s) => s.id === "release_tag");
+check(
+  "the release tag resolves to v1.0.<run_number>",
+  /v1\.0\.\$\{\{ github\.run_number \}\}/.test(releaseTagStep?.run ?? ""),
+  releaseTagStep?.run,
+);
+check(
+  "the release title is 'Release v1.0.<run_number>'",
+  publish?.with?.name === "Release ${{ steps.release_tag.outputs.tag }}",
+  publish?.with?.name,
+);
 check("the release target is a SHA, never a branch", /steps\.release_tag\.outputs\.commitish/.test(publish?.with?.target_commitish ?? ""));
 
 /*
   THE LOOP GUARD. The workflow publishes a release, and publishing a release
   fires the `release` trigger again. Without this `if:`, that is an infinite
-  rebuild-and-republish loop — and because the version-bump step also COMMITS
+  rebuild-and-republish loop — and because the version step also COMMITS
   BACK, it would bury the repo in "chore: bump version" commits.
+
+  The guard is on the AUTHOR, not the tag: releases are minted per run
+  (v1.0.<run_number>), so no fixed tag name identifies "ours" anymore.
 */
-check("the release-triggered run is guarded against self-retrigger", /github\.event\.release\.tag_name != 'latest'/.test(job.if ?? ""), job.if);
+check("the release-triggered run is guarded against self-retrigger", /github\.event\.release\.author\.login != 'github-actions\[bot\]'/.test(job.if ?? ""), job.if);
 
 /*
-  THE TAG MUST NOT BUMP. `extractVersion` in src/services/updater.ts reads the
-  version out of the release NAME, and a tag push that bumps publishes a release
-  whose body contradicts the tag the operator just pushed.
+  THE VERSION STEP MUST STAMP THE RUN NUMBER, BEFORE THE BUILD.
 */
 const bump = (job.steps ?? []).find((s) => s.id === "version");
-check("a tag push takes its version from the tag", /github\.ref_type.*tag/.test(bump?.run ?? "") && /regex\]::Match/.test(bump?.run ?? ""), "the bump step is tag-unaware");
+check(
+  "package.json is stamped with 1.0.<run_number>, not patch+1 or the tag",
+  /npm version 1\.0\.\$\{\{ github\.run_number \}\}/.test(bump?.run ?? ""),
+  "the version step must write `1.0.${{ github.run_number }}` into package.json",
+);
+check(
+  "the version is stamped BEFORE the exe is compiled",
+  Boolean(bump && buildStep) && job.steps.indexOf(bump) < job.steps.indexOf(buildStep),
+  "a version written after `npm run package` never reaches the shipped binary",
+);
 
 const commitBump = (job.steps ?? []).find((s) => s.name === "Commit the version bump");
 check("the commit-back is skipped on a tag (detached HEAD)", /github\.ref_type != 'tag'/.test(commitBump?.if ?? ""), commitBump?.if);

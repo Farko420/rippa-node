@@ -1,7 +1,10 @@
 name: build-node
 
-# Every push to main compiles the portable .exe and publishes it to a rolling
-# "latest" release. The fleet's Master polls this release hourly and rolls the
+# Every push to main compiles the portable .exe and publishes it to a versioned
+# release tagged `v1.0.<run_number>` — the GitHub Action run number IS the
+# version, so the local node, the GitHub Releases and the Mothership's OTA
+# updater can never disagree. The fleet's Master polls /releases/latest (GitHub
+# resolves it to the newest release by creation time) hourly and rolls the
 # whole swarm forward automatically — no operator action anywhere.
 on:
   push:
@@ -17,13 +20,12 @@ on:
     # Actions page because nothing ran. The fleet then sat on its old binary with
     # the updater logging a version it had already seen and nothing to fetch.
     #
-    # The tag build publishes to the SAME rolling "latest" release as a branch
-    # build (see the Publish step) rather than minting a versioned release, and
-    # that is deliberate: GitHub's `/releases/latest` returns the newest release
-    # by CREATED_AT, so a permanent `v1.0.11` release would permanently outrank
-    # the rolling tag and become the answer every node polls — freezing OTA on
-    # whatever shipped that day. The tag is still recorded in the release body as
-    # `build-tag:` for provenance.
+    # A tag build and a branch build publish through the SAME run-numbered
+    # release scheme (see the Publish step): every run mints `v1.0.<run_number>`,
+    # and GitHub's `/releases/latest` returns the newest release by CREATED_AT —
+    # runs create releases in ascending run order, so the newest build is always
+    # the answer every node polls. The operator's own tag is still recorded in
+    # the release body as `build-tag:` for provenance.
     #
     # `v*` only, and `v[0-9]+.*` would be stricter still; `v*` is chosen so a
     # typo'd tag fails the build loudly rather than silently matching nothing.
@@ -32,14 +34,14 @@ on:
   workflow_dispatch:
   # Also run when a release is published from the GitHub UI.
   #
-  # GUARDED, and the guard is load-bearing. This workflow publishes a release, and
-  # publishing a release fires this trigger again. It only settles after the first
-  # run because `softprops/action-gh-release` UPDATES the existing "latest" release
-  # rather than creating a second one — an update emits `edited`, not `published` —
-  # but that is a property of the action's behaviour, not of GitHub's, and a
-  # day when it creates rather than updates would ship an infinite release loop
-  # that republishes the same binary forever. The `if:` below makes the loop
-  # impossible by construction, so it does not depend on that behaviour holding.
+  # GUARDED, and the guard is load-bearing. This workflow publishes a release,
+  # and publishing a release fires this trigger again. Releases are now minted
+  # PER RUN (`v1.0.<run_number>`), so every publish creates a NEW release rather
+  # than updating a fixed one — and a day when that re-trigger actually lands
+  # would ship an infinite rebuild-and-republish loop. The `if:` below keys on
+  # the release AUTHOR (`github-actions[bot]`), making the loop impossible by
+  # construction rather than depending on which events GitHub chooses to
+  # propagate from a GITHUB_TOKEN.
   release:
     types: [published]
 
@@ -92,18 +94,21 @@ jobs:
     # would still let a re-triggered run bump and commit a version again, so the
     # repo would gain an endless series of "chore: bump version" commits.
     #
-    # This workflow's own releases are all tagged "latest" (see the Publish step),
-    # so a `release` event for that tag is this workflow talking to itself. A
-    # human publishing some OTHER tag still runs, which is the case worth keeping.
+    # This workflow's own releases are minted by the bot (see the Publish step),
+    # so a `release` event authored by `github-actions[bot]` is this workflow
+    # talking to itself. The tags are now per-run (v1.0.<run_number>), so a tag
+    # name can no longer distinguish "ours" from "a human's" — the AUTHOR is the
+    # only stable discriminator left. A human publishing any release still runs,
+    # which is the case worth keeping.
     if: >-
       github.event_name != 'release' ||
-      github.event.release.tag_name != 'latest'
+      github.event.release.author.login != 'github-actions[bot]'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Depth 0 is REQUIRED, not an optimisation. The Bump-version step commits
+          # Depth 0 is REQUIRED, not an optimisation. The version step commits
           # a new package.json back to the branch, and `stefanzweifel/git-auto-commit-action`
           # refuses to push without a usable ref to push onto — with the default
           # shallow fetch (depth 1) that ref is missing and the step fails with a
@@ -129,44 +134,58 @@ jobs:
           npm install better-sqlite3@11.3.0 --no-save
           npm install --no-package-lock
 
-      # Bump the patch version so the fleet's isVersionNewer() comparison sees a
-      # genuinely newer release on every push. The bumped version is committed
-      # back so package.json stays the single source of truth for the app.
+      # -------------------------------------------------------------------------
+      # RUN-NUMBER VERSIONING — the version IS the action run number.
       #
-      # A TAG PUSH DOES NOT BUMP, and that is the load-bearing branch here. The tag
-      # is the operator's statement of what this build IS (`v1.0.11`), so bumping on
-      # top of it would publish a release whose body claims a version the tag
-      # contradicts. The node's updater reads the version out of the release body
-      # (see `extractVersion` in src/services/updater.ts), so the two would disagree
-      # and a fleet could install a binary it believes is a version it already has
-      # and skip it — the exact "OTA aborts" symptom this workflow exists to fix.
+      # `1.0.<github.run_number>` is written into package.json BEFORE anything
+      # compiles, so the shipped rippa-node.exe inherently knows its exact
+      # build: src/version.ts reads package.json with require() at module load
+      # and pkg freezes that manifest into the binary's snapshot. The startup
+      # banner, the /api/swarm/heartbeat payload and the OTA updater's
+      # isVersionNewer() comparison all read that one value — which is what
+      # removes the local / GitHub Release / Mothership version drift this epic
+      # exists to fix, without a single hand-edited number in the chain.
       #
-      # So: on a tag, the tag's own version wins; on a branch, it is bumped.
-      - name: Bump version
+      # NOT a patch+1, and NOT the operator's tag either: the run number is
+      # monotonic per workflow, so a version can never repeat, never needs a
+      # manual bump, and every release can be traced back to the exact Actions
+      # run that produced it. A tag push takes the SAME path — deriving the
+      # version from the pushed tag would make the release tag
+      # (v1.0.<run_number>) and the body (`rippa-node-version`) disagree, which
+      # is the exact mismatch the epic removes (see `extractVersion` in
+      # src/services/updater.ts: it reads the tag first, so the two must match).
+      #
+      # `--allow-same-version` is load-bearing for a re-run: GitHub re-runs
+      # reuse the ORIGINAL run_number, and without the flag `npm version` fails
+      # with "Version not changed" before a single line of code compiles.
+      #
+      # The set version is committed back so package.json stays the single
+      # source of truth for local dev and for anything that reads the repo.
+      - name: Set the run-number version
         id: version
         shell: pwsh
         run: |
           $pkg = Get-Content package.json -Raw | ConvertFrom-Json
-          if ("${{ github.ref_type }}" -eq "tag") {
-            # Take the version from the tag, and fail loudly if the tag is not a
-            # version at all rather than silently falling back to a stale one.
-            $m = [regex]::Match("${{ github.ref_name }}", '^v?(\d+\.\d+\.\d+)')
-            if (-not $m.Success) {
-              Write-Error "Tag '${{ github.ref_name }}' is not a vMAJOR.MINOR.PATCH tag"
-              exit 1
-            }
-            $newVersion = $m.Groups[1].Value
-          } else {
-            $parts = $pkg.version.Split('.')
-            $major = [int]$parts[0]
-            $minor = [int]$parts[1]
-            $patch = [int]$parts[2] + 1
-            $newVersion = "$major.$minor.$patch"
+          $previous = "$($pkg.version)"
+          $newVersion = "1.0.${{ github.run_number }}"
+          # The literal run-number stamp, exactly as the epic specifies: the
+          # exe's snapshot must carry this exact value.
+          npm version 1.0.${{ github.run_number }} --no-git-tag-version --allow-same-version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "::error::npm version 1.0.${{ github.run_number }} failed (exit $LASTEXITCODE); package.json was not stamped with the run number."
+            exit 1
           }
-          npm version $newVersion --no-git-tag-version --allow-same-version
-          $pkg.version = $newVersion
-          $pkg | ConvertTo-Json -Depth 10 | Set-Content package.json
-          Write-Host "Building version $newVersion"
+          # A run_number at or below the fleet's current version would publish
+          # a DOWNGRADE that the fleet's isVersionNewer() guard silently
+          # refuses - a green run with an OTA that never moves, the exact
+          # failure mode this pipeline exists to prevent. Warn loudly rather
+          # than fail: the binary itself is still valid. (ASCII hyphen, not an
+          # em-dash: a smart quote inside a PowerShell string literal breaks
+          # the no-BOM ANSI parse this suite does on Windows PowerShell 5.1.)
+          if ($previous -match '^\d+\.\d+\.\d+$' -and [version]$newVersion -le [version]$previous) {
+            Write-Warning "Version $newVersion is not newer than $previous - the fleet's downgrade guard will refuse to OTA onto it."
+          }
+          Write-Host "Building version $newVersion (was: $previous)"
           "version=$newVersion" >> $env:GITHUB_OUTPUT
 
       # -------------------------------------------------------------------------
@@ -360,29 +379,23 @@ jobs:
       # -------------------------------------------------------------------------
       # RELEASE TAG RESOLUTION
       #
-      # A release can only be created against a commitish that actually exists.
-      # On an ordinary push to `master`, `github.ref_name` is the BRANCH name,
-      # not a tag, so using it as a tag target is what makes release creation
-      # fail on every commit that is not itself a tagged release. Resolve an
-      # explicit, always-valid target instead:
-      #   - tag-triggered run  -> the real git tag;
-      #   - branch commit      -> the pushed SHA (never fails), with a stable
-      #                          fallback tag v1.0.<run_number> recorded for
-      #                          provenance and used as the release target name.
+      # The release tag is ALWAYS `v1.0.<run_number>` — the same run number the
+      # version step just stamped into package.json, so tag, release title,
+      # release body and the version compiled into the binary can only ever
+      # agree. `github.ref_name` is deliberately never used: on a branch push it
+      # is the BRANCH name (not a tag at all), and on an operator tag push it
+      # would resurrect the version skew the run number exists to eliminate.
+      #
+      # The commitish is the pushed SHA, which is always resolvable — that is
+      # the entire point: it removes the "release creation failed because
+      # master is not a tag" failure. Never a branch name.
       # -------------------------------------------------------------------------
       - name: Resolve release tag
         id: release_tag
         shell: pwsh
         run: |
-          if ("${{ github.ref_type }}" -eq "tag") {
-            $tag = "${{ github.ref_name }}"
-            $commitish = "${{ github.sha }}"
-          } else {
-            $tag = "v1.0.${{ github.run_number }}"
-            # The SHA is always resolvable, which is the entire point: it removes
-            # the "release creation failed because master is not a tag" failure.
-            $commitish = "${{ github.sha }}"
-          }
+          $tag = "v1.0.${{ github.run_number }}"
+          $commitish = "${{ github.sha }}"
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "commitish=$commitish" >> $env:GITHUB_OUTPUT
           Write-Host "Release tag: $tag (commitish: $commitish)"
@@ -390,12 +403,18 @@ jobs:
       - name: Publish rolling release
         uses: softprops/action-gh-release@v2
         with:
-          # Rolling tag: always points at the newest build. The fleet's Master
-          # polls /releases/latest, so this tag must stay stable across pushes.
-          tag_name: latest
+          # RUN-NUMBERED TAG, never a fixed rolling tag. Every run mints its
+          # own immutable `v1.0.<run_number>`; the fleet's Master polls
+          # /releases/latest, which GitHub resolves to the newest release by
+          # creation time — and runs create releases in ascending run order,
+          # so the newest build is always the answer every node polls.
+          tag_name: ${{ steps.release_tag.outputs.tag }}
           # What the release/tag is created from. Never a branch name.
           target_commitish: ${{ steps.release_tag.outputs.commitish }}
-          name: rippa-node ${{ steps.version.outputs.version }}
+          # "Release v1.0.<run_number>" — derived from the TAG output rather
+          # than restating the run number, so the title can never drift from
+          # the tag it describes.
+          name: Release ${{ steps.release_tag.outputs.tag }}
           prerelease: false
           draft: false
           # Auto-generated notes are NOT enabled: they get prepended to `body`
@@ -477,14 +496,21 @@ jobs:
             -Uri "https://api.github.com/repos/$repo/releases/latest" `
             -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
 
-          if ($release.tag_name -ne "latest") {
-            Write-Error "::error::/releases/latest returned tag '$($release.tag_name)', expected 'latest'. A stale release is shadowing the rolling tag, and the fleet will keep polling it forever."
+          # The endpoint is still /releases/latest — GitHub resolves it to the
+          # NEWEST release by creation time, and this run just created the
+          # newest one. Assert it carries THIS run's tag: an older release
+          # answering here means a stale release is shadowing the newest build,
+          # and every node would keep polling it forever.
+          $expectedTag = "${{ steps.release_tag.outputs.tag }}"
+          if ($release.tag_name -ne $expectedTag) {
+            Write-Error "::error::/releases/latest returned tag '$($release.tag_name)', expected '$expectedTag'. A stale release is shadowing the newest build, and the fleet will keep polling it forever."
             exit 1
           }
 
           # The updater extracts the version from the tag, the NAME or the body —
-          # in that order — and 'latest' is not a version, so the name is what
-          # actually carries it. Assert it rather than trusting that it does.
+          # in that order. All three now carry v1.0.<run_number>, but assert the
+          # NAME too rather than trusting that it does: it is the fallback an
+          # older fleet reads when the tag carries no version.
           if ($release.name -notmatch [regex]::Escape($expectedVersion)) {
             Write-Error "::error::Release name '$($release.name)' does not carry the built version $expectedVersion; the updater will extract a different version and skip the fleet."
             exit 1
@@ -532,7 +558,7 @@ jobs:
             exit 1
           }
 
-          Write-Host "Verified: latest -> $($release.name)"
+          Write-Host "Verified: $expectedTag -> $($release.name)"
           Write-Host "  worker   $($asset.name) ($([math]::Round($asset.size/1MB,1)) MB), SHA recorded"
           Write-Host "  watchdog $($watchdogAsset.name) ($([math]::Round($watchdogAsset.size/1MB,1)) MB)"
 

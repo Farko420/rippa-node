@@ -31,8 +31,9 @@ export { claimHandoffSlot, releaseHandoffClaim, isPackagedExe, installDir };
  *
  * Flow:
  *   1. BUILD     — `.github/workflows/build-node.yml` compiles `rippa-node.exe`
- *                  on every push to `main` and publishes it to the rolling
- *                  `latest` GitHub Release.
+ *                  on every push to `main` and publishes it to a GitHub
+ *                  Release tagged `v1.0.<run_number>` — the run number IS the
+ *                  version; `/releases/latest` resolves to the newest one.
  *   2. POLL      — every 60 minutes the Master asks GitHub for the latest
  *                  release and compares its tag against the local version.
  *   3. SELF      — on a newer build the Master downloads `temp_update.exe` into
