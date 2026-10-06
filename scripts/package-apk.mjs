@@ -71,6 +71,31 @@ if (!/^\d+\.\d+\.\d+/.test(appVersion)) {
 const [major, minor, patch] = appVersion.split(".").map(Number);
 const appVersionCode = major * 10000 + minor * 100 + patch;
 
+/*
+  THE ANDROID PACKAGE ID, PINNED.
+
+  The satellite's in-app updater (MobileBridge.assertItIsThisApp()) refuses any
+  APK whose package name is not this app's own, and Android itself refuses an
+  update that changes the ID. A build stamped with the consumer app ID
+  (`com.rippaadventures.app`) downloads fine and then aborts install with
+  "Refusing to install com.rippaadventures.app: this updater only installs
+  com.rippaadventures.node" — the guard working, the build wrong.
+
+  Capacitor generates applicationId/namespace from mobile/capacitor.config.json
+  at `npx cap add android` time, and mobile/android/ is gitignored + regenerated
+  on CI, so a stale or mis-edited config would silently bake the wrong ID into
+  every APK. These constants are the single source of truth the build enforces:
+  the capacitor config is validated against them up front, and the generated
+  app/build.gradle is patched + verified against them below.
+*/
+const EXPECTED_ANDROID_APP_ID = "com.rippaadventures.node";
+const EXPECTED_ANDROID_APP_NAME = "Rippa Node";
+const FORBIDDEN_ANDROID_APP_IDS = [
+  "com.rippaadventures.app",
+  "com.codelink.app",
+  "com.getcapacitor.app",
+];
+
 /** Runs a command, inheriting stdio; exits the build on failure. */
 function run(command, args, options = {}) {
   // `windowsHide: true` — see package.mjs. Stops each build step from flashing
@@ -100,6 +125,64 @@ function tryRun(command, args, options = {}) {
     ...options,
   });
   return !result.error && result.status === 0;
+}
+
+/*
+  VALIDATE THE PACKAGE ID BEFORE ANYTHING GENERATES OR COMPILES.
+
+  This runs before step 1 so a wrong appId fails in under a second with the
+  exact file to fix, rather than after a multi-minute Gradle run — or worse,
+  as a shipped APK the fleet's updater then refuses to install.
+
+  Both directions are checked: the config MUST equal the expected node worker
+  ID, and it MUST NOT equal any known-foreign ID (the consumer app ID that
+  caused the "Refusing to install" outage, the legacy template default, the
+  historic codelink ID). The second check is what catches a copy-paste from a
+  sibling project; the first catches everything else.
+*/
+{
+  const capacitorConfigPath = path.join(mobileDir, "capacitor.config.json");
+  let capacitorConfig;
+  try {
+    capacitorConfig = JSON.parse(fs.readFileSync(capacitorConfigPath, "utf8"));
+  } catch (error) {
+    console.error(
+      `[APK] Cannot read ${path.relative(root, capacitorConfigPath)}: ${error.message}\n` +
+        "       Capacitor falls back to defaults (an empty appId) when it cannot\n" +
+        "       parse this file, which would build an uninstallable APK.",
+    );
+    process.exit(1);
+  }
+  const configuredAppId = String(capacitorConfig.appId ?? "");
+  const configuredAppName = String(capacitorConfig.appName ?? "");
+  if (configuredAppId !== EXPECTED_ANDROID_APP_ID) {
+    console.error(
+      `[APK] Wrong Android appId in ${path.relative(root, capacitorConfigPath)}: "${configuredAppId}".\n` +
+        `       Expected "${EXPECTED_ANDROID_APP_ID}".\n` +
+        "       The in-app updater refuses any APK whose package differs from the\n" +
+        "       installed app, so shipping this ID would abort every satellite OTA\n" +
+        '       with "Refusing to install". Fix the appId and rebuild.',
+    );
+    process.exit(1);
+  }
+  for (const forbidden of FORBIDDEN_ANDROID_APP_IDS) {
+    if (configuredAppId === forbidden) {
+      console.error(
+        `[APK] Forbidden Android appId "${forbidden}" in ${path.relative(root, capacitorConfigPath)}.\n` +
+          "       That ID belongs to a different app; stamping it here builds an APK\n" +
+          "       Android treats as foreign and the updater deletes on sight.",
+      );
+      process.exit(1);
+    }
+  }
+  if (configuredAppName !== EXPECTED_ANDROID_APP_NAME) {
+    console.error(
+      `[APK] Wrong Android appName in ${path.relative(root, capacitorConfigPath)}: "${configuredAppName}".\n` +
+        `       Expected "${EXPECTED_ANDROID_APP_NAME}".`,
+    );
+    process.exit(1);
+  }
+  console.log(`[APK] Package ID verified: ${configuredAppId} ("${configuredAppName}").`);
 }
 
 /**
@@ -1686,8 +1769,17 @@ console.log("[APK] Staged res/xml/file_paths.xml (the FileProvider roots).");
      a `api` -> `implementation` change upstream turns it into an unsolvable
      compile error. variables.gradle already pins the version.
 
+  4. `applicationId` / `namespace` pinned to the node worker ID
+     Capacitor derives both from mobile/capacitor.config.json when it generates
+     android/, and android/ is gitignored + regenerated on CI. If the config is
+     ever copied from the consumer app (or a stale template), the APK builds
+     fine under `com.rippaadventures.app` and the fleet's updater then deletes
+     it on sight with "Refusing to install". So the generated values are
+     overwritten here with the pinned EXPECTED_ANDROID_APP_ID and re-verified
+     below, including a negative check against every known-foreign ID.
+
   THE PATCH IS VERIFIED, NOT ASSUMED. Each rewrite is re-read from disk below and
-  the build fails loudly if any of the three did not land, because a silently
+  the build fails loudly if any of the four did not land, because a silently
   unpatched build.gradle is exactly how a "works on my machine" updater ships.
 */
 const gradleTarget = path.join(androidDir, "app", "build.gradle");
@@ -1695,6 +1787,11 @@ const gradleTarget = path.join(androidDir, "app", "build.gradle");
 let gradle = fs.readFileSync(gradleTarget, "utf8");
 gradle = gradle.replace(/versionCode\s+\d+/, `versionCode ${appVersionCode}`);
 gradle = gradle.replace(/versionName\s+"[^"]*"/, `versionName "${appVersion}"`);
+// Pin the package ID even when Capacitor generated the project from a stale or
+// foreign config: a wrong applicationId/namespace compiles fine and only fails
+// on-device at install time, which is the outage being fixed.
+gradle = gradle.replace(/applicationId\s+"[^"]*"/, `applicationId "${EXPECTED_ANDROID_APP_ID}"`);
+gradle = gradle.replace(/namespace\s+"[^"]*"/, `namespace "${EXPECTED_ANDROID_APP_ID}"`);
 
 if (!/buildFeatures\s*{/.test(gradle)) {
   gradle = gradle.replace(
@@ -1722,6 +1819,11 @@ if (!/buildConfig\s+true/.test(gradleApplied)) gradleProblems.push("buildFeature
 if (!gradleApplied.includes(`versionCode ${appVersionCode}`)) gradleProblems.push(`versionCode ${appVersionCode}`);
 if (!gradleApplied.includes(`versionName "${appVersion}"`)) gradleProblems.push(`versionName "${appVersion}"`);
 if (!gradleApplied.includes("androidx.core:core:")) gradleProblems.push("androidx.core:core");
+if (!gradleApplied.includes(`applicationId "${EXPECTED_ANDROID_APP_ID}"`)) gradleProblems.push(`applicationId "${EXPECTED_ANDROID_APP_ID}"`);
+if (!gradleApplied.includes(`namespace "${EXPECTED_ANDROID_APP_ID}"`)) gradleProblems.push(`namespace "${EXPECTED_ANDROID_APP_ID}"`);
+for (const forbidden of FORBIDDEN_ANDROID_APP_IDS) {
+  if (gradleApplied.includes(forbidden)) gradleProblems.push(`forbidden ID ${forbidden}`);
+}
 if (gradleProblems.length) {
   console.error(
     `[APK] Could not patch ${path.relative(root, gradleTarget)}:\n` +

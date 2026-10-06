@@ -1684,9 +1684,11 @@ if (mothershipPresent) {
  * must stay.
  *
  * What this pins is the OTHER half: that nothing in the build config reintroduces
- * the foreign ID in the first place. A stray `com.codelink.app` in an
- * applicationId or a capacitor appId would build an APK that this very gate then
- * refuses to install — a self-inflicted, entirely silent update outage.
+ * the foreign ID in the first place. A stray `com.rippaadventures.app` (the
+ * consumer app ID that caused the "Refusing to install" OTA outage) or a legacy
+ * `com.codelink.app` in an applicationId or a capacitor appId would build an APK
+ * that this very gate then refuses to install — a self-inflicted, entirely
+ * silent update outage.
  */
 {
   const gradle = readFileSync(path.join(ROOT, "mobile", "android", "app", "build.gradle"), "utf8");
@@ -1713,13 +1715,23 @@ if (mothershipPresent) {
     // otherwise report itself as the offender on every run.
     if (path.resolve(ROOT, file) === path.resolve(fileURLToPath(import.meta.url))) return false;
     try {
-      return /com\.codelink\.app/.test(readFileSync(path.join(ROOT, file), "utf8"));
+      const text = readFileSync(path.join(ROOT, file), "utf8");
+      // `com.rippaadventures.app` is a prefix of nothing expected here, but it IS
+      // a substring trap for `com.rippaadventures.appX` future IDs — so match on
+      // a boundary (quote, whitespace, end) rather than a bare substring. The
+      // scripts/package-apk.mjs allow-list (constants + error copy) is exempted
+      // by filename below.
+      if (/com\.rippaadventures\.app(?=["'\s]|$)/.test(text)) {
+        if (path.resolve(ROOT, file) === path.join(ROOT, "scripts", "package-apk.mjs")) return false;
+        return true;
+      }
+      return /com\.codelink\.app/.test(text);
     } catch {
       return false;
     }
   });
   check(
-    "no source file reintroduces the foreign com.codelink.app package",
+    "no source file reintroduces a foreign package (com.rippaadventures.app / com.codelink.app)",
     offenders.length === 0,
     offenders.join(", "),
   );

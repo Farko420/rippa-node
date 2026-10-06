@@ -776,12 +776,45 @@ jobs:
       - name: Verify the APK manifest
         run: |
           set -euo pipefail
+          # The package ID is the OTA contract: the satellite's in-app updater
+          # (MobileBridge.assertItIsThisApp()) deletes any APK whose package is
+          # not com.rippaadventures.node, and Android itself refuses an update
+          # that changes the ID. A build stamped com.rippaadventures.app (the
+          # consumer app ID) downloads fine and aborts install with
+          # "Refusing to install" — so the ID is asserted here against the
+          # BUILT binary, not just the source config.
+          EXPECTED_PKG="com.rippaadventures.node"
+          echo "Expected package: $EXPECTED_PKG"
+          echo "Checking generated build config ..."
+          if ! grep -q "applicationId \"$EXPECTED_PKG\"" mobile/android/app/build.gradle; then
+            echo "::error::app/build.gradle does not set applicationId \"$EXPECTED_PKG\""
+            grep -n "applicationId" mobile/android/app/build.gradle || true
+            exit 1
+          fi
+          if ! grep -q "namespace \"$EXPECTED_PKG\"" mobile/android/app/build.gradle; then
+            echo "::error::app/build.gradle does not set namespace \"$EXPECTED_PKG\""
+            grep -n "namespace" mobile/android/app/build.gradle || true
+            exit 1
+          fi
+          for FORBIDDEN in com.rippaadventures.app com.codelink.app com.getcapacitor.app; do
+            if grep -rq "$FORBIDDEN" mobile/android/app/build.gradle mobile/capacitor.config.json mobile/android/app/src/main/AndroidManifest.xml 2>/dev/null; then
+              echo "::error::forbidden package ID $FORBIDDEN found in the Android build config"
+              grep -rn "$FORBIDDEN" mobile/android/app/build.gradle mobile/capacitor.config.json mobile/android/app/src/main/AndroidManifest.xml || true
+              exit 1
+            fi
+          done
+          echo "ok: build config carries $EXPECTED_PKG and no forbidden ID"
           AAPT=$(ls "${ANDROID_HOME}"/build-tools/*/aapt2 2>/dev/null | head -n 1 || true)
           if [ -z "$AAPT" ]; then
             echo "::warning::aapt2 not found; skipping manifest verification"
             exit 0
           fi
           DUMP="$("$AAPT" dump xmltree --file AndroidManifest.xml "${{ steps.apk.outputs.path }}" | tr -d '\r')"
+          if ! grep -q "com.rippaadventures.node" <<<"$DUMP"; then
+            echo "::error::built APK manifest does not declare package com.rippaadventures.node"
+            exit 1
+          fi
+          echo "ok: built APK declares com.rippaadventures.node"
           for NEEDLE in WAKE_LOCK FOREGROUND_SERVICE RippaNodeService REQUEST_INSTALL_PACKAGES FileProvider RippaNodeTileService BIND_QUICK_SETTINGS_TILE RECEIVE_BOOT_COMPLETED REQUEST_IGNORE_BATTERY_OPTIMIZATIONS; do
             if ! grep -q "$NEEDLE" <<<"$DUMP"; then
               echo "::error::APK manifest is missing $NEEDLE"
