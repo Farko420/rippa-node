@@ -2270,6 +2270,166 @@ function wireRemoteOffload() {
   const btn = $("remoteTaskSend");
   if (!btn || btn.dataset.wired === "1") return;
   btn.dataset.wired = "1";
+
+  /* DISPATCHED TASKS TRAY — persistent + concurrent with summaries.
+     Every offload + every staged file appends a card here (never replaces a
+     status line). Polls GET /api/mesh/remote-tasks; session-persisted so
+     queuing URLs in sequence keeps every task visible. */
+  const TRAY_KEY = "rippa_remote_tray";
+  let trayTasks = [];
+  try {
+    const raw = sessionStorage.getItem(TRAY_KEY);
+    if (raw) trayTasks = JSON.parse(raw) || [];
+  } catch (err) { trayTasks = []; }
+
+  function saveTray() {
+    try { sessionStorage.setItem(TRAY_KEY, JSON.stringify(trayTasks.slice(0, 25))); } catch (err) {}
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  function fmtTime(iso) {
+    try {
+      return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    } catch (err) { return ""; }
+  }
+
+  function mergeServerTasks(serverTasks) {
+    const byId = new Map(trayTasks.map((t) => [t.id, t]));
+    for (const s of (serverTasks || [])) {
+      if (byId.has(s.id)) byId.set(s.id, Object.assign({}, byId.get(s.id), s));
+      else byId.set(s.id, s);
+    }
+    trayTasks = [...byId.values()].slice(0, 25);
+    saveTray();
+  }
+
+  function showRemoteSummary(id) {
+    const task = trayTasks.find((t) => t.id === id);
+    const drawer = $("remoteSummaryDrawer");
+    const body = $("remoteSummaryBody");
+    const title = $("remoteSummaryTitle");
+    if (!task || !drawer || !body) return;
+    if (title) title.textContent = "Summary — " + (task.fileName || task.target || task.id);
+    const s = task.summary || {};
+    const found = Array.isArray(s.places_found) ? s.places_found : [];
+    body.innerHTML =
+      "<p><strong>Locations / trails discovered:</strong> " + found.length + "</p>" +
+      (found.length ? "<ul>" + found.map((p) => "<li>" + esc(p) + "</li>").join("") + "</ul>" : "") +
+      "<p><strong>DB profiles created / updated:</strong> " + esc(s.places_created == null ? 0 : s.places_created) + "</p>" +
+      (s.notes ? "<p><strong>Notes:</strong> " + esc(s.notes) + "</p>" : "") +
+      (task.error && task.status === "failed" ? '<p class="remote-error"><strong>Error:</strong> ' + esc(task.error) + "</p>" : "");
+    drawer.hidden = false;
+  }
+
+  function renderTray() {
+    const tray = $("remoteTaskTray");
+    const count = $("remoteTrayCount");
+    if (!tray) return;
+    if (count) count.textContent = String(trayTasks.length);
+    if (trayTasks.length === 0) {
+      tray.innerHTML = '<p class="cc-empty">No dispatched tasks yet. Offload a target or drop a file above.</p>';
+      return;
+    }
+    tray.innerHTML = trayTasks.map((t) => {
+      const status = esc(t.status || "queued");
+      const tierLabel = "Tier " + esc(t.tier == null ? 0 : t.tier) + (String(t.load || "heavy") === "heavy" ? " Heavy" : "");
+      const canExpand = t.status === "completed" || t.status === "failed";
+      return '<div class="remote-card" data-task-id="' + esc(t.id) + '">' +
+        '<div class="remote-card-top">' +
+          '<span class="remote-target" title="' + esc(t.target || "") + '">' + esc(t.fileName || t.target || "") + "</span>" +
+          '<span class="remote-tier">' + tierLabel + "</span>" +
+          '<span class="remote-status st-' + status + '">' + status + "</span>" +
+          '<span class="remote-time">' + esc(fmtTime(t.updatedAt || t.createdAt)) + "</span>" +
+        "</div>" +
+        (t.error && t.status === "failed" ? '<p class="remote-error">' + esc(t.error) + "</p>" : "") +
+        (canExpand ? '<button type="button" class="remote-summary-toggle" data-summary-for="' + esc(t.id) + '">View summary</button>' : "") +
+      "</div>";
+    }).join("");
+    tray.querySelectorAll("[data-summary-for]").forEach((el) => {
+      el.addEventListener("click", () => showRemoteSummary(el.getAttribute("data-summary-for")));
+    });
+  }
+
+  async function refreshTray() {
+    try {
+      const res = await api("/api/mesh/remote-tasks?limit=25");
+      if (res.response.ok && res.data && res.data.success && Array.isArray(res.data.tasks)) {
+        mergeServerTasks(res.data.tasks);
+        renderTray();
+      }
+    } catch (err) { /* keep last-known state; next tick retries */ }
+  }
+
+  async function uploadRemoteFiles(files) {
+    const msg = $("remoteTaskMessage");
+    const list = [...(files || [])];
+    if (list.length === 0) return;
+    for (const file of list) {
+      try {
+        if (msg) { msg.textContent = "Uploading " + file.name + "…"; msg.hidden = false; }
+        const form = new FormData();
+        form.append("file", file, file.name);
+        let token = "";
+        try { token = localStorage.getItem("rippa_dashboard_auth") || ""; } catch (err) {}
+        const response = await fetch("/api/storage/upload", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: token ? { Authorization: "Bearer " + token } : {},
+          body: form,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.success) throw new Error((data && data.message) || ("HTTP " + response.status));
+        const staged = data.remoteTask || data.task;
+        if (staged) {
+          const byId = new Map(trayTasks.map((t) => [t.id, t]));
+          byId.set(staged.id, staged);
+          trayTasks = [...byId.values()].slice(0, 25);
+          saveTray();
+          renderTray();
+        }
+        if (msg) { msg.textContent = "Staged " + file.name + " as a Tier 0 swarm task."; msg.hidden = false; }
+      } catch (err) {
+        if (msg) { msg.textContent = "Upload failed (" + file.name + "): " + (err && err.message ? err.message : err); msg.hidden = false; }
+      }
+    }
+    void refreshTray();
+  }
+
+  function wireRemoteDropzone() {
+    const zone = $("remoteDropzone");
+    const picker = $("remoteFilesInput");
+    const attach = $("remoteAttachBtn");
+    if (attach && picker && !attach.dataset.wired) {
+      attach.dataset.wired = "1";
+      attach.addEventListener("click", (e) => { e.stopPropagation(); picker.click(); });
+      picker.addEventListener("change", () => { void uploadRemoteFiles(picker.files); picker.value = ""; });
+    }
+    if (zone && !zone.dataset.dropWired) {
+      zone.dataset.dropWired = "1";
+      ["dragenter", "dragover"].forEach((ev) => zone.addEventListener(ev, (e) => { e.preventDefault(); zone.classList.add("drag-over"); }));
+      ["dragleave", "drop"].forEach((ev) => zone.addEventListener(ev, (e) => { e.preventDefault(); zone.classList.remove("drag-over"); }));
+      zone.addEventListener("drop", (e) => {
+        const files = e.dataTransfer && e.dataTransfer.files;
+        if (files && files.length) void uploadRemoteFiles(files);
+      });
+    }
+    const closeBtn = $("remoteSummaryClose");
+    if (closeBtn && !closeBtn.dataset.wired) {
+      closeBtn.dataset.wired = "1";
+      closeBtn.addEventListener("click", () => { const d = $("remoteSummaryDrawer"); if (d) d.hidden = true; });
+    }
+  }
+
+  renderTray();
+  wireRemoteDropzone();
+  void refreshTray();
+  if (!btn.dataset.trayPoll) {
+    btn.dataset.trayPoll = "1";
+    setInterval(() => void refreshTray(), 5000);
+  }
   btn.addEventListener("click", async () => {
     const labelEl = $("remoteTaskLabel");
     const loadEl = $("remoteTaskLoad");
@@ -2285,15 +2445,27 @@ function wireRemoteOffload() {
         method: "POST",
         body: JSON.stringify({ label, load: (loadEl && loadEl.value) || "heavy", tier: 0 }),
       });
+      if (res.data && res.data.success && (res.data.remoteTask || res.data.task)) {
+        const staged = res.data.remoteTask || Object.assign(
+          { id: res.data.task.id, target: label, kind: "place", tier: 0, load: (loadEl && loadEl.value) || "heavy", status: "queued", summary: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+          {},
+        );
+        const byId = new Map(trayTasks.map((t) => [t.id, t]));
+        byId.set(staged.id, staged);
+        trayTasks = [...byId.values()].slice(0, 25);
+        saveTray();
+        renderTray();
+      }
       if (msg) {
         msg.textContent = res.data && res.data.success
-          ? (res.data.message || "Offloaded to the Master as a Tier 0 task.")
+          ? ("Dispatched \"" + label + "\" as a Tier 0 task — tracking below.")
           : ("Offload failed: " + ((res.data && res.data.message) || "unknown error"));
         msg.hidden = false;
       }
       if (labelEl && res.data && res.data.success) labelEl.value = "";
       // A successful offload shows up in the (proxied) fleet snapshot.
       try { await refresh(); } catch (err) { /* snapshot will catch up */ }
+      void refreshTray();
     } catch (err) {
       if (msg) { msg.textContent = "Offload failed: " + (err && err.message ? err.message : err); msg.hidden = false; }
     } finally {

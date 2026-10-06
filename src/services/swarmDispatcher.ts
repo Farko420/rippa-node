@@ -144,6 +144,15 @@ export interface SwarmAssignment {
   p2pRevokedAt?: string;
   /** Human-readable reason recorded when P2P was revoked. */
   p2pRevokeReason?: string;
+  /**
+   * REMOTE COMMAND SUMMARY — structured completion report for the Task Tray.
+   *
+   * Written by the Master when the work behind this assignment finishes
+   * (`completeTask` / `reportLocalTaskResult`), read by
+   * `GET /api/mesh/remote-tasks` so a completed card can expand into
+   * locations-found / profiles-created / notes. Absent until completion.
+   */
+  summary?: { places_found: string[]; places_created: number; notes: string } | null;
 }
 
 /** Rolling P2P health between the Master and one satellite. */
@@ -421,6 +430,15 @@ export class SwarmDispatcher {
   private readonly registry = new Map<string, SatelliteRecord>();
   /** Master-only: taskId -> assignment. */
   private readonly tasks = new Map<string, SwarmAssignment>();
+  /**
+   * REMOTE COMMAND HISTORY — bounded ledger of recent assignments for the
+   * Task Tray poll (`GET /api/mesh/remote-tasks`). The live `tasks` map only
+   * holds in-flight work, so a completed task would vanish from the tray the
+   * instant it finished. This ring keeps the last N with their terminal
+   * status + summary so the tray can render the confirmation drawer.
+   */
+  private readonly recentTasks: SwarmAssignment[] = [];
+  private static readonly RECENT_TASK_LIMIT = 25;
   /** Master-only: the mesh key issued to every paired Satellite. */
   private meshKey = "";
   /** Master-only: the self endpoint advertised to satellites. */
@@ -1045,6 +1063,7 @@ export class SwarmDispatcher {
       createdAt: new Date().toISOString(),
     };
     this.tasks.set(task.id, task);
+    this.rememberRecentTask(task);
 
     for (const code of task.assignees) {
       const record = this.registry.get(code);
@@ -1058,6 +1077,44 @@ export class SwarmDispatcher {
       `[Swarm] Task "${task.label}" (${task.load}) assigned to ${task.assignees.length} node(s); sibling payloads pushed.`,
     );
     return task;
+  }
+
+  /**
+   * REMOTE COMMAND HISTORY — pushes one assignment into the bounded recent
+   * ring (newest first, capped). Called on dispatch AND on every completion
+   * transition so the stored copy carries the terminal status + summary.
+   */
+  private rememberRecentTask(task: SwarmAssignment): void {
+    const copy: SwarmAssignment = { ...task, summary: task.summary ? { ...task.summary } : task.summary };
+    const at = this.recentTasks.findIndex((entry) => entry.id === task.id);
+    if (at >= 0) this.recentTasks.splice(at, 1);
+    this.recentTasks.unshift(copy);
+    while (this.recentTasks.length > SwarmDispatcher.RECENT_TASK_LIMIT) this.recentTasks.pop();
+  }
+
+  /**
+   * Lifecycle status of one assignment for the Task Tray poll.
+   * `queued` = assigned but no satellite has claimed it yet (or a
+   * Master-local task not yet picked up); `processing` = at least one
+   * assignee is actively working; terminal states come from `completeTask`.
+   */
+  getAssignmentStatus(id: string): "queued" | "processing" | "completed" | "failed" | null {
+    const live = this.tasks.get(id);
+    if (live) {
+      const busy = live.assignees.some((code) => {
+        const record = this.registry.get(code);
+        return Boolean(record && record.currentTask && record.currentTask.id === id);
+      });
+      return busy || live.assignees.length > 0 ? "processing" : "queued";
+    }
+    const recent = this.recentTasks.find((entry) => entry.id === id);
+    if (!recent) return null;
+    return (recent as SwarmAssignment & { terminal?: "completed" | "failed" }).terminal ?? "completed";
+  }
+
+  /** Recent assignments (newest first) for the Task Tray poll. */
+  getRecentTasks(limit = 25): SwarmAssignment[] {
+    return this.recentTasks.slice(0, Math.max(1, Math.min(50, limit))).map((entry) => ({ ...entry }));
   }
 
   /** Picks up to `count` idle satellites, preferring the highest efficiency. */
@@ -1201,6 +1258,15 @@ export class SwarmDispatcher {
     if (!record) return;
     const task = record.currentTask;
     if (!task || task.id !== taskId) return;
+    const terminal = outcome === "success" ? "completed" : "failed";
+    const finished = this.tasks.get(task.id);
+    if (finished) {
+      (finished as SwarmAssignment & { terminal?: "completed" | "failed" }).terminal = terminal;
+      finished.summary = outcome === "success"
+        ? { places_found: [], places_created: 0, notes: `Completed by ${record.nodeName || nodeCode}.` }
+        : { places_found: [], places_created: 0, notes: `Outcome: ${outcome}.` };
+      this.rememberRecentTask(finished);
+    }
 
     record.metrics.loadAttempts[task.load] += 1;
     if (outcome === "success") {

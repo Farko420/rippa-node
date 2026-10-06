@@ -85,6 +85,17 @@ import {
   walkBatchFiles,
 } from "./services/commandCenter";
 import { registerSwarmTriageRoutes } from "./api/swarmTriageRoutes";
+import {
+  completeRemoteTask,
+  createRemoteTask,
+  ensureRemoteTaskSchema,
+  failRemoteTask,
+  getRemoteTask,
+  listRemoteTasks,
+  updateRemoteTask,
+} from "./services/remoteTasks";
+import { sanitizeFilename } from "./services/multipartParser";
+import { dataFilePath } from "./utils/paths";
 
 /**
  * THE INTERROGATION ENDPOINT — where the cloud-based Rippa AI pings the
@@ -599,8 +610,10 @@ export function createApp(): Express {
   // Raw multipart bodies must be captured BEFORE express.json() runs: the
   // global JSON parser would otherwise consume (and reject) the file bytes,
   // leaving req.body empty so there is nothing left to forward to the Master.
-  // Scoped to the single intake path; every other route keeps the JSON parser.
+  // Scoped to the intake + swarm-ingest upload paths; every other route keeps
+  // the JSON parser.
   app.use("/api/command-center/intake", express.raw({ limit: "2gb", type: "multipart/*" }));
+  app.use("/api/storage/upload", express.raw({ limit: "70mb", type: "*/*" }));
   app.use(express.json());
 
   /*
@@ -1730,6 +1743,9 @@ export function createApp(): Express {
   // on the Master it lands here and is dispatched as a high-priority (heavy)
   // shared swarm task, so the Master takes the compute load while the
   // Satellite acts purely as the controller.
+  //
+  // Every dispatch is ALSO recorded in the persistent remote_tasks ledger so
+  // the Task Tray can track it concurrently with the swarm assignment.
   app.post("/api/mesh/offload", requireDashboardAuth, async (req: Request, res: Response) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const labelRaw = String(body["label"] ?? body["placeName"] ?? body["target"] ?? "").trim();
@@ -1742,24 +1758,38 @@ export function createApp(): Express {
       res.status(400).json({ success: false, message: "load must be heavy, normal or lite." });
       return;
     }
-    const assignees = Array.isArray(body["assignees"]) ? (body["assignees"] as string[]) : undefined;
-    const label = /^\[(tier 0|remote)\]/i.test(labelRaw) ? labelRaw : `[Tier 0/Remote] ${labelRaw}`;
+    const offloadAssignees = Array.isArray(body["assignees"]) ? (body["assignees"] as string[]) : undefined;
+    const offloadLabel = /^\[(tier 0|remote)\]/i.test(labelRaw) ? labelRaw : `[Tier 0/Remote] ${labelRaw}`;
+    let trayTask: ReturnType<typeof createRemoteTask> | null = null;
+    try {
+      const looksUrl = /^https?:\/\//i.test(labelRaw) || /^https?:\/\//i.test(String(body["url"] ?? ""));
+      trayTask = createRemoteTask({ target: labelRaw, kind: looksUrl ? "url" : "place", tier: 0, load });
+    } catch {
+      trayTask = null;
+    }
     try {
       const task = await dispatcher.assignSharedTask({
-        label,
+        label: offloadLabel,
         load,
-        ...(assignees ? { assignees } : {}),
+        ...(offloadAssignees ? { assignees: offloadAssignees } : {}),
       });
+      if (trayTask) {
+        updateRemoteTask(trayTask.id, { swarmTaskId: task.id, status: task.assignees.length > 0 ? "processing" : "queued" });
+        trayTask = getRemoteTask(trayTask.id) ?? trayTask;
+      }
       res.json({
         success: true,
         task,
+        remoteTask: trayTask,
         tier: 0,
         offloaded: true,
         message: `Offloaded "${labelRaw}" to the Master as a Tier 0 (${load}) swarm task.`,
       });
     } catch (error) {
+      if (trayTask) failRemoteTask(trayTask.id, error instanceof Error ? error.message : String(error));
       res.status(400).json({
         success: false,
+        remoteTask: trayTask ? getRemoteTask(trayTask.id) : null,
         message: error instanceof Error ? error.message : String(error),
       });
     }
@@ -1769,6 +1799,145 @@ export function createApp(): Express {
   app.post("/api/mesh/satellite/:code/restore-p2p", requireDashboardAuth, (req: Request, res: Response) => {
     dispatcher.restoreP2p(String(req.params["code"] ?? ""));
     res.json({ success: true });
+  });
+
+  // --- REMOTE COMMAND TASK TRAY (Master Control Center) ---------------------
+  //
+  // The Task Tray polls GET /api/mesh/remote-tasks for every dispatched task
+  // with its live lifecycle status + structured summary. Each row merges the
+  // persistent remote_tasks ledger (queued/processing/completed/failed +
+  // summary) with the live swarm assignment status when one is linked, so a
+  // task dispatched with zero satellites online still shows honestly.
+  app.get("/api/mesh/remote-tasks", requireDashboardAuth, (req: Request, res: Response) => {
+    if (!requireMasterBrain(res)) return;
+    try {
+      ensureRemoteTaskSchema();
+    } catch { /* ledger degrades to in-memory; still answer */ }
+    const limit = Math.max(1, Math.min(50, Number(req.query["limit"] ?? 25) || 25));
+    const tasks = listRemoteTasks(limit).map((entry) => {
+      let liveStatus: string | null = null;
+      let liveSummary: { places_found: string[]; places_created: number; notes: string } | null = null;
+      if (entry.swarmTaskId) {
+        try {
+          liveStatus = dispatcher.getAssignmentStatus(entry.swarmTaskId);
+          const recent = dispatcher.getRecentTasks(50).find((t) => t.id === entry.swarmTaskId);
+          if (recent?.summary) liveSummary = recent.summary;
+        } catch { /* snapshot is best-effort */ }
+      }
+      let status = entry.status;
+      if ((status === "queued" || status === "processing") && (liveStatus === "processing" || liveStatus === "queued")) {
+        status = liveStatus;
+        if (status !== entry.status) {
+          try { updateRemoteTask(entry.id, { status }); } catch { /* best effort */ }
+        }
+      }
+      if ((status === "queued" || status === "processing") && liveStatus === "completed") {
+        try { completeRemoteTask(entry.id, liveSummary ?? { notes: "Swarm task finished." }); } catch { /* best effort */ }
+        return getRemoteTask(entry.id) ?? { ...entry, status: "completed" as const };
+      }
+      if ((status === "queued" || status === "processing") && liveStatus === "failed") {
+        try { failRemoteTask(entry.id, liveSummary?.notes || "Swarm task failed."); } catch { /* best effort */ }
+        return getRemoteTask(entry.id) ?? { ...entry, status: "failed" as const };
+      }
+      return status === entry.status ? entry : { ...entry, status };
+    });
+    res.json({ success: true, tasks });
+  });
+
+  // POST /api/mesh/remote-tasks/:id/complete — Master Node completion sync.
+  // Writes the structured { places_found, places_created, notes } summary the
+  // Task Tray renders in the expandable drawer. Local equivalent of the
+  // epic's "update swarm_tasks in D1 upon completion" step.
+  app.post("/api/mesh/remote-tasks/:id/complete", requireDashboardAuth, (req: Request, res: Response) => {
+    if (!requireMasterBrain(res)) return;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const summary = (body["summary"] ?? body) as Record<string, unknown>;
+    const placesFound = Array.isArray(summary["places_found"])
+      ? (summary["places_found"] as unknown[]).map(String).slice(0, 100)
+      : [];
+    const placesCreated = Number(summary["places_created"] ?? 0) || 0;
+    const notes = String(summary["notes"] ?? "").slice(0, 4000);
+    const done = completeRemoteTask(String(req.params["id"] ?? ""), { places_found: placesFound, places_created: placesCreated, notes });
+    if (!done) {
+      res.status(404).json({ success: false, message: "Remote task not found." });
+      return;
+    }
+    publishNodeEvent({ kind: "command_center", command: "REMOTE_TASK_COMPLETED", title: "Remote task completed", detail: done.target });
+    res.json({ success: true, task: done });
+  });
+
+  // POST /api/storage/upload — direct file staging for Swarm scraping.
+  //
+  // The epic names R2 (`command-center/` / `swarm-ingest/` prefixes); this repo
+  // stages to the SAME prefixed folder under the persistent data dir instead.
+  // Accepts multipart (paperclip/dropzone) AND raw bodies. On success the file
+  // is dispatched as a Tier 0 swarm task AND recorded in the Task Tray ledger.
+  app.post("/api/storage/upload", requireDashboardAuth, async (req: Request, res: Response) => {
+    if (!requireMasterBrain(res)) return;
+    const allowedExts = new Set([".pdf", ".docx", ".doc", ".gpx", ".kml", ".txt", ".md", ".csv"]);
+    try {
+      const contentType = String(req.headers["content-type"] ?? "");
+      let filename = String(req.query["filename"] ?? req.headers["x-filename"] ?? "");
+      let bytes: Buffer | null = null;
+      if (/multipart\/form-data/i.test(contentType) && Buffer.isBuffer(req.body)) {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-upload-"));
+        try {
+          const { parseMultipart } = await import("./services/multipartParser.js");
+          const parsed = parseMultipart(req.body, contentType, tmpDir);
+          const first = parsed.files[0];
+          if (!first) {
+            res.status(400).json({ success: false, message: "No file part found in the upload." });
+            return;
+          }
+          filename = first.filename;
+          bytes = fs.readFileSync(first.filePath);
+        } finally {
+          try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
+        }
+      } else if (Buffer.isBuffer(req.body)) {
+        bytes = req.body;
+      }
+      if (!bytes) {
+        res.status(400).json({ success: false, message: "No file bytes received." });
+        return;
+      }
+      const safe = sanitizeFilename(filename || "upload");
+      const ext = safe.includes(".") ? safe.slice(safe.lastIndexOf(".")).toLowerCase() : "";
+      if (!allowedExts.has(ext)) {
+        res.status(400).json({ success: false, message: `Unsupported file type — accepted: .pdf, .docx, .doc, .gpx, .kml, .txt, .md, .csv.` });
+        return;
+      }
+      if (bytes.length === 0 || bytes.length > 64 * 1024 * 1024) {
+        res.status(400).json({ success: false, message: "File must be non-empty and under 64 MB." });
+        return;
+      }
+      const ingestDir = dataFilePath("swarm-ingest");
+      fs.mkdirSync(ingestDir, { recursive: true });
+      let target = path.join(ingestDir, safe);
+      if (fs.existsSync(target)) {
+        const stem = safe.slice(0, safe.length - ext.length) || "upload";
+        let n = 2;
+        do {
+          target = path.join(ingestDir, `${stem} (${n})${ext}`);
+          n += 1;
+        } while (fs.existsSync(target) && n < 10_000);
+      }
+      fs.writeFileSync(target, bytes);
+      const stagedName = path.basename(target);
+      const relKey = `swarm-ingest/${stagedName}`;
+      const trayTask = createRemoteTask({ target: stagedName, kind: "file", tier: 0, load: "heavy", fileName: stagedName, stagedPath: target });
+      try {
+        const task = await dispatcher.assignSharedTask({ label: `[Tier 0/Remote] Swarm file: ${stagedName} (${relKey})`, load: "heavy" });
+        updateRemoteTask(trayTask.id, { swarmTaskId: task.id, status: task.assignees.length > 0 ? "processing" : "queued" });
+      } catch (error) {
+        failRemoteTask(trayTask.id, error instanceof Error ? error.message : String(error));
+      }
+      const done = getRemoteTask(trayTask.id) ?? trayTask;
+      publishNodeEvent({ kind: "command_center", command: "REMOTE_TASK_QUEUED", title: "Swarm file staged", detail: stagedName });
+      res.json({ success: true, key: relKey, fileName: stagedName, stagedPath: target, task: done, remoteTask: done });
+    } catch (error) {
+      res.status(400).json({ success: false, message: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   // GET /api/mesh/identity — this node's permanent code (shown in the UI).

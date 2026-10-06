@@ -278,6 +278,31 @@
 .health-badge.is-offline { border-color:var(--bad,#f85149); color:var(--bad,#f85149); }
 .health-badge.is-offline .health-dot { background:var(--bad,#f85149); }
 @keyframes health-pulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.45; transform:scale(.78); } }
+
+/* ---- REMOTE COMMAND TASK TRAY + FILE DROPZONE --------------------------------
+   Replaces the old single transient status line. The tray persists every
+   dispatched task as a card (target, tier badge, live status, timestamp) and
+   completed cards expand into the summary drawer below. */
+.remote-drop.drag-over { outline:2px dashed var(--acc); outline-offset:4px; border-radius:12px; }
+.remote-tray-head { display:flex; align-items:center; gap:10px; margin:18px 0 10px; }
+.remote-tray-head h3 { margin:0; font-size:14px; }
+.remote-tray { display:flex; flex-direction:column; gap:10px; }
+.remote-card { border:1px solid var(--line); border-radius:12px; padding:12px 14px; background:#0d1117; }
+.remote-card-top { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.remote-target { font-weight:700; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1 1 160px; }
+.remote-tier { font-size:10px; padding:2px 8px; border-radius:999px; border:1px solid var(--acc); color:var(--acc); font-weight:700; }
+.remote-status { font-size:10px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--mut); text-transform:uppercase; letter-spacing:.06em; }
+.remote-status.st-queued { border-color:var(--warn); color:var(--warn); }
+.remote-status.st-processing { border-color:#58a6ff; color:#58a6ff; }
+.remote-status.st-completed { border-color:var(--ok); color:var(--ok); }
+.remote-status.st-failed { border-color:var(--bad,#f85149); color:var(--bad,#f85149); }
+.remote-time { font-size:11px; color:var(--mut); margin-left:auto; }
+.remote-summary-toggle { margin-top:8px; font-size:12px; background:none; border:none; color:var(--acc); cursor:pointer; padding:0; }
+.remote-error { margin-top:8px; font-size:12px; color:var(--bad,#f85149); }
+.remote-summary { margin-top:12px; border:1px solid var(--acc); border-radius:12px; padding:14px 16px; background:#0d1117; }
+.remote-summary-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.remote-summary-body { margin-top:10px; font-size:13px; display:flex; flex-direction:column; gap:8px; }
+.remote-summary-body ul { margin:4px 0; padding-left:20px; }
 @keyframes health-spin  { to { transform:rotate(360deg); } }
 
 /* ---- TERMINAL -------------------------------------------------------------- */

@@ -592,16 +592,32 @@
         and heavy processing below all execute on the Master — this node only
         sends the command.
       </p>
-      <div class="cc-control" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
-        <input id="remoteTaskLabel" type="text" placeholder="Build Profile for X…" style="flex:2 1 260px;" />
+      <div class="cc-control remote-drop" id="remoteDropzone" role="button" tabindex="0" aria-label="Type a target or drop swarm files to offload">
+        <input id="remoteTaskLabel" type="text" placeholder="Build Profile for X… or drop PDF / DOCX / GPX…" style="flex:2 1 260px;" />
         <select id="remoteTaskLoad" style="flex:0 0 130px;">
           <option value="heavy">Heavy (Tier 0)</option>
           <option value="normal">Normal</option>
           <option value="lite">Lite</option>
         </select>
+        <button id="remoteAttachBtn" type="button" class="ghost" title="Attach swarm files (PDF, DOCX, GPX, KML, TXT)">📎</button>
         <button id="remoteTaskSend" type="button" class="save cc-run" style="width:auto;">Offload to Master</button>
       </div>
+      <input id="remoteFilesInput" type="file" multiple hidden accept=".pdf,.docx,.doc,.gpx,.kml,.txt,.md,.csv" />
       <p id="remoteTaskMessage" class="hint" hidden></p>
+      <div class="remote-tray-head">
+        <h3>Dispatched Tasks</h3>
+        <span id="remoteTrayCount" class="badge">0</span>
+      </div>
+      <div id="remoteTaskTray" class="remote-tray" aria-live="polite">
+        <p class="cc-empty" id="remoteTrayEmpty">No dispatched tasks yet. Offload a target or drop a file above.</p>
+      </div>
+      <div id="remoteSummaryDrawer" class="remote-summary" hidden>
+        <div class="remote-summary-head">
+          <strong id="remoteSummaryTitle">Task summary</strong>
+          <button id="remoteSummaryClose" type="button" class="ghost" title="Close">✕</button>
+        </div>
+        <div id="remoteSummaryBody" class="remote-summary-body"></div>
+      </div>
     </section>
   </div>
 

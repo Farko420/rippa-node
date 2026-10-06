@@ -72,6 +72,8 @@ export function isProxyableAdminPath(path: string): boolean {
   if (p === "/api/mesh/snapshot") return true;
   if (p === "/api/mesh/task") return true;
   if (p === "/api/mesh/offload") return true;
+  if (p === "/api/mesh/remote-tasks") return true;
+  if (p.startsWith("/api/mesh/remote-tasks/")) return true;
   if (p === "/api/mesh/updater") return true;
   if (p === "/api/mesh/broadcast-update") return true;
   if (p === "/api/mesh/purge") return true;
@@ -81,6 +83,8 @@ export function isProxyableAdminPath(path: string): boolean {
   if (p === "/api/brain/status") return true;
   if (p === "/api/brain/sync-now") return true;
   if (p === "/api/brain/upload-backup") return true;
+  if (p === "/api/storage/upload") return true;
+  if (p.startsWith("/api/storage/")) return true;
   return false;
 }
 export interface ProxyReq {
