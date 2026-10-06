@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Review Queue — Rippa</title>
+<link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="dashboard.css" />
+<style>
+  .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+  .queue-badge { display: inline-block; padding: 4px 8px; background: rgba(210, 153, 34, 0.2); color: #d29922; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { padding: 12px; border-bottom: 1px solid var(--line); text-align: left; font-weight: 600; color: var(--mut); }
+  td { padding: 12px; border-bottom: 1px solid var(--line); }
+  tr:hover { background: rgba(47, 129, 247, 0.02); cursor: pointer; }
+  .btn-sm { padding: 6px 10px; background: none; border: 1px solid var(--line); border-radius: 4px; cursor: pointer; font-size: 11px; margin: 0 4px 0 0; }
+  .btn-sm:hover { border-color: var(--acc); }
+  .btn-approve { border-color: #3fb950; color: #3fb950; }
+  .btn-approve:hover { background: rgba(63, 185, 80, 0.1); }
+  .btn-reject { border-color: #f85149; color: #f85149; }
+  .btn-reject:hover { background: rgba(248, 81, 73, 0.1); }
+  .btn-retry { border-color: var(--acc); color: var(--acc); }
+  .btn-retry:hover { background: rgba(47, 129, 247, 0.1); }
+  .pagination { display: flex; gap: 8px; justify-content: center; margin: 24px 0; }
+  .page-btn { padding: 6px 12px; background: var(--card); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .page-btn.active { background: var(--acc); color: white; }
+  
+  /* Detail Modal */
+  .modal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; z-index: 1000; }
+  .modal.show { display: flex; }
+  .modal-content { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 32px; max-width: 600px; max-height: 80vh; overflow-y: auto; position: relative; }
+  .modal-close { position: absolute; top: 16px; right: 16px; background: none; border: none; font-size: 20px; cursor: pointer; }
+  .modal h2 { margin: 0 0 16px; }
+  .fact-item { background: var(--line); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+  .fact-label { font-size: 11px; text-transform: uppercase; color: var(--mut); }
+  .fact-text { font-size: 13px; margin-top: 4px; }
+  .modal-actions { display: flex; gap: 8px; margin-top: 24px; flex-wrap: wrap; }
+</style>
+</head>
+<body class="cc-body">
+<div class="bg"></div>
+<div class="cc-shell">
+  <header class="cc-header">
+    <div class="logo">◈</div>
+    <div class="cc-head-text">
+      <h1>Review Queue</h1>
+      <p class="sub" id="subtext">Manual triage inbox — Confidence < 90</p>
+    </div>
+    <a href="/admin/node-fleet-command" class="ghost">← Fleet Command</a>
+  </header>
+  <div class="cc-main" style="max-width: 1200px; margin: 0 auto; padding: 20px;">
+    <div class="cc-view" id="content"></div>
+  </div>
+</div>
+
+<!-- Detail Modal -->
+<div class="modal" id="detailModal">
+  <div class="modal-content">
+    <button class="modal-close" onclick="window.closeDetail()">×</button>
+    <h2 id="modalTitle">Item Details</h2>
+    <p id="modalSummary" style="color: var(--mut); margin: 0 0 16px;"></p>
+    <div id="modalChunks"></div>
+    <div class="modal-actions" id="modalActions"></div>
+  </div>
+</div>
+
+<script src="review-queue.js"></script>
+</body>
+</html>

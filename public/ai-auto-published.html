@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Auto-Published Items — Rippa</title>
+<link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="dashboard.css" />
+<style>
+  .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+  .header-row h1 { margin: 0; font-size: 24px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { padding: 12px; border-bottom: 1px solid var(--line); text-align: left; font-weight: 600; color: var(--mut); }
+  td { padding: 12px; border-bottom: 1px solid var(--line); }
+  tr:hover { background: rgba(47, 129, 247, 0.02); }
+  .badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; background: rgba(63, 185, 80, 0.2); color: #3fb950; }
+  .badge.score { background: rgba(47, 129, 247, 0.15); color: var(--acc); }
+  .btn { padding: 8px 12px; background: none; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; font-size: 12px; color: var(--txt); }
+  .btn:hover { border-color: var(--acc); background: rgba(47, 129, 247, 0.05); }
+  .pagination { display: flex; gap: 8px; justify-content: center; margin: 24px 0; }
+  .page-btn { padding: 6px 12px; background: var(--card); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .page-btn.active { background: var(--acc); color: white; border-color: var(--acc); }
+  .page-btn:hover:not(.active) { background: rgba(47, 129, 247, 0.1); }
+</style>
+</head>
+<body class="cc-body">
+<div class="bg"></div>
+<div class="cc-shell">
+  <header class="cc-header">
+    <div class="logo">◈</div>
+    <div class="cc-head-text">
+      <h1>Auto-Published Items</h1>
+      <p class="sub">Confidence ≥ 90 — Verified by swarm consensus</p>
+    </div>
+    <a href="/admin/node-fleet-command" class="ghost">← Fleet Command</a>
+  </header>
+  <div class="cc-main" style="max-width: 1200px; margin: 0 auto; padding: 20px;">
+    <div class="cc-view" id="content"></div>
+  </div>
+</div>
+<script src="ai-auto-published.js"></script>
+</body>
+</html>

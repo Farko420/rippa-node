@@ -5,6 +5,7 @@ import path from "node:path";
 import { env } from "../config";
 import { resolveAppRoot } from "../config/configManager";
 import { ensureDataDir } from "../utils/paths";
+import { migrateSwarmTriageColumns } from "./swarmTriageMigrations";
 
 /**
  * THE DEEP BRAIN — local SQLite knowledge store.
@@ -245,6 +246,10 @@ export function initializeDeepBrain(): Database.Database | null {
     instance.exec("ALTER TABLE brain_places ADD COLUMN last_verified TEXT");
     console.log("[Deep Brain] Migrated brain_places: added 'last_verified' column.");
   }
+
+
+   // Swarm Triage migration: add confidence_score, ai_auto_published, consensus_status.
+   migrateSwarmTriageColumns(instance);
 
   instance.exec(INDEXES_SQL);
 

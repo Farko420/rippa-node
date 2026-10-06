@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Node Fleet Command — Rippa</title>
+<link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="dashboard.css" />
+<style>
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; margin: 24px 0; }
+  .stat-card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  .stat-label { font-size: 11px; text-transform: uppercase; color: var(--mut); margin-bottom: 8px; }
+  .stat-value { font-size: 28px; font-weight: 600; }
+  .stat-value.ok { color: #3fb950; }
+  .stat-value.warn { color: #d29922; }
+  .stat-value.danger { color: #f85149; }
+  .stat-value.accent { color: var(--acc); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 16px 0; }
+  th { padding: 12px 0; border-bottom: 1px solid var(--line); color: var(--mut); text-align: left; font-weight: 600; }
+  td { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .badge.ok { background: rgba(63, 185, 80, 0.2); color: #3fb950; }
+  .badge.warn { background: rgba(210, 153, 34, 0.2); color: #d29922; }
+  .btn-link { color: var(--acc); cursor: pointer; text-decoration: underline; font-size: 13px; padding: 8px 0; }
+</style>
+</head>
+<body class="cc-body">
+<div class="bg"></div>
+<div class="cc-shell">
+  <header class="cc-header">
+    <div class="logo">◈</div>
+    <div class="cc-head-text">
+      <h1>Node Fleet Command</h1>
+      <p class="sub">Swarm consensus & triage</p>
+    </div>
+    <a href="/dashboard" class="ghost">← Dashboard</a>
+  </header>
+  <div class="cc-main" style="max-width: 1200px; margin: 0 auto; padding: 20px;">
+    <div class="cc-view" id="content"></div>
+  </div>
+</div>
+<script src="node-fleet-command.js"></script>
+</body>
+</html>

@@ -43,6 +43,17 @@
     <button type="button" class="cc-nav-item" data-view="viewOllama">⚙ Embedded AI</button>
     <button type="button" class="cc-nav-item" data-view="viewScraper">🕷 Playwright Scraper</button>
     <button type="button" class="cc-nav-item" data-view="viewMesh">🛰 Mesh Network</button>
+    <hr style="margin: 12px 0; border: none; border-top: 1px solid var(--line);">
+    <a href="/admin/node-fleet-command" style="display: block; padding: 10px 16px; color: var(--txt); text-decoration: none; font-size: 13px; border-radius: 6px; margin: 4px 0; transition: all 0.2s ease;">
+      📊 Node Fleet Command
+    </a>
+    <a href="/admin/ai-auto-published" style="display: block; padding: 10px 16px; color: var(--txt); text-decoration: none; font-size: 13px; border-radius: 6px; margin: 4px 0; transition: all 0.2s ease;">
+      ✓ Auto-Published Items
+    </a>
+    <a href="/admin/review-queue" style="display: block; padding: 10px 16px; color: var(--txt); text-decoration: none; font-size: 13px; border-radius: 6px; margin: 4px 0; transition: all 0.2s ease; position: relative;">
+      ⚠️ Review Queue
+      <span id="reviewBadge" style="display: none; position: absolute; top: 6px; right: 8px; background: #f85149; color: white; border-radius: 50%; width: 20px; height: 20px; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; min-width: 20px;">0</span>
+    </a>
   </nav>
 
   <div id="viewFleet" class="cc-view">

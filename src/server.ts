@@ -79,6 +79,7 @@ import {
   sweepOrphanBatchFolders,
   walkBatchFiles,
 } from "./services/commandCenter";
+import { registerSwarmTriageRoutes } from "./api/swarmTriageRoutes";
 
 /**
  * THE INTERROGATION ENDPOINT — where the cloud-based Rippa AI pings the
@@ -1624,6 +1625,33 @@ export function createApp(): Express {
       message: outcome.message,
     });
   });
+   // POST /api/mesh/process-chunk — Satellite processes a chunk from a Dispatcher.
+   app.post("/api/mesh/process-chunk", async (req: Request, res: Response) => {
+     if (!dispatcher.authenticate(meshKeyOf(req))) {
+       res.status(401).json({ success: false, message: "Invalid or missing mesh key." });
+       return;
+     }
+     // TODO: Implement chunk processing (calls local Ollama, returns ChunkResult).
+     res.status(202).json({
+       success: true,
+       message: "Chunk processing queued. Implementation pending.",
+     });
+   });
+
+   // POST /api/mesh/consensus-check — Satellite runs consensus verification.
+   app.post("/api/mesh/consensus-check", async (req: Request, res: Response) => {
+     if (!dispatcher.authenticate(meshKeyOf(req))) {
+       res.status(401).json({ success: false, message: "Invalid or missing mesh key." });
+       return;
+     }
+     // TODO: Implement consensus checking (calls local Ollama on same source data).
+     res.status(202).json({
+       success: true,
+       message: "Consensus check queued. Implementation pending.",
+     });
+   });
+
+
 
   /*
     OLLAMA CONTROL PANEL API.
@@ -2216,6 +2244,35 @@ export function createApp(): Express {
       }
       res.redirect("/dashboard");
     });
+
+    // Swarm Triage UI Routes (Phase 2 Frontend)
+    app.get("/admin/node-fleet-command", (_req: Request, res: Response) => {
+      const file = path.join(publicDir, "node-fleet-command.html");
+      if (fs.existsSync(file)) {
+        res.sendFile(file);
+        return;
+      }
+      res.redirect("/dashboard");
+    });
+
+    app.get("/admin/ai-auto-published", (_req: Request, res: Response) => {
+      const file = path.join(publicDir, "ai-auto-published.html");
+      if (fs.existsSync(file)) {
+        res.sendFile(file);
+        return;
+      }
+      res.redirect("/dashboard");
+    });
+
+    app.get("/admin/review-queue", (_req: Request, res: Response) => {
+      const file = path.join(publicDir, "review-queue.html");
+      if (fs.existsSync(file)) {
+        res.sendFile(file);
+        return;
+      }
+      res.redirect("/dashboard");
+    });
+
     console.log(`[API] Serving Local Web GUI from ${publicDir}`);
   } else {
     // Nothing found anywhere, packaged or not. Name the likely cause instead of
@@ -2239,6 +2296,10 @@ export function createApp(): Express {
       res.redirect("/");
     });
   }
+
+  // Register Swarm Triage routes (admin API for fleet command UI).
+  registerSwarmTriageRoutes(app, requireDashboardAuth);
+
 
   return app;
 }

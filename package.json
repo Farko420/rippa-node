@@ -77,7 +77,13 @@
       "public/dashboard.js",
       "public/command-center.html",
       "public/command-center.css",
-      "public/command-center.js"
+      "public/command-center.js",
+      "public/node-fleet-command.html",
+      "public/node-fleet-command.js",
+      "public/ai-auto-published.html",
+      "public/ai-auto-published.js",
+      "public/review-queue.html",
+      "public/review-queue.js"
     ]
   }
 }

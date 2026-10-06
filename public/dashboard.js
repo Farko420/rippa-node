@@ -2286,6 +2286,32 @@ function startControlCenter() {
   // Polls for the life of the page; no teardown hook is needed because the
   // document is discarded wholesale when the operator navigates away.
   setInterval(() => void refresh(), REFRESH_MS);
+
+  // --- PHASE 2: Review Queue Badge Polling -----
+  async function updateReviewBadge() {
+    try {
+      const token = localStorage.getItem("rippa_dashboard_auth") || "";
+      const headers = token ? { Authorization: "Bearer " + token } : {};
+      const response = await fetch("/api/admin/review-count", {
+        credentials: "same-origin",
+        headers: Object.assign({ "Content-Type": "application/json" }, headers),
+      });
+      if (response.status === 200) {
+        const data = await response.json();
+        const badge = document.getElementById("reviewBadge");
+        if (badge && data.count > 0) {
+          badge.textContent = data.count;
+          badge.style.display = "flex";
+        } else if (badge) {
+          badge.style.display = "none";
+        }
+      }
+    } catch (err) {
+      // Silent fail — badge stays hidden or in last state
+    }
+  }
+  updateReviewBadge();
+  setInterval(updateReviewBadge, 30000); // Poll every 30 seconds
 }
 window.RippaControlCenterStart = startControlCenter;
 
