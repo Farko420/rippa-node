@@ -34,7 +34,24 @@ const publicDir = path.join(root, "public");
 const pkgJsonPath = path.join(root, "package.json");
 
 /** Files without which the dashboard cannot render at all. */
-const REQUIRED = ["index.html", "app.js", "styles.css", "dashboard.html", "dashboard.js", "dashboard.css", "command-center.html", "command-center.css", "command-center.js"];
+const REQUIRED = ["index.html", "app.js", "styles.css", "dashboard.html", "dashboard.js", "dashboard.css", "command-center.html", "command-center.css", "command-center.js", "node-fleet-command.html", "node-fleet-command.js", "ai-auto-published.html", "ai-auto-published.js", "review-queue.html", "review-queue.js"];
+
+/**
+ * Virtual routes served by `src/server.ts` via `res.sendFile(...)`.
+ * These look like missing static files to a naive href scan (`/admin/...`
+ * has no matching `public/admin/` folder) but are valid at runtime, so the
+ * reference check maps them back to the file they serve. Keep this in sync
+ * with the `app.get(...)` routes in `src/server.ts`.
+ */
+const VIRTUAL_ROUTES = {
+  "/": "index.html",
+  "/dashboard": "dashboard.html",
+  "/command-center": "command-center.html",
+  "/admin/command-center": "command-center.html",
+  "/admin/node-fleet-command": "node-fleet-command.html",
+  "/admin/ai-auto-published": "ai-auto-published.html",
+  "/admin/review-queue": "review-queue.html",
+};
 
 function fail(message) {
   console.error(`[WebGUI] BUILD FAILED — ${message}`);
@@ -58,7 +75,16 @@ if (missing.length > 0) {
 // --- 3. Every local asset the HTML references must resolve ---------------------
 // Catches the realistic failure (a file that was renamed or never copied) rather
 // than just checking a hand-kept list stays in sync.
-const htmlFiles = REQUIRED.filter((name) => name.endsWith(".html"));
+//
+// NOTE: `src/server.ts` serves several virtual routes (`/dashboard`,
+// `/admin/...`) via `res.sendFile(...)` — those have no matching file under
+// `public/` (there is no `public/admin/` folder) but are valid at runtime.
+// VIRTUAL_ROUTES maps each one back to the file it serves so the check
+// validates the target exists instead of failing the build. API routes
+// (`/api/...`) and other server-handled absolute paths are skipped outright.
+const htmlFiles = fs
+  .readdirSync(publicDir)
+  .filter((name) => name.endsWith(".html"));
 const broken = [];
 for (const html of htmlFiles) {
   const source = fs.readFileSync(path.join(publicDir, html), "utf8");
@@ -66,7 +92,22 @@ for (const html of htmlFiles) {
     const ref = match[1].split("?")[0].split("#")[0];
     // Skip absolute URLs, protocol-relative URLs and inline/data payloads.
     if (!ref || /^(?:[a-z]+:)?\/\//i.test(ref) || ref.startsWith("data:")) continue;
-    if (!fs.existsSync(path.join(publicDir, ref))) broken.push(`${html} -> ${ref}`);
+    // Skip non-file schemes (mailto:, tel:, javascript:, ...).
+    if (/^[a-z][a-z0-9+.-]*:/i.test(ref)) continue;
+    // API calls and other server-handled endpoints are not static files.
+    if (ref.startsWith("/api/")) continue;
+    // Virtual page routes served by server.ts -> validate the mapped file.
+    if (ref.startsWith("/") && Object.hasOwn(VIRTUAL_ROUTES, ref)) {
+      const target = VIRTUAL_ROUTES[ref];
+      if (!fs.existsSync(path.join(publicDir, target))) {
+        broken.push(`${html} -> ${ref} (maps to missing ${target})`);
+      }
+      continue;
+    }
+    // Any other site-absolute path (e.g. "/") resolves from public/ root.
+    const diskRef = ref.startsWith("/") ? ref.slice(1) : ref;
+    if (!diskRef) continue; // bare "/" or "/#..." — always valid (index route)
+    if (!fs.existsSync(path.join(publicDir, diskRef))) broken.push(`${html} -> ${ref}`);
   }
 }
 if (broken.length > 0) {
