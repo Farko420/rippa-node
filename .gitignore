@@ -33,3 +33,5 @@ mobile/node_modules/
 mobile/.gradle/
 *.apk
 *.aab
+
+*.legacy_backup
