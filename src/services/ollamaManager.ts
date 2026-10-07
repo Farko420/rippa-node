@@ -416,6 +416,46 @@ class OllamaManager {
     return this.unlocked;
   }
 
+  /**
+   * BOUNDED WAIT FOR THE MANAGED SERVER — what boot awaits before LocalAI.
+   *
+   * `setManaged(true)` only kicks off `start()` in the background (binary
+   * fetch, spawn, then a multi-GB pull that never blocks). Without this,
+   * `startLocalAiDiscovery()` probes /api/tags before `ollama serve` is even
+   * listening and reports "No usable local model found" for a healthy boot.
+   * Polls `probe()` on the live managed port until it answers, nudges one
+   * generation-model pull pass (reconcile-first, so an installed
+   * `qwen2.5-coder:7b` returns instantly), then returns. Bounded by
+   * `timeoutMs` — boot never wedges on a broken runtime. Never throws for a
+   * down server (resolves false); throws only when unmanaged, which is a
+   * caller bug worth surfacing.
+   */
+  async waitForReady(timeoutMs = 90_000): Promise<boolean> {
+    if (!this.managed) throw new Error("waitForReady() requires managed mode (setManaged(true) first).");
+    const deadline = Date.now() + Math.max(1_000, timeoutMs);
+    const port = resolveBundledOllamaPort();
+    publishManagedOllamaOrigin(port);
+    let lastLogged = 0;
+    while (Date.now() < deadline) {
+      if (await this.probe(resolveBundledOllamaPort())) {
+        try {
+          await this.pullGenerationModel();
+        } catch {
+          // Pull reports through the tile/terminal; readiness is about the
+          // server answering, not the download finishing.
+        }
+        return true;
+      }
+      if (Date.now() - lastLogged > 15_000) {
+        lastLogged = Date.now();
+        console.log(`[OllamaManager] Waiting for managed Ollama on port ${resolveBundledOllamaPort()}…`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+    }
+    console.warn(`[OllamaManager] Managed Ollama did not answer within ${Math.round(timeoutMs / 1000)}s — continuing; LocalAI will pick it up when it lands.`);
+    return false;
+  }
+
   setModel(model: string): void {
     const next = model.trim() || PRIMARY_MODEL;
     if (next === this.model) return;

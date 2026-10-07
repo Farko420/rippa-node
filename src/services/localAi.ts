@@ -19,6 +19,36 @@ const FALLBACK_URLS = [
   "http://localhost:11434",
 ];
 
+/** Dynamic-port candidates — the watchdog may have healed Ollama off 11434. */
+function dynamicPortCandidates(): string[] {
+  try {
+    // require() (not static import): localAi is constructed inside the
+    // Orchestrator long after boot, but a static bundled-ollama import here
+    // would still drag the spawn/supervision graph into every consumer.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const bundled = require("./bundled-ollama") as typeof import("./bundled-ollama");
+    const claimed = bundled.getDynamicOllamaPort?.() ?? null;
+    const resolved = bundled.resolveBundledOllamaPort?.() ?? null;
+    const ports = [claimed, resolved].filter(
+      (p): p is number => Number.isInteger(p) && (p as number) >= 1 && (p as number) <= 65535,
+    );
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const p of ports) {
+      for (const host of ["127.0.0.1", "localhost"]) {
+        const url = `http://${host}:${p}`;
+        if (!seen.has(url)) {
+          seen.add(url);
+          out.push(url);
+        }
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 /** How often the node re-probes for a local AI server. */
 const DISCOVERY_INTERVAL_MS = 5 * 60_000;
 /** Probing must be fast — a dead port fails immediately, a live one is instant. */
@@ -125,7 +155,7 @@ async function probeTags(baseUrl: string): Promise<string[]> {
  * node without a GPU simply advertises "not AI capable".
  */
 export async function discoverLocalAi(): Promise<LocalAiStatus> {
-  const candidates = [env.OLLAMA_URL ?? "", ...FALLBACK_URLS]
+  const candidates = [env.OLLAMA_URL ?? "", ...dynamicPortCandidates(), ...FALLBACK_URLS]
     .map((url) => url.trim())
     .filter(Boolean)
     // De-duplicate so a loopback alias is not probed twice.

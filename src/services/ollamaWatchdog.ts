@@ -51,7 +51,7 @@ import { pipeline } from "node:stream/promises";
 // boot path must be statically analyzable, so these live at the top level.
 // (`bundled-ollama` never imports this file, and `nodeEvents` is a leaf, so
 // there is no import cycle.)
-import { setDynamicOllamaPort } from "./bundled-ollama";
+import { setDynamicOllamaPort, bundledOllamaOrigin } from "./bundled-ollama";
 import { publishNodeEvent } from "./nodeEvents";
 import { dataFilePath } from "../utils/paths";
 
@@ -404,6 +404,25 @@ export async function ensureZeroTouchOllama(
   }
   // Static import at the top (pkg cannot resolve dynamic import callbacks).
   setDynamicOllamaPort(port);
+  // SYNC THE HEALED PORT INTO THE LIVE CONFIG — the actual port-mismatch fix.
+  // `env` (src/config.ts) is a zod snapshot taken at module load, NOT a live
+  // view of process.env, so claiming the dynamic port alone leaves every
+  // `env.OLLAMA_URL` reader (LocalAI discovery, OllamaClient, /v1 proxy,
+  // getPort/heartbeat) aimed at the stale 11434 default while the child binds
+  // the healed port (e.g. 11435). Publishing `process.env.OLLAMA_URL` +
+  // `reloadEnv()` here (and NOT via ollamaManager, which would be an import
+  // cycle: watchdog <- manager <- bundled + config) keeps the boot print,
+  // the checker and the spawner on one number. require() keeps the pkg
+  // snapshot statically analyzable.
+  try {
+    const origin = bundledOllamaOrigin(port);
+    if (process.env.OLLAMA_URL !== origin) process.env.OLLAMA_URL = origin;
+    const configModule = require("../config") as typeof import("../config");
+    configModule.reloadEnv();
+  } catch {
+    // Config unavailable (unit tests) — the dynamic-port claim above still
+    // steers the resolver; LocalAI just keeps its default candidates.
+  }
   const plan: ZeroTouchPlan = { hostBinary, usingBundledRuntime: true, port, model };
   lastPlan = plan;
   onProgress("ready", null, `Zero-touch plan ready — model ${model} on port ${port}.`);

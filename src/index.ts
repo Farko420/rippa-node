@@ -82,7 +82,6 @@ async function main(): Promise<void> {
     }`,
   );
   console.log(` Mothership: ${env.MOTHERSHIP_URL}`);
-  console.log(` Ollama: ${env.OLLAMA_URL}`);
   /*
     ZERO-TOUCH OLLAMA WATCHDOG — the epic's autonomous bootstrap, FIRST in the
     startup sequence before anything can send a heartbeat or claim the port.
@@ -92,6 +91,12 @@ async function main(): Promise<void> {
     `setDynamicOllamaPort()` so every later resolver agrees, and reports the
     required model. Best-effort by design — a failed probe must never wedge
     the boot; the manager's own spawn-time heal is the backstop.
+
+    FIX (port mismatch): the watchdog now publishes the healed port into
+    `process.env.OLLAMA_URL` + `reloadEnv()` (see ollamaWatchdog.ts), so the
+    `Ollama:` line below MUST print AFTER the await — printing it before
+    would log the stale 11434 default even though LocalAI + the spawner are
+    already aimed at the healed port (e.g. 11435).
   */
   try {
     const { ensureZeroTouchOllama } = require("./services/ollamaWatchdog") as typeof import("./services/ollamaWatchdog");
@@ -103,11 +108,13 @@ async function main(): Promise<void> {
         console.log(`[Boot][OllamaWatchdog] ${stage}${suffix} — ${detail}`);
       },
     );
+    console.log(` Ollama: ${env.OLLAMA_URL}`);
     console.log(
       `[Boot] Zero-touch Ollama plan — port ${plan.port}, model ${plan.model}, ` +
         (plan.hostBinary ? `host binary at ${plan.hostBinary}` : "portable runtime"),
     );
   } catch (error) {
+    console.log(` Ollama: ${env.OLLAMA_URL}`);
     console.warn(
       `[Boot] Zero-touch Ollama bootstrap failed — continuing unmanaged: ${
         error instanceof Error ? error.message : String(error)
@@ -168,7 +175,7 @@ async function main(): Promise<void> {
   const { MasterBeacon, shouldAdvertise } = require("./network/discovery") as typeof import("./network/discovery");
   const beacon = new MasterBeacon();
 
-  const startNodeServices = (): void => {
+  const startNodeServices = async (): Promise<void> => {
     if (!isConfigComplete(readCurrentConfig())) {
       console.log("[Boot] Node not fully configured — services paused until GUI setup completes.");
       return;
@@ -218,6 +225,35 @@ async function main(): Promise<void> {
     const persistedManaged = readCurrentConfig()?.OLLAMA_MANAGED === true;
     if (persistedManaged || process.env.RIPPA_OLLAMA_MANAGED === "true") {
       ollamaManager.setManaged(true);
+    }
+
+    /*
+      AWAIT THE MANAGED SPAWN BEFORE LOCALAI PROBES — the race fix.
+
+      `setManaged(true)` above only KICKS OFF `ollamaManager.start()` in the
+      background (binary download, `ollama serve` spawn, then a multi-GB model
+      pull that never blocks start()). The Orchestrator built below starts
+      `startLocalAiDiscovery()`, which probes immediately — so on a fresh boot
+      LocalAI asked "any usable model?" before Ollama was even listening and
+      logged `[LocalAI] No usable local model found` for a server that was
+      still starting. `waitForReady()` bridges that gap: it waits (bounded,
+      boot never wedges) for the server to answer /api/tags on the healed
+      port, and nudges one model-pull pass so `qwen2.5-coder:7b` (or the
+      RAM-appropriate model) is at least in flight before the first probe.
+      Unmanaged nodes skip this entirely — their Ollama is someone else's.
+    */
+    const managedAtBoot = persistedManaged || process.env.RIPPA_OLLAMA_MANAGED === "true";
+    if (managedAtBoot) {
+      try {
+        const { ollamaManager: manager } = require("./services/ollamaManager") as typeof import("./services/ollamaManager");
+        await manager.waitForReady(90_000);
+      } catch (error) {
+        console.warn(
+          `[Boot] Managed Ollama not ready before LocalAI probe — continuing anyway: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
     }
 
     // Wire the rich heartbeat telemetry + remote command execution. The swarm
@@ -526,7 +562,7 @@ async function main(): Promise<void> {
     }
   };
 
-  startNodeServices();
+  void startNodeServices();
 
   // Re-initializes node services with new parameters after a GUI save.
   onConfigChange(async () => {
@@ -539,7 +575,7 @@ async function main(): Promise<void> {
       closeDeepBrain();
       deepBrainOpen = false;
     }
-    startNodeServices();
+    await startNodeServices();
     // The dispatcher reads NODE_ROLE, so a role change must restart it with the
     // new mode (Master monitor loop vs. Satellite poll loop).
     dispatcher.start();

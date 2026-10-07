@@ -497,7 +497,10 @@ export class SwarmClient {
   constructor() {
     this.client = axios.create({
       baseURL: env.MOTHERSHIP_URL,
-      timeout: 10_000,
+      // 30s, not 10s: Cloudflare cold starts + queue chunking + laptop-link
+      // latency otherwise trip "timeout of 10000ms exceeded" on heartbeats,
+      // task fetches and capability registration.
+      timeout: 30_000,
       headers: {
         "Content-Type": "application/json",
         "X-Node-Name": env.NODE_NAME,
