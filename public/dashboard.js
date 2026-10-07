@@ -1055,6 +1055,13 @@ function startEventStream() {
 
     if (event.kind === "brain_sync") {
       renderBrainSync(event);
+    } else if (event.kind === "admin_command" && event.command === "FORCE_UPDATE_ABORTED") {
+      // OTA ABORT — the backend pipeline refused to swap (rejected downgrade,
+      // bad payload, failed download, handoff contention). Lift the blocking
+      // "Applying OTA Update…" overlay and toast the reason so the operator
+      // lands back on the dashboard instead of a permanent loading screen.
+      hideAdminOverlay();
+      showAlert(event.detail || "Update cancelled: Node is already on a newer version.", "err");
     } else if (event.kind === "admin_command" && event.blocking) {
       showAdminOverlay(event);
     }
@@ -1107,11 +1114,17 @@ function renderBrainSync(event) {
 /**
  * Shows the full-screen, unclosable admin overlay.
  *
- * There is intentionally no dismiss path here. By the time this event is
- * published the node has already committed: the OTA batch script is spawned (or
- * the shutdown has begun), so a "Cancel" button would offer a control that does
- * not exist. The overlay lifts only when the page does, which coincides with the
- * restart it is announcing.
+ * There is intentionally no dismiss path here for the COMMITTED commands. By
+ * the time a blocking FORCE_UPDATE / RESTART event is published the node has
+ * already committed: the OTA batch script is spawned (or the shutdown has
+ * begun), so a "Cancel" button would offer a control that does not exist. The
+ * overlay lifts only when the page does, which coincides with the restart it
+ * is announcing.
+ *
+ * The one exception is the non-blocking FORCE_UPDATE_ABORTED event: the OTA
+ * pipeline refused to swap (rejected downgrade, bad payload, failed download)
+ * and the node is still running, so hideAdminOverlay() below lifts the overlay
+ * and returns the operator to the dashboard.
  */
 function showAdminOverlay(event) {
   const overlay = $("adminOverlay");
@@ -1131,6 +1144,21 @@ function showAdminOverlay(event) {
         : "The Mothership asked this node to update to the latest build.");
   }
   overlay.hidden = false;
+}
+
+/**
+ * Lifts the admin overlay and returns the operator to the dashboard.
+ *
+ * Called ONLY for the non-blocking FORCE_UPDATE_ABORTED event — the OTA
+ * pipeline refused to swap (rejected downgrade, bad payload, failed download)
+ * and the node is still running, so there is no pending restart to wait for.
+ * Never called for the blocking RESTART / committed-OTA events, where the
+ * overlay must stay until the page goes away with the restart.
+ */
+function hideAdminOverlay() {
+  const overlay = $("adminOverlay");
+  if (!overlay) return;
+  overlay.hidden = true;
 }
 
 /** Wires the brain panel and opens the node event stream. */

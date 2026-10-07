@@ -712,6 +712,30 @@ export async function executePendingCommands(
               "rejected_downgrade — this node is already running a newer build than the target version; clearing the command",
               { ...ackContext, status: "rejected_downgrade" },
             );
+            /*
+              OTA ABORT — DISMISS THE "Applying OTA Update…" OVERLAY.
+
+              The blocking overlay was published BEFORE the pipeline ran (it has
+              to be — a successful swap ends in process.exit, so anything
+              published afterwards never reaches a browser). On the abort paths
+              nothing exits, so without this the dashboard sits on the loading
+              screen forever — including late-joining tabs, because the retained
+              blocking event is replayed on SSE connect.
+
+              Publishing a NON-blocking abort event fixes both: live dashboards
+              hide the overlay and toast the reason, and the retained
+              `admin_command` is overwritten so the replay guard
+              (`replay?.blocking` in GET /api/system/events) stops re-showing a
+              stale overlay to newcomers.
+            */
+            publishNodeEvent({
+              kind: "admin_command",
+              command: "FORCE_UPDATE_ABORTED",
+              title: "Update cancelled",
+              detail:
+                "Update cancelled: Node is already on a newer version than the offered build. No files were changed.",
+              blocking: false,
+            });
             acknowledgedUpFront = true;
           } else if (committed === false) {
             await acknowledge(
@@ -720,6 +744,20 @@ export async function executePendingCommands(
               "not applied — no swap was committed (Mothership payload unusable, download failed, the requested version was older than this node's, or another updater owns the handoff)",
               { ...ackContext, status: "failed" },
             );
+            /*
+              Same overlay-lift as the downgrade path above: any non-fatal abort
+              (bad payload, failed download, handoff contention) must return the
+              operator to the dashboard instead of stranding them on
+              "Applying OTA Update…".
+            */
+            publishNodeEvent({
+              kind: "admin_command",
+              command: "FORCE_UPDATE_ABORTED",
+              title: "Update cancelled",
+              detail:
+                "Update cancelled: the OTA pipeline aborted before swapping (unusable payload, download failure, or another updater owns the handoff). The node is still on its current build.",
+              blocking: false,
+            });
             // The record is now correct, so the generic completion ack below
             // would only contradict it.
             acknowledgedUpFront = true;
@@ -772,6 +810,23 @@ export async function executePendingCommands(
         ...ackContext,
         status: "failed",
       });
+      /*
+        THROWN MID-OTA MUST ALSO LIFT THE OVERLAY. The non-fatal abort paths
+        above publish FORCE_UPDATE_ABORTED on their normal returns, but an
+        unexpected throw out of forceUpdate() would skip them and strand the
+        dashboard on "Applying OTA Update…" the same way. A thrown FORCE_UPDATE
+        never committed a swap (a committed swap exits the process rather than
+        returning or throwing), so dismissing here is safe.
+      */
+      if (command === "FORCE_UPDATE") {
+        publishNodeEvent({
+          kind: "admin_command",
+          command: "FORCE_UPDATE_ABORTED",
+          title: "Update cancelled",
+          detail: `Update cancelled: the OTA pipeline failed before swapping (${reason}). The node is still on its current build.`,
+          blocking: false,
+        });
+      }
     }
   }
   return executed;
