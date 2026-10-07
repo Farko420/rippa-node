@@ -2020,7 +2020,25 @@ export function createApp(): Express {
     const activeTask = require("./services/heartbeat").getCurrentProcess() as
       | { task: string }
       | null;
-    res.json({ success: true, ...ollamaManager.getStatus(activeTask?.task ?? null) });
+    let watchdog: Record<string, unknown> | null = null;
+    try {
+      const { getZeroTouchPlan, findHostOllamaBinary } =
+        require("./services/ollamaWatchdog") as typeof import("./services/ollamaWatchdog");
+      const plan = getZeroTouchPlan();
+      watchdog = {
+        hostBinary: plan?.hostBinary ?? findHostOllamaBinary(),
+        usingBundledRuntime: plan?.usingBundledRuntime ?? true,
+        port: plan?.port ?? ollamaManager.getPort(),
+        model: plan?.model ?? ollamaManager.getModel(),
+      };
+    } catch {
+      watchdog = null;
+    }
+    res.json({
+      success: true,
+      ...ollamaManager.getStatus(activeTask?.task ?? null),
+      watchdog,
+    });
   });
 
   app.post("/api/ollama/unlock", requireDashboardAuth, (req: Request, res: Response) => {

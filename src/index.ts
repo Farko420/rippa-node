@@ -84,6 +84,37 @@ async function main(): Promise<void> {
   console.log(` Mothership: ${env.MOTHERSHIP_URL}`);
   console.log(` Ollama: ${env.OLLAMA_URL}`);
   /*
+    ZERO-TOUCH OLLAMA WATCHDOG — the epic's autonomous bootstrap, FIRST in the
+    startup sequence before anything can send a heartbeat or claim the port.
+
+    Runs unconditionally (both roles need local inference for extraction and
+    self-healing): detects a host binary, claims the healed port via
+    `setDynamicOllamaPort()` so every later resolver agrees, and reports the
+    required model. Best-effort by design — a failed probe must never wedge
+    the boot; the manager's own spawn-time heal is the backstop.
+  */
+  try {
+    const { ensureZeroTouchOllama } = require("./services/ollamaWatchdog") as typeof import("./services/ollamaWatchdog");
+    const { resolveBundledOllamaPort } = require("./services/bundled-ollama") as typeof import("./services/bundled-ollama");
+    const plan = await ensureZeroTouchOllama(
+      resolveBundledOllamaPort(),
+      (stage: string, percent: number | null, detail: string) => {
+        const suffix = percent === null ? "" : ` (${percent}%)`;
+        console.log(`[Boot][OllamaWatchdog] ${stage}${suffix} — ${detail}`);
+      },
+    );
+    console.log(
+      `[Boot] Zero-touch Ollama plan — port ${plan.port}, model ${plan.model}, ` +
+        (plan.hostBinary ? `host binary at ${plan.hostBinary}` : "portable runtime"),
+    );
+  } catch (error) {
+    console.warn(
+      `[Boot] Zero-touch Ollama bootstrap failed — continuing unmanaged: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  /*
     SUPERVISION, STATED PLAINLY AT BOOT.
 
     Whether a restart comes back is the single most-asked operational question,

@@ -38,6 +38,17 @@ const OTA_FIRST_CHECK_DELAY_MS = 30_000; // let boot settle before the first che
 const DYNAMIC_SKILL = "DYNAMIC_SKILL";
 
 /**
+ * The `ai_inference` task type — the epic's outbound-only AI work.
+ *
+ * The Mothership assigns `{ prompt, model?, system?, options? }` in
+ * `task.payload`; the node runs it against its LOCAL dynamic-port Ollama
+ * instance and POSTs the text back via `submitProfile` (kind
+ * `ai_inference_result`). Accepted alongside `AI_INFERENCE`/`INFER` spellings
+ * because the cloud and the queue do not always agree on case.
+ */
+const AI_INFERENCE = "AI_INFERENCE";
+
+/**
  * Hooks the fleet controller supplies so an ADMIN task can actually be carried
  * out. Kept as a constructor option rather than reaching for module state, so the
  * orchestrator stays testable and the boot sequence in index.ts owns the wiring.
@@ -316,10 +327,21 @@ export class Orchestrator {
       return this.handleAdminTask(task, adminCommand);
     }
 
-    switch (task.type) {
+    // Normalised once: the cloud sends `ai_inference`, `AI_INFERENCE` and
+    // `AI_INFERENCE_TASK` for the same work, and an exact-match switch would
+    // silently skip two of the three. Admin types already normalise the same
+    // way (see adminCommandForTaskType); task types get the same treatment.
+    const taskKind = String(task.type ?? "").trim().toUpperCase();
+    switch (taskKind) {
       // AI-generated JavaScript from the Mothership, run in the skill sandbox.
       case DYNAMIC_SKILL:
         return this.handleDynamicSkill(task);
+      // Outbound-only local inference: prompt in, text out, no inbound socket.
+      case AI_INFERENCE:
+      case "AI_INFERENCE_TASK":
+      case "INFER":
+      case "INFERENCE":
+        return this.handleAiInference(task);
       // TODO: wire real handlers as they are built, e.g.:
       //   case "scrape":   → Playwright headless scrape
       //   case "extract":  → Ollama structured extraction
@@ -501,6 +523,65 @@ export class Orchestrator {
         : result.error.split("\n")[0] ?? "skill failed",
       reported: true,
     };
+  }
+
+  /**
+   * AI_INFERENCE — runs a Mothership prompt against the LOCAL dynamic-port
+   * Ollama instance and POSTs the text back. Strictly outbound: the prompt
+   * arrived over the poll loop, the result leaves over `submitProfile`.
+   *
+   * Payload shape (all optional except `prompt`):
+   * `{ prompt, model?, system?, temperature?, maxTokens? }`.
+   * `reported: true` on every path, because this handler files its own
+   * `ai_inference_result` and the engine's generic `task_result` would double
+   * -report the same task.
+   */
+  private async handleAiInference(task: SwarmTask): Promise<TaskOutcome> {
+    const payload = task.payload ?? {};
+    const prompt = String(payload["prompt"] ?? payload["input"] ?? payload["query"] ?? "").trim();
+    if (!prompt) {
+      console.warn(`[Orchestrator] ${AI_INFERENCE} task ${task.id} had no prompt — skipping.`);
+      await this.swarm.submitProfile({
+        kind: "ai_inference_result",
+        taskId: task.id,
+        status: "skipped",
+        error: "task carried no prompt",
+      });
+      return { status: "skipped", detail: "task carried no prompt", reported: true };
+    }
+    const startedAt = Date.now();
+    try {
+      const { runLocalInference } = await import("../services/ollamaManager.js");
+      const result = await runLocalInference({
+        prompt,
+        model: typeof payload["model"] === "string" ? payload["model"] : undefined,
+        system: typeof payload["system"] === "string" ? payload["system"] : undefined,
+        temperature: typeof payload["temperature"] === "number" ? payload["temperature"] : undefined,
+        maxTokens: typeof payload["maxTokens"] === "number" ? payload["maxTokens"] : undefined,
+      });
+      const durationMs = Date.now() - startedAt;
+      await this.swarm.submitProfile({
+        kind: "ai_inference_result",
+        taskId: task.id,
+        status: "success",
+        output: result.text,
+        model: result.model,
+        durationMs,
+      });
+      console.log(`[Orchestrator] ${AI_INFERENCE} ${task.id} completed in ${durationMs}ms (${result.model}).`);
+      return { status: "success", detail: `inferred in ${durationMs}ms`, reported: true };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.swarm.submitProfile({
+        kind: "ai_inference_result",
+        taskId: task.id,
+        status: "failed",
+        error: message.split("\n")[0] ?? "inference failed",
+        durationMs: Date.now() - startedAt,
+      });
+      console.warn(`[Orchestrator] ${AI_INFERENCE} ${task.id} failed — ${message.split("\n")[0]}`);
+      return { status: "failure", detail: message.split("\n")[0] ?? "inference failed", reported: true };
+    }
   }
 }
 

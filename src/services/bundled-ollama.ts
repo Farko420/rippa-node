@@ -98,6 +98,34 @@ export const BUNDLED_OLLAMA_ORIGIN = `http://127.0.0.1:${BUNDLED_OLLAMA_PORT}`;
  * function exists to make impossible: there is now ONE resolver, and every
  * consumer asks it.
  */
+/**
+ * DYNAMIC PORT OVERRIDE — the zero-touch watchdog's claim on the bind port.
+ * Set once per boot by `ensureZeroTouchOllama()` (or the spawner's own
+ * EADDRINUSE retry). Read first by the resolver below so "the port we
+ * advertise" and "the port we bind" stay identical by construction.
+ * `clearDynamicOllamaPort()` exists for tests only.
+ */
+let dynamicOllamaPort: number | null = null;
+
+/** Claims the healed port. Ignores out-of-range values rather than binding them. */
+export function setDynamicOllamaPort(port: number): void {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.warn(`[BundledOllama] Ignoring invalid dynamic port ${port}.`);
+    return;
+  }
+  dynamicOllamaPort = port;
+}
+
+/** Returns the claimed dynamic port, or null when nothing was claimed. */
+export function getDynamicOllamaPort(): number | null {
+  return dynamicOllamaPort;
+}
+
+/** Clears the claim (tests only — production never un-claims mid-boot). */
+export function clearDynamicOllamaPort(): void {
+  dynamicOllamaPort = null;
+}
+
 export const BUNDLED_OLLAMA_PORT_ENV = "RIPPA_BUNDLED_OLLAMA_PORT";
 
 /**
@@ -114,6 +142,8 @@ export const BUNDLED_OLLAMA_PORT_ENV = "RIPPA_BUNDLED_OLLAMA_PORT";
  * which fails in a far more confusing way than simply using the default.
  */
 export function resolveBundledOllamaPort(): number {
+  // 1. The watchdog's live claim wins — freshest fact from this boot.
+  if (dynamicOllamaPort !== null) return dynamicOllamaPort;
   const raw = process.env[BUNDLED_OLLAMA_PORT_ENV];
   if (!raw || !raw.trim()) return BUNDLED_OLLAMA_PORT;
   const parsed = Number(raw.trim());
@@ -127,9 +157,10 @@ export function resolveBundledOllamaPort(): number {
   return parsed;
 }
 
-/** Loopback origin for the resolved managed port. */
-export function bundledOllamaOrigin(): string {
-  return `http://127.0.0.1:${resolveBundledOllamaPort()}`;
+/** Loopback origin for the resolved managed port (dynamic claim included). */
+export function bundledOllamaOrigin(port?: number): string {
+  const resolved = typeof port === "number" ? port : resolveBundledOllamaPort();
+  return `http://127.0.0.1:${resolved}`;
 }
 
 /**

@@ -6,6 +6,7 @@ import {
   PRIMARY_MODEL,
   FALLBACK_MODEL,
   EMBEDDING_MODEL,
+  KEEP_ALIVE,
   recommendedPrimaryModel,
   systemRamGb,
 } from "../agent/OllamaClient";
@@ -312,7 +313,14 @@ interface PullFrame {
  * test drive the publish directly and assert the invariant in milliseconds.
  */
 export function publishManagedOllamaOrigin(port: number): void {
-  const origin = bundledOllamaOrigin();
+  // The explicit port wins: on a healed boot the caller passes the port the
+  // watchdog already claimed, which the resolver may not know yet if the
+  // claim landed after module load. Falling back to the resolver keeps the
+  // old call sites (which pass the resolved port) behaving identically.
+  const origin =
+    Number.isInteger(port) && port >= 1 && port <= 65535
+      ? bundledOllamaOrigin(port)
+      : bundledOllamaOrigin();
 
   // Cheap drift guard. `origin` is machine-built and always well-formed, so
   // extractPort cannot realistically fail here — the check exists to catch a
@@ -556,53 +564,71 @@ class OllamaManager {
       // cheap path now requires the whole runtime tree; `ensureBundledBinary()`
       // is the fallback that notices a half-install and rebuilds it.
       const binary = bundledRuntimeComplete() ? bundledBinaryPath() : await ensureBundledBinary();
-      const child = spawn(binary, ["serve"], {
-        // Isolation env applied LAST so it wins over any stray value already in
-        // this process's environment (see bundledOllamaEnv for why each matters).
-        env: { ...process.env, ...bundledOllamaEnv() },
-        /*
-          THE CHILD'S OUTPUT IS PIPED, NOT IGNORED.
+      const spawnWithPipedOutput = (bin: string): ChildProcess =>
+        spawn(bin, ["serve"], {
+          // Isolation env applied LAST so it wins over any stray value already in
+          // this process's environment (see bundledOllamaEnv for why each matters).
+          env: { ...process.env, ...bundledOllamaEnv() },
+          /*
+            THE CHILD'S OUTPUT IS PIPED, NOT IGNORED.
 
-          It used to be `stdio: "ignore"`, which threw away everything `ollama serve`
-          writes about model loading, runner startup and memory allocation — exactly
-          the lines an operator needs when the engine is misbehaving at 3am. Piping
-          costs nothing on a node nobody is watching: the lines are trimmed, pushed
-          into a capped ring buffer, and fanned out to whichever dashboards happen to
-          be listening (of which there are usually none).
-        */
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-      });
+            It used to be `stdio: "ignore"`, which threw away everything `ollama serve`
+            writes about model loading, runner startup and memory allocation — exactly
+            the lines an operator needs when the engine is misbehaving at 3am. Piping
+            costs nothing on a node nobody is watching: the lines are trimmed, pushed
+            into a capped ring buffer, and fanned out to whichever dashboards happen to
+            be listening (of which there are usually none).
+          */
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+        });
+      const child = spawnWithPipedOutput(binary);
       this.child = child;
       this.pipeChildOutput(child);
-      child.once("exit", (code) => {
-        this.child = null;
-        if (this.stopping) {
-          this.state = "stopped";
-          return;
-        }
-        this.state = "crashed";
-        this.lastError = `ollama serve exited (code ${code ?? "unknown"})`;
-        console.warn(`[OllamaManager] ${this.lastError} — scheduling restart.`);
-        publishNodeEvent({
-          kind: "info",
-          title: "Ollama process restarting",
-          detail: this.lastError,
-        });
-        this.scheduleRestart();
-      });
-      child.once("error", (error) => {
-        this.lastError = error.message;
-        console.warn(`[OllamaManager] Failed to spawn ollama — ${error.message}`);
-        this.state = "crashed";
-        this.child = null;
-        this.scheduleRestart();
-      });
+      this.watchChild(child);
       await new Promise((resolve) => setTimeout(resolve, 1_500));
-      const alive = await this.probe(port);
+      let alive = await this.probe(port);
+      let boundPort = port;
+      if (!alive) {
+        // DYNAMIC PORT SELF-HEAL AT THE SPAWN SITE. The watchdog pre-claims a
+        // free port, but the claim is advisory (TOCTOU, or the watchdog ran
+        // with a stale override). The tell is in OUR OWN child's first lines:
+        // Ollama logs "address already in use" when the bind fails, while a
+        // merely slow boot logs nothing of the sort. Matching our own output
+        // (not a foreign probe, which our held child handle makes ambiguous)
+        // is what keeps a slow machine from healing away from a healthy boot.
+        // One retry only: a machine genuinely out of ports belongs on the
+        // crash-restart ladder, not in a spawn loop.
+        if (await this.childSawBindConflict()) {
+          try {
+            const { setDynamicOllamaPort } = await import("./bundled-ollama.js");
+            const healed = await this.claimEphemeralPort();
+            if (healed !== null) {
+              setDynamicOllamaPort(healed);
+              publishManagedOllamaOrigin(healed);
+              console.warn(
+                `[OllamaManager] Port ${port} is held by another process — healed to ${healed} and retrying.`,
+              );
+              this.detachChild(child);
+              const retryBinary = bundledRuntimeComplete() ? bundledBinaryPath() : binary;
+              const retry = spawnWithPipedOutput(retryBinary);
+              this.child = retry;
+              this.pipeChildOutput(retry);
+              this.watchChild(retry);
+              await new Promise((resolve) => setTimeout(resolve, 1_500));
+              alive = await this.probe(healed);
+              boundPort = healed;
+            }
+          } catch (error) {
+            console.warn(
+              `[OllamaManager] Port heal failed — ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+      }
       this.state = alive ? "running" : "starting";
       if (alive) {
-        console.log(`[OllamaManager] ollama serve is up on port ${port}.`);
+        console.log(`[OllamaManager] ollama serve is up on port ${boundPort}.`);
         // HARDWARE AUTO-PROFILING + LOCAL EMBEDDING — pull the RAM-appropriate
         // generation model and the embedding model in the background. Never
         // blocks `start()` — a slow first pull must not look like a hang.
@@ -660,6 +686,106 @@ class OllamaManager {
     attach(child.stdout, "stdout");
     attach(child.stderr, "stderr");
   }
+
+  /** Wires crash/exit lifecycle onto a spawned child (start + heal retry share it). */
+  private watchChild(child: ChildProcess): void {
+    child.once("exit", (code) => {
+      if (this.child !== child) return; // superseded by the heal retry — ignore
+      this.child = null;
+      if (this.stopping) {
+        this.state = "stopped";
+        return;
+      }
+      this.state = "crashed";
+      this.lastError = `ollama serve exited (code ${code ?? "unknown"})`;
+      console.warn(`[OllamaManager] ${this.lastError} — scheduling restart.`);
+      publishNodeEvent({
+        kind: "info",
+        title: "Ollama process restarting",
+        detail: this.lastError,
+      });
+      this.scheduleRestart();
+    });
+    child.once("error", (error) => {
+      if (this.child !== child) return;
+      this.lastError = error.message;
+      console.warn(`[OllamaManager] Failed to spawn ollama — ${error.message}`);
+      this.state = "crashed";
+      this.child = null;
+      this.scheduleRestart();
+    });
+  }
+
+  /** Detaches a failed first-attempt child so the heal retry starts clean. */
+  private detachChild(child: ChildProcess): void {
+    try {
+      child.removeAllListeners("exit");
+      child.removeAllListeners("error");
+      child.kill("SIGTERM");
+    } catch {
+      // Already dead — the retry is the real attempt.
+    }
+    if (this.child === child) this.child = null;
+  }
+
+  /**
+   * True when the current child's early output shows a bind conflict.
+   *
+   * Ollama logs "address already in use" (Go's "bind:" prefix, or EADDRINUSE)
+   * when the port is taken; a slow-but-healthy boot logs neither. The child's
+   * stdout/stderr are piped straight to the telemetry bus with no retained
+   * buffer, so this taps the live streams for one short window and unhooks —
+   * no new plumbing, no retained history, no interference with the pipe.
+   */
+  private async childSawBindConflict(timeoutMs = 1_000): Promise<boolean> {
+    const child = this.child;
+    if (!child) return false;
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (conflict: boolean): void => {
+        if (settled) return;
+        settled = true;
+        try {
+          child.stdout?.removeListener("data", onData);
+          child.stderr?.removeListener("data", onData);
+        } catch {
+          // Unhook best-effort — the tap is advisory, not load-bearing.
+        }
+        resolve(conflict);
+      };
+      const timer = setTimeout(() => done(false), timeoutMs);
+      timer.unref?.();
+      const onData = (chunk: unknown): void => {
+        if (/address already in use|bind:.*in use|EADDRINUSE/i.test(String(chunk))) {
+          clearTimeout(timer);
+          done(true);
+        }
+      };
+      try {
+        child.stdout?.on("data", onData);
+        child.stderr?.on("data", onData);
+      } catch {
+        clearTimeout(timer);
+        done(false);
+      }
+    });
+  }
+
+  /** Claims a free ephemeral loopback port (bind 0, read, release). */
+  private async claimEphemeralPort(): Promise<number | null> {
+    const net = await import("node:net");
+    return new Promise((resolve) => {
+      const server = net.createServer();
+      server.unref?.();
+      server.once("error", () => resolve(null));
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        const claimed = typeof address === "object" && address ? address.port : 0;
+        server.close(() => resolve(claimed > 0 ? claimed : null));
+      });
+    });
+  }
+
 
   /** The port the local server is configured to serve on. */
   getPort(): number {
@@ -1524,3 +1650,64 @@ class OllamaManager {
 
 /** Process-wide singleton — one Ollama child per node. */
 export const ollamaManager = new OllamaManager();
+
+/**
+ * Runs one prompt against the LOCAL dynamic-port Ollama instance.
+ *
+ * THE INTERNAL ROUTING THE EPIC REQUIRES. The origin is built from the live
+ * managed port (`getPort()` reads the published `env.OLLAMA_URL`, which the
+ * watchdog/bundled resolver keeps on the healed port) — never a hard-coded
+ * 11434. The model defaults to the node's reconciled generation model and
+ * falls back to the hardware-appropriate recommendation when nothing is set.
+ * Loopback-only with `proxy: false`, matching every other local call.
+ */
+export interface LocalInferenceInput {
+  prompt: string;
+  model?: string;
+  system?: string;
+  temperature?: number;
+  maxTokens?: number;
+  timeoutMs?: number;
+}
+
+export interface LocalInferenceResult {
+  text: string;
+  model: string;
+  port: number;
+  durationMs: number;
+}
+
+export async function runLocalInference(input: LocalInferenceInput): Promise<LocalInferenceResult> {
+  const prompt = String(input.prompt ?? "").trim();
+  if (!prompt) throw new Error("runLocalInference requires a non-empty prompt.");
+  const port = ollamaManager.getPort();
+  const origin = `http://127.0.0.1:${port}`;
+  const status = ollamaManager.getStatus(null);
+  const model =
+    (typeof input.model === "string" && input.model.trim()) || status.model || recommendedPrimaryModel();
+  const started = Date.now();
+  const body: Record<string, unknown> = {
+    model,
+    prompt,
+    stream: false,
+    keep_alive: KEEP_ALIVE,
+  };
+  if (typeof input.system === "string" && input.system.trim()) body["system"] = input.system;
+  const options: Record<string, unknown> = {};
+  if (typeof input.temperature === "number" && Number.isFinite(input.temperature)) {
+    options["temperature"] = input.temperature;
+  }
+  if (typeof input.maxTokens === "number" && Number.isFinite(input.maxTokens) && input.maxTokens > 0) {
+    options["num_predict"] = Math.floor(input.maxTokens);
+  }
+  if (Object.keys(options).length > 0) body["options"] = options;
+  const timeout = typeof input.timeoutMs === "number" && input.timeoutMs > 0 ? input.timeoutMs : 180_000;
+  const { data } = await axios.post<{ response?: string }>(`${origin}/api/generate`, body, {
+    timeout,
+    proxy: false,
+  });
+  const text = String(data?.response ?? "").trim();
+  if (!text) throw new Error(`Local inference on ${model} returned an empty response.`);
+  return { text, model, port, durationMs: Date.now() - started };
+}
+
