@@ -103,10 +103,14 @@ export class InMemoryStorage implements StorageProvider {
 /**
  * DESKTOP PROVIDER (uses better-sqlite3 + fs)
  * Implemented in a separate module to avoid importing Node builtins in mobile builds.
+ *
+ * NOTE: loaded via bundler-safe `require()` (not `import()`) so the `pkg`
+ * snapshot can resolve it. Mobile builds never call this function, so the
+ * desktop-only dependency is never loaded there.
  */
 export async function createDesktopProvider(): Promise<StorageProvider> {
-  // Dynamic import to avoid compile-time dependency in mobile builds
-  const { DesktopStorageProvider } = await import("./storage-desktop.js");
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { DesktopStorageProvider } = require("./storage-desktop") as typeof import("./storage-desktop");
   return new DesktopStorageProvider();
 }
 

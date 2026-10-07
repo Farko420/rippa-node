@@ -5,6 +5,7 @@ import { OtaUpdater } from "../update/OtaUpdater";
 import { APP_VERSION } from "../version";
 import { schedule, type ScheduledTask } from "node-cron";
 import { executeSkill } from "../services/skillExecutor";
+import { runLocalInference } from "../services/ollamaManager";
 import { healTask } from "../services/taskManager";
 import { startLocalAiDiscovery, type LocalAiStatus } from "../services/localAi";
 import { AutonomousForager } from "../services/autonomousForager";
@@ -551,7 +552,7 @@ export class Orchestrator {
     }
     const startedAt = Date.now();
     try {
-      const { runLocalInference } = await import("../services/ollamaManager.js");
+      // Static import at the top (pkg snapshot cannot resolve dynamic imports).
       const result = await runLocalInference({
         prompt,
         model: typeof payload["model"] === "string" ? payload["model"] : undefined,

@@ -17,10 +17,13 @@
  *      installer wants elevation, writes to Program Files, registers a service
  *      and starts a tray app — every one breaks "portable, no admin". The
  *      standalone release archive is the same official build without the host
- *      mutation. Official installer URLs are still reported when a host binary
- *      is absent AND the operator opts into a host install
- *      (`RIPPA_OLLAMA_HOST_INSTALL=1`); otherwise the portable runtime is used
- *      silently. Host binaries are reported but never disturbed.
+ *      mutation. The official installer (`OllamaSetup.exe` on Windows) is now
+ *      auto-run silently on a fresh machine unless the operator opts OUT with
+ *      `RIPPA_OLLAMA_HOST_INSTALL=0`; legacy `=1` still opts in. When the
+ *      silent host install fails (no admin, no network, non-Windows without a
+ *      runnable installer) the portable runtime is used as the fallback, so
+ *      boot never wedges. Host binaries that already exist are reported but
+ *      never disturbed.
  *
  *   2. DYNAMIC PORT BINDING & AUTO-REPAIR — prefer the configured port, but
  *      when it is occupied heal to a free ephemeral localhost port instead of
@@ -40,6 +43,17 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import axios from "axios";
+import { pipeline } from "node:stream/promises";
+
+// Static imports: `@yao-pkg/pkg` cannot resolve dynamic `import()` inside the
+// snapshot ("A dynamic import callback was not specified"). Everything on the
+// boot path must be statically analyzable, so these live at the top level.
+// (`bundled-ollama` never imports this file, and `nodeEvents` is a leaf, so
+// there is no import cycle.)
+import { setDynamicOllamaPort } from "./bundled-ollama";
+import { publishNodeEvent } from "./nodeEvents";
+import { dataFilePath } from "../utils/paths";
 
 import { PRIMARY_MODEL, recommendedPrimaryModel } from "../agent/OllamaClient";
 
@@ -122,15 +136,16 @@ export function findHostOllamaBinary(): string | null {
 }
 
 /**
- * Official installer source for the host OS (reported, not auto-run).
- * Only downloaded when the operator sets `RIPPA_OLLAMA_HOST_INSTALL=1`.
+ * Official installer source for the host OS.
+ * Downloaded + silently executed automatically unless the operator sets
+ * `RIPPA_OLLAMA_HOST_INSTALL=0` (or false/no/off).
  */
 export function getOfficialInstallerInfo(): { url: string; silentArgs: string[]; note: string } {
   if (process.platform === "win32") {
     return {
       url: "https://ollama.com/download/OllamaSetup.exe",
       silentArgs: ["/S"],
-      note: "Requires elevation; portable runtime is preferred for zero-touch.",
+      note: "Silent NSIS install (/S); portable runtime is the fallback.",
     };
   }
   if (process.platform === "darwin") {
@@ -147,10 +162,26 @@ export function getOfficialInstallerInfo(): { url: string; silentArgs: string[];
   };
 }
 
-/** True when the operator explicitly asked for a host-level official install. */
+/**
+ * True unless the operator explicitly opted OUT of the silent host install
+ * (`RIPPA_OLLAMA_HOST_INSTALL=0` / false / no / off). Unset (the normal
+ * fresh-machine case) means YES — true zero-touch. Legacy `=1` still opts in.
+ */
 export function wantsHostInstall(): boolean {
   const raw = (process.env[HOST_INSTALL_ENV] ?? "").trim().toLowerCase();
-  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+  if (raw === "" || raw === "auto") return true;
+  if (raw === "0" || raw === "false" || raw === "no" || raw === "off") return false;
+  return true;
+}
+
+/** Where the downloaded official installer is staged (OTA-safe data dir). */
+export function hostInstallerStagePath(): string {
+  const name = process.platform === "win32" ? "OllamaSetup.exe" : "ollama-host-installer";
+  try {
+    return dataFilePath("ollama-host-install", name);
+  } catch {
+    return path.join(os.tmpdir(), "rippa-ollama-host-install", name);
+  }
 }
 
 /** True when a TCP connect to 127.0.0.1:port succeeds (something answers). */
@@ -204,6 +235,112 @@ export async function resolveHealedPort(preferred: number): Promise<{ port: numb
 }
 
 /**
+ * Downloads the official installer to the stage path (`.part` + rename, so a
+ * half-written file is never executed). Bundler-safe: static `axios` import.
+ */
+export async function downloadHostInstaller(
+  onProgress: WatchdogProgress = defaultProgressReporter,
+): Promise<string> {
+  const installer = getOfficialInstallerInfo();
+  const dest = hostInstallerStagePath();
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  onProgress("install-download", null, `Downloading official Ollama installer from ${installer.url} ...`);
+  const response = await axios.get(installer.url, {
+    responseType: "stream",
+    timeout: 10 * 60_000,
+    maxRedirects: 5,
+    headers: { "User-Agent": "rippa-node-zero-touch", Accept: "application/octet-stream" },
+  });
+  const total = Number(response.headers?.["content-length"] ?? 0);
+  let received = 0;
+  let lastPercent = -1;
+  const stream = response.data as NodeJS.ReadableStream;
+  stream.on("data", (chunk: Buffer) => {
+    received += chunk.length;
+    if (total > 0) {
+      const percent = Math.floor((received / total) * 100);
+      if (percent !== lastPercent) {
+        lastPercent = percent;
+        onProgress("install-download", percent, `Downloading OllamaSetup.exe: ${percent}%`);
+      }
+    }
+  });
+  const partial = `${dest}.part`;
+  try {
+    await pipeline(stream, fs.createWriteStream(partial));
+    fs.renameSync(partial, dest);
+  } finally {
+    try {
+      if (fs.existsSync(partial)) fs.rmSync(partial, { force: true });
+    } catch {
+      // Best-effort cleanup of the partial file.
+    }
+  }
+  onProgress("install-download", 100, `Installer downloaded (${received} bytes).`);
+  return dest;
+}
+
+/**
+ * Silently executes the staged installer and waits for completion.
+ * Windows: `OllamaSetup.exe /S` (NSIS silent). Other platforms have no silent
+ * contract, so this reports unsupported and the caller falls back.
+ */
+export async function runHostInstallerSilent(
+  installerPath: string,
+  onProgress: WatchdogProgress = defaultProgressReporter,
+): Promise<boolean> {
+  const info = getOfficialInstallerInfo();
+  if (process.platform !== "win32" || info.silentArgs.length === 0) {
+    onProgress("install", null, "No silent host-install contract here — portable runtime instead.");
+    return false;
+  }
+  onProgress("install", null, `Running silent Ollama install (${info.silentArgs.join(" ")}) ...`);
+  const result = spawnSync(installerPath, info.silentArgs, {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 15 * 60_000,
+  });
+  if (result.error) {
+    onProgress("install", null, `Silent installer failed to launch: ${result.error.message}.`);
+    return false;
+  }
+  if (result.status !== 0) {
+    onProgress("install", null, `Silent installer exited with code ${result.status}.`);
+    return false;
+  }
+  const found = findHostOllamaBinary();
+  if (found) {
+    onProgress("install", null, `Silent Ollama install complete — host binary at ${found}.`);
+    return true;
+  }
+  onProgress("install", null, "Installer finished but no host binary found — portable fallback.");
+  return false;
+}
+
+/**
+ * TRUE ZERO-TOUCH: autonomously download + silently run `OllamaSetup.exe /S`
+ * and wait. Never throws — any failure resolves false so boot falls back to
+ * the portable runtime instead of wedging.
+ */
+export async function ensureHostOllamaInstalled(
+  onProgress: WatchdogProgress = defaultProgressReporter,
+): Promise<boolean> {
+  if (findHostOllamaBinary()) return true;
+  if (!wantsHostInstall()) {
+    onProgress("install", null, "Host install disabled via RIPPA_OLLAMA_HOST_INSTALL=0.");
+    return false;
+  }
+  try {
+    const staged = await downloadHostInstaller(onProgress);
+    return await runHostInstallerSilent(staged, onProgress);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    onProgress("install", null, `Host auto-install failed (${reason}) — portable fallback.`);
+    return false;
+  }
+}
+
+/**
  * Builds the zero-touch plan WITHOUT starting anything: detect the host
  * binary, pick the model for this hardware, heal the port when occupied.
  * Pure with respect to processes — safe for tests and the UI.
@@ -218,9 +355,10 @@ export async function planZeroTouchOllama(preferredPort: number): Promise<ZeroTo
 }
 
 /**
- * Runs the silent bootstrap: claims the healed port, then reports readiness.
- * The server start stays with `ollamaManager.start()` (one spawner); this
- * only decides WHERE it binds and WHAT it pulls.
+ * Runs the silent bootstrap: auto-installs when missing, claims the healed
+ * port, then reports readiness. The server start stays with
+ * `ollamaManager.start()` (one spawner); this only decides WHERE it binds
+ * and WHAT it pulls. Bundler-safe: no dynamic `import()` anywhere.
  */
 export async function ensureZeroTouchOllama(
   preferredPort: number,
@@ -238,17 +376,24 @@ export async function ensureZeroTouchOllama(
     onProgress("disabled", null, "Zero-touch bootstrap disabled via RIPPA_ZERO_TOUCH_OLLAMA=0.");
     return plan;
   }
-  const hostBinary = findHostOllamaBinary();
+  let hostBinary = findHostOllamaBinary();
   if (hostBinary) {
     onProgress("detect", null, `Found host Ollama binary at ${hostBinary} — managed runtime stays isolated.`);
+  } else if (wantsHostInstall()) {
+    onProgress("detect", null, "No host Ollama binary — zero-touch auto-install starting.");
+    const installed = await ensureHostOllamaInstalled(onProgress);
+    hostBinary = findHostOllamaBinary();
+    if (!installed || !hostBinary) {
+      const installer = getOfficialInstallerInfo();
+      onProgress(
+        "detect",
+        null,
+        `Host auto-install did not land a binary — portable runtime (no admin). ` +
+          `Official installer at ${installer.url}.`,
+      );
+    }
   } else {
-    const installer = getOfficialInstallerInfo();
-    onProgress(
-      "detect",
-      null,
-      `No host Ollama binary — portable runtime (no admin). ` +
-        `Official installer at ${installer.url} when RIPPA_OLLAMA_HOST_INSTALL=1.`,
-    );
+    onProgress("detect", null, "No host Ollama binary — portable runtime (host install disabled).");
   }
   const { port, healed } = await resolveHealedPort(preferredPort);
   const model = recommendedPrimaryModel();
@@ -257,8 +402,7 @@ export async function ensureZeroTouchOllama(
   } else {
     onProgress("port", null, `Port ${port} is free — binding there.`);
   }
-  // Lazy import: bundled-ollama never imports this file, so no cycle.
-  const { setDynamicOllamaPort } = await import("./bundled-ollama.js");
+  // Static import at the top (pkg cannot resolve dynamic import callbacks).
   setDynamicOllamaPort(port);
   const plan: ZeroTouchPlan = { hostBinary, usingBundledRuntime: true, port, model };
   lastPlan = plan;
@@ -267,11 +411,11 @@ export async function ensureZeroTouchOllama(
 }
 
 /** Default progress sink: engine bus when available, console otherwise. */
-function defaultProgressReporter(stage: string, percent: number | null, detail: string): void {
+export function defaultProgressReporter(stage: string, percent: number | null, detail: string): void {
   const suffix = percent === null ? "" : ` (${percent}%)`;
   console.log(`[OllamaWatchdog] ${stage}${suffix} — ${detail}`);
   try {
-    const { publishNodeEvent } = require("./nodeEvents") as typeof import("./nodeEvents");
+    // Static import at the top (pkg cannot resolve dynamic import callbacks).
     publishNodeEvent({ kind: "info", title: `Ollama bootstrap: ${stage}`, detail });
   } catch {
     // Bus unavailable (tests) — the console line above is the report.

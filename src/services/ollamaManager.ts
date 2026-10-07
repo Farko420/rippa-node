@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import net from "node:net";
 import axios from "axios";
 import { env, reloadEnv } from "../config";
 import {
@@ -27,6 +28,7 @@ import {
   bundledOllama,
   ensureBundledBinary,
   resolveBundledOllamaPort,
+  setDynamicOllamaPort,
   sweepOrphanedOllama,
 } from "./bundled-ollama";
 
@@ -601,7 +603,8 @@ class OllamaManager {
         // crash-restart ladder, not in a spawn loop.
         if (await this.childSawBindConflict()) {
           try {
-            const { setDynamicOllamaPort } = await import("./bundled-ollama.js");
+            // Static import at the top (pkg snapshot cannot resolve
+            // dynamic import callbacks).
             const healed = await this.claimEphemeralPort();
             if (healed !== null) {
               setDynamicOllamaPort(healed);
@@ -773,7 +776,7 @@ class OllamaManager {
 
   /** Claims a free ephemeral loopback port (bind 0, read, release). */
   private async claimEphemeralPort(): Promise<number | null> {
-    const net = await import("node:net");
+    // Static `net` import at the top (pkg cannot resolve dynamic imports).
     return new Promise((resolve) => {
       const server = net.createServer();
       server.unref?.();

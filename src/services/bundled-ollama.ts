@@ -1,6 +1,7 @@
-﻿import { spawn, type ChildProcess } from "node:child_process";
+﻿import { execFile, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 import { PassThrough } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import axios from "axios";
@@ -222,7 +223,7 @@ function isOllamaImageName(name: string): boolean {
  * the sweep instead of throwing during boot.
  */
 async function runInventory(cmd: string, args: string[]): Promise<string> {
-  const { execFile } = await import("node:child_process");
+  // Static `execFile` import at the top (pkg cannot resolve dynamic imports).
   return new Promise((resolve) => {
     execFile(cmd, args, { windowsHide: true, timeout: 10_000 }, (error, stdout) => {
       resolve(error ? "" : String(stdout ?? ""));
@@ -670,7 +671,7 @@ export async function extractTarTree(archivePath: string, destDir: string): Prom
 
   // Node 22.15+/23+ exposes zstd on zlib. Older runtimes cannot read a .tar.zst at
   // all, so this fails loudly rather than writing a corrupt runtime.
-  const zlib = await import("node:zlib");
+  // (`zlib` is a static import at the top — pkg cannot resolve dynamic imports.)
   if (isZstd && typeof zlib.createZstdDecompress !== "function") {
     throw new Error(
       "this Node runtime cannot decompress zstd (tar.zst). Ollama's Linux release is " +

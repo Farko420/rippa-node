@@ -94,7 +94,7 @@ import {
   listRemoteTasks,
   updateRemoteTask,
 } from "./services/remoteTasks";
-import { sanitizeFilename } from "./services/multipartParser";
+import { sanitizeFilename, parseMultipart } from "./services/multipartParser";
 import { dataFilePath } from "./utils/paths";
 
 /**
@@ -1882,7 +1882,7 @@ export function createApp(): Express {
       if (/multipart\/form-data/i.test(contentType) && Buffer.isBuffer(req.body)) {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-upload-"));
         try {
-          const { parseMultipart } = await import("./services/multipartParser.js");
+          // Static import at the top (pkg snapshot cannot resolve dynamic imports).
           const parsed = parseMultipart(req.body, contentType, tmpDir);
           const first = parsed.files[0];
           if (!first) {
