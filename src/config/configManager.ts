@@ -69,6 +69,15 @@ export interface RippaNodeConfig {
    */
   OLLAMA_MANAGED?: boolean;
   /**
+   * THERMAL GOVERNOR — the cooling gap between forage passes.
+   *
+   * Seconds (or milliseconds — see `resolveIdleThrottleMs`), clamped to
+   * 10–30s. Carried through `normalizeConfig` like every other persisted
+   * field: `writeConfig` rebuilds rather than merges, so a field not named
+   * there is deleted on the next GUI save. Unset means the 20s midpoint.
+   */
+  IDLE_THROTTLE?: string;
+  /**
    * GitHub token the OTA updater authenticates release downloads with.
    *
    * CARRIED THROUGH `normalizeConfig` FOR THE SAME REASON `MESH_KEY` IS:
@@ -305,6 +314,10 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
     // `=== true` (not truthiness) so a stray "false" STRING from a hand-edited
     // config does not read as enabled. Absent/undefined means unmanaged.
     OLLAMA_MANAGED: record["OLLAMA_MANAGED"] === true,
+    // THERMAL GOVERNOR — carried through for the same rebuild-not-merge
+    // reason: without this the operator's cooling gap is wiped on the next
+    // unrelated GUI save and the node reverts to the default pacing.
+    IDLE_THROTTLE: pickString(record, "IDLE_THROTTLE", "idle_throttle") || undefined,
     node_role: role,
     master_node_url: masterLocal,
     dashboard_pin: pin,
@@ -620,6 +633,11 @@ export function applyConfigToEnv(cfg: ConfigInput | RippaNodeConfig | null, forc
   }
   if (config.cloud_link_code) {
     put("CLOUD_LINK_CODE", config.cloud_link_code);
+  }
+  // THERMAL GOVERNOR — pushed only when the operator set one, so `.env`
+  // keeps working and an unset config does not shadow it with a blank.
+  if (config.IDLE_THROTTLE) {
+    put("IDLE_THROTTLE", config.IDLE_THROTTLE);
   }
 }
 

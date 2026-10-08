@@ -1,6 +1,6 @@
 {
   "name": "rippa-node",
-  "version": "1.0.78",
+  "version": "1.0.79",
   "description": "Rippa Node â€” Deep Brain worker for Rippa Adventures: headless scraping, local LLM extraction (Ollama), and autonomous feature research.",
   "main": "dist/index.js",
   "scripts": {
@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck",
     "test:brain-parity": "tsx scripts/brain-parity-check.ts .parity/bundle.json",
-    "test:verify": "npm run build && node scripts/verify-units.mjs && node scripts/verify-fixes.mjs && node scripts/verify-watchdog.mjs && node scripts/verify-governor.mjs && node scripts/verify-ingestion.mjs",
+    "test:verify": "npm run build && node scripts/verify-units.mjs && node scripts/verify-fixes.mjs && node scripts/verify-watchdog.mjs && node scripts/verify-governor.mjs && node scripts/verify-ingestion.mjs && node scripts/verify-forage.mjs",
+    "test:forage": "npm run build && node scripts/verify-forage.mjs",
     "test:ingestion": "npm run build && node scripts/verify-ingestion.mjs",
     "test:governor": "npm run build && node scripts/verify-governor.mjs",
     "test:fleet": "npm run build && node scripts/verify-fleet-roles.mjs",

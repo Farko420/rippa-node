@@ -37,8 +37,31 @@ import type { SwarmClient, SwarmTask } from "../network/SwarmClient";
 
 /** How often the priority tier asks the Mothership for work. */
 const PRIORITY_POLL_MS = 15_000;
-/** Gap between foraging passes once the previous one finished. */
+/**
+ * THERMAL GOVERNOR — the cooling gap between forage passes.
+ *
+ * A node left foraging 24/7 would otherwise pin CPU/GPU forever and melt its
+ * host. This fixed sleep between passes lets cooling recover; production
+ * honours `IDLE_THROTTLE` / `IDLE_THROTTLE_MS` / `IDLE_THROTTLE_SECONDS`
+ * (seconds or milliseconds, clamped to 10–30s — see `resolveIdleThrottleMs`),
+ * so operators can tune the duty cycle without rebuilding. No env set means
+ * the 20s midpoint: cool enough for a laptop lid closed overnight, busy
+ * enough that the fleet still learns.
+ */
 const IDLE_PASS_GAP_MS = 60_000;
+/** Floor of the thermal clamp — below this the cooler never recovers. */
+const IDLE_THROTTLE_MIN_MS = 10_000;
+/** Ceiling of the thermal clamp — above this the node barely forages. */
+const IDLE_THROTTLE_MAX_MS = 30_000;
+/**
+ * Default when no env override is set — the midpoint of the clamp.
+ *
+ * Read by the status panels (and the engine's start line) so the operator can
+ * see the pacing without opening the source. The engine itself falls back to
+ * its legacy constant when `resolveIdleThrottleMs()` returns undefined, which
+ * keeps the constructor's explicit-override-wins shape intact.
+ */
+export const IDLE_THROTTLE_DEFAULT_MS = 20_000;
 
 /** The two tiers. */
 export type TaskTier = "priority" | "idle";
@@ -81,7 +104,14 @@ export interface TaskEngineDeps {
   governor?: ResourceGovernor;
   /** Overridable for tests; defaults to the 15s Mothership poll. */
   priorityPollMs?: number;
-  /** Overridable for tests; defaults to the gap between foraging passes. */
+  /**
+   * THERMAL PACING — the cooling gap between forage passes.
+   *
+   * Overridable for tests; production reads `IDLE_THROTTLE` from the
+   * environment (see `resolveIdleThrottleMs`), clamped to 10–30s. The gap lets
+   * the host's cooling recover between GPU/CPU-heavy passes so a node left
+   * foraging 24/7 never melts its host.
+   */
   idleGapMs?: number;
 }
 
@@ -113,6 +143,19 @@ export class TaskEngine {
   /** Guards against two polls in flight when a heartbeat also pushes work. */
   private polling = false;
   /**
+   * THE INTERRUPT — the AbortController behind idle preemption.
+   *
+   * Owned by the engine, armed per forage pass, fired by `dispatch()` the
+   * instant a PRIORITY task arrives. The forager's probe carries its signal
+   * into the in-flight Playwright navigation and the Ollama HTTP body, so the
+   * background scrape/inference dies MID-flight — the deck is cleared for the
+   * user task instead of finishing background work nobody needs any more. A
+   * fresh controller is armed for every pass (see `armIdleAbort`), because an
+   * AbortSignal is single-shot: once fired it stays fired, and reusing it
+   * would abort every future pass on sight.
+   */
+  private idleAbort: AbortController | null = null;
+  /**
    * Priority tasks executing right now. Bounded by the Resource Governor's
    * `max_concurrent_tasks`; this is the number {@link atCapacity} compares
    * against, and what makes "delay pulling new work" observable from outside.
@@ -140,7 +183,10 @@ export class TaskEngine {
 
   constructor(private readonly deps: TaskEngineDeps) {
     this.priorityPollMs = deps.priorityPollMs ?? PRIORITY_POLL_MS;
-    this.idleGapMs = deps.idleGapMs ?? IDLE_PASS_GAP_MS;
+    // Explicit test override wins; otherwise the operator's IDLE_THROTTLE env
+    // (10–30s clamp); otherwise the legacy 60s constant. The harness passes
+    // hours so its parked sleeps never fire mid-assertion.
+    this.idleGapMs = deps.idleGapMs ?? resolveIdleThrottleMs() ?? IDLE_PASS_GAP_MS;
   }
 
   /**
@@ -176,6 +222,22 @@ export class TaskEngine {
   }
 
   /**
+   * PRIORITY vs IDLE_FORAGE at a glance — for the status panels.
+   *
+   * `tier` is the live tier; `idleThrottleMs` is the thermal pacing between
+   * forage passes (the operator's IDLE_THROTTLE, clamped 10–30s). Surfaced so
+   * an operator can see "foraging every 20s, priority preempts instantly"
+   * without opening the source.
+   */
+  describeTiers(): { tier: TaskTier; idleThrottleMs: number; priorityPollMs: number } {
+    return {
+      tier: this.currentTier(),
+      idleThrottleMs: this.idleGapMs,
+      priorityPollMs: this.priorityPollMs,
+    };
+  }
+
+  /**
    * Starts both tiers. Idempotent, and never blocks the caller.
    *
    * The priority loop polls once immediately so a node that boots into a
@@ -196,8 +258,9 @@ export class TaskEngine {
     this.idleLoop = this.runIdleLoop();
 
     console.log(
-      `[Swarm] Task engine started — priority tier polls every ` +
-        `${this.priorityPollMs / 1000}s, idle tier forages every ${this.idleGapMs / 1000}s.`,
+      `[Swarm] Task engine started — PRIORITY tier polls every ` +
+        `${this.priorityPollMs / 1000}s, IDLE_FORAGE tier forages every ${this.idleGapMs / 1000}s ` +
+        `(IDLE_THROTTLE thermal pacing; a priority task aborts the in-flight pass at once).`,
     );
   }
 
@@ -247,6 +310,12 @@ export class TaskEngine {
         `${fresh.length} task(s) queued${wasIdle ? ` — pausing idle foraging.` : `.`}`,
     );
 
+    // THE INTERRUPT: fire the AbortController FIRST, so the in-flight
+    // Playwright navigation and Ollama HTTP body die immediately — the deck is
+    // cleared for the PRIORITY task instead of finishing a background scrape
+    // nobody needs any more. The gate wake below is the second tripwire for
+    // foragers parked between stages.
+    this.abortIdlePass("priority task arrived");
     // Woken before anything else: a forager already inside a page load must
     // stop waiting on it immediately, not at the next stage boundary.
     this.openAll(this.interruptWaiters);
@@ -294,7 +363,18 @@ export class TaskEngine {
   }
 
   /**
-   * THE IDLE TIER — forage the local database, forever.
+   * THE IDLE TIER — forage the Mothership queue, then the local database.
+   *
+   * Each pass arms a FRESH AbortController (a fired signal stays fired, so
+   * reuse would abort the next pass on sight). When idle the node asks the
+   * Mothership for a `forage_target` first and falls back to its local queue;
+   * either way the pass scrapes, extracts, persists and feeds.
+   *
+   * THERMAL PACING: after a completed pass the loop sleeps `idleGapMs`
+   * (IDLE_THROTTLE, 10–30s clamp) so the host's cooling recovers — a node
+   * foraging 24/7 must never melt its host. A preempted pass skips the sleep
+   * (see below) and a new idle task is only requested once the priority queue
+   * is at zero (see `waitForIdleWindow`).
    *
    * The order of the two waits at the top of every iteration is the whole
    * design. Yielding comes FIRST, so the loop parks on the resume gate before
@@ -307,7 +387,10 @@ export class TaskEngine {
       await this.waitForIdleWindow();
       if (!this.running) break;
 
-      // 2. One pass. The probe inside makes this yield at its first checkpoint.
+      // 2. Arm a fresh interrupt for this pass, then run it. The probe inside
+      //    carries the signal into the scrape + inference, so a PRIORITY task
+      //    arriving mid-pass aborts the in-flight I/O at once.
+      this.armIdleAbort();
       let preempted = false;
       /*
         Status telemetry. The node is genuinely busy — a Playwright page load and
@@ -332,6 +415,9 @@ export class TaskEngine {
           `[Swarm] Idle forage pass failed — ${error instanceof Error ? error.message : String(error)}`,
         );
       } finally {
+        // The pass is over — disarm the controller so a LATE abort cannot leak
+        // into the next pass (a fired signal stays fired; see `armIdleAbort`).
+        this.idleAbort = null;
         /*
           Cleared ONLY while the idle tier still owns the node. If a Mothership
           task arrived mid-pass, the priority tier has already claimed this
@@ -353,10 +439,16 @@ export class TaskEngine {
       */
       if (preempted) continue;
 
-      // 3. Breathe. One page load a minute is already a busy node; going faster
-      //    turns "autonomous" into "laptop fan", and throttling here is what
-      //    leaves the priority loop free to be scheduled promptly.
-      await Promise.race([sleep(this.idleGapMs), this.shutdown.promise]);
+      // 3. THERMAL GOVERNOR. Cool the host between passes: one completed pass
+      //    then `idleGapMs` of sleep (IDLE_THROTTLE, 10–30s), so a node
+      //    foraging 24/7 never melts its host. The sleep is interruptible —
+      //    a PRIORITY task arriving mid-cooldown wakes the loop at once via
+      //    the resume-gate race below, so pacing never delays user work.
+      await Promise.race([
+        sleep(this.idleGapMs),
+        this.shutdown.promise,
+        this.park("interrupt"),
+      ]);
     }
   }
 
@@ -377,6 +469,13 @@ export class TaskEngine {
    * THE PROBE HANDED TO THE FORAGER — the engine's entire vocabulary to the
    * idle tier. It exposes state and gates; it never reaches into the forager.
    *
+   * `signal` is the live AbortController signal for the CURRENT pass: the
+   * in-flight Playwright navigation and Ollama HTTP body race it, so a
+   * PRIORITY task arriving mid-scrape or mid-inference clears the deck at
+   * once instead of waiting for the next stage boundary. The stage
+   * checkpoints (`shouldYield` / `waitForInterrupt`) remain as the second
+   * tripwire for aborts that land between stages.
+   *
    * Both waits resolve IMMEDIATELY when the condition they are waiting for is
    * already true. That asymmetry is what makes them safe to call from inside a
    * race: a forager that starts a stage during a preemption gets stopped at
@@ -388,6 +487,7 @@ export class TaskEngine {
       shouldYield: () => this.isProcessingPriority,
       waitForInterrupt: () => this.park("interrupt"),
       waitForResume: () => this.park("resume"),
+      signal: this.idleAbort?.signal,
     };
   }
 
@@ -399,6 +499,40 @@ export class TaskEngine {
     }
     if (!this.isProcessingPriority) return Promise.resolve();
     return new Promise<void>((resolve) => this.resumeWaiters.push(resolve));
+  }
+
+  /**
+   * ARMS A FRESH INTERRUPT FOR THE NEXT FORAGE PASS.
+   *
+   * Called at the top of every idle pass. A new controller every time because
+   * an AbortSignal is single-shot — once fired it stays fired, and reusing
+   * the previous pass's controller would abort the new pass on sight before
+   * it scraped a single byte.
+   */
+  private armIdleAbort(): void {
+    this.idleAbort = new AbortController();
+  }
+
+  /**
+   * FIRES THE IDLE INTERRUPT — the deck-clearing half of preemption.
+   *
+   * Called by `dispatch()` the instant a PRIORITY task arrives. Aborting the
+   * controller cancels the in-flight Playwright navigation and the Ollama HTTP
+   * body inside the forager; the pass then throws `PreemptedError`, keeps its
+   * session cursor, and parks until the priority queue drains to zero. Safe to
+   * call with no pass running (a cooldown sleep, a parked loop): aborting with
+   * no listener just wakes the gate race, which is exactly what "a priority
+   * task arrived during the thermal sleep" must do.
+   */
+  private abortIdlePass(reason: string): void {
+    const controller = this.idleAbort;
+    if (!controller || controller.signal.aborted) return;
+    try {
+      controller.abort(new PreemptedError(reason));
+    } catch {
+      // Aborting must never break dispatch: the priority task is already
+      // queued and the gate wake below still yields the forager.
+    }
   }
 
   /** Opens every waiter on a list, leaving the list empty. */
@@ -589,4 +723,32 @@ export class TaskEngine {
 /** Waits `ms`, without keeping the process alive on its own. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * THERMAL GOVERNOR — resolves the cooling gap between forage passes.
+ *
+ * Reads `IDLE_THROTTLE` (aliases `IDLE_THROTTLE_MS`, `IDLE_THROTTLE_SECONDS`),
+ * accepting either seconds or milliseconds: values ≤ 1000 are read as seconds
+ * (an operator writing "20" means twenty seconds, not twenty milliseconds),
+ * anything larger as milliseconds. The result is clamped to 10–30s — below
+ * 10s the host's cooling never recovers, above 30s the node barely forages.
+ *
+ * Returns `undefined` when no override is set, so the caller falls back to
+ * its default. Exported for the verification harness and the status panels.
+ */
+export function resolveIdleThrottleMs(
+  envSource: NodeJS.ProcessEnv = process.env,
+): number | undefined {
+  const raw =
+    envSource["IDLE_THROTTLE"] ?? envSource["IDLE_THROTTLE_MS"] ?? envSource["IDLE_THROTTLE_SECONDS"];
+  if (raw === undefined || raw === null) return undefined;
+  const text = String(raw).trim();
+  if (!text) return undefined;
+  const parsed = Number(text);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  // `IDLE_THROTTLE_SECONDS` is always seconds; the bare/MS names accept both.
+  const explicitSeconds = envSource["IDLE_THROTTLE_SECONDS"] !== undefined;
+  const ms = explicitSeconds || parsed <= 1000 ? parsed * 1000 : parsed;
+  return Math.min(IDLE_THROTTLE_MAX_MS, Math.max(IDLE_THROTTLE_MIN_MS, Math.floor(ms)));
 }

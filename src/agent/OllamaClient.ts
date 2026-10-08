@@ -125,9 +125,11 @@ export type VerifiedFact = z.infer<typeof verifiedFactSchema>;
  *  - CRITICAL: every imperial measurement must be converted to metric.
  *  - Output is a single JSON object matching `verified_knowledge`.
  */
-const SYSTEM_PROMPT = `You are an Australian outdoor guide with decades of experience in the Queensland bush, 4WD touring, bushwalking and remote-area safety.
+const SYSTEM_PROMPT = `You are an Australian outdoor guide with decades of experience in the Queensland bush, 4WD touring, bushwalking and remote-area safety. Write like a fair-dinkum local: warm, direct Aussie tone, plain words, no yank slang.
 
-From the TEXT supplied by the user, extract the single most useful and verifiable fact for an outdoor-adventure knowledge base. Cover these kinds of facts when present: locations, rules/regulations, hazards, and descriptions of places or conditions.
+From the TEXT supplied by the user, extract the single most useful and verifiable fact for an outdoor-adventure knowledge base. Cover these kinds of facts when present: locations, rules/regulations, hazards, and descriptions of places or conditions. Favour what changed recently: new trail conditions, updated access rules, closures, fees, permits, or missing historical facts.
+
+CRITICAL MEASUREMENT RULE: The source text may use imperial units. You MUST convert ALL imperial measurements to metric before writing anything: feet -> metres, miles -> kilometres, pounds -> kilograms, ounces -> grams, inches -> centimetres, Fahrenheit -> Celsius. Never leave an imperial unit (ft, feet, mi, miles, lb, lbs, in, degrees F) anywhere in your output. Round sensibly (e.g. "1,500 ft" -> "457 metres").
 
 CRITICAL MEASUREMENT RULE: The source text may use imperial units. You MUST convert ALL imperial measurements to metric before writing anything: feet -> metres, miles -> kilometres, pounds -> kilograms, ounces -> grams, inches -> centimetres, Fahrenheit -> Celsius. Never leave an imperial unit (ft, feet, mi, miles, lb, lbs, in, degrees F) anywhere in your output. Round sensibly (e.g. "1,500 ft" -> "457 metres").
 
@@ -187,12 +189,24 @@ export class OllamaClient {
    * Extracts a `verified_knowledge`-shaped fact from raw page text.
    * Returns `null` when the model is unreachable or the payload is not
    * valid JSON matching the schema — callers decide what to do then.
+   *
+   * PREEMPTIBLE: `signal` aborts the Ollama HTTP request mid-generation. The
+   * forager passes the engine's controller signal so a PRIORITY task arriving
+   * mid-inference cancels the local 7B run immediately instead of burning GPU
+   * seconds on a fact nobody will read. An abort returns `null` (the "no fact"
+   * contract) — never throws — so a preempted pass resumes cleanly with no
+   * backoff, no cooldown and no phantom failure.
+   *
+   * The extraction runs in the established Aussie tone with strictly metric
+   * measurements (see SYSTEM_PROMPT).
    */
-  async extractFacts(rawText: string): Promise<VerifiedFact | null> {
+  async extractFacts(rawText: string, signal?: AbortSignal): Promise<VerifiedFact | null> {
     const input = rawText.slice(0, MAX_INPUT_CHARS);
+    if (signal?.aborted) return null;
     try {
-      return await this.extractFactsWithModel(input, await this.resolveModel());
+      return await this.extractFactsWithModel(input, await this.resolveModel(), signal);
     } catch (error) {
+      if (isAbortError(error, signal)) return null;
       // AUTO-FAILOVER: the primary model failed to load or generate — pull and
       // switch to FALLBACK_MODEL, then retry exactly once. A second failure is
       // reported to the caller rather than looping forever.
@@ -203,8 +217,9 @@ export class OllamaClient {
       );
       try {
         await this.pullModel(FALLBACK_MODEL);
-        return await this.extractFactsWithModel(input, FALLBACK_MODEL);
+        return await this.extractFactsWithModel(input, FALLBACK_MODEL, signal);
       } catch (fallbackError) {
+        if (isAbortError(fallbackError, signal)) return null;
         console.warn(
           `[Ollama] Fallback model also failed — ${
             fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
@@ -216,7 +231,11 @@ export class OllamaClient {
   }
 
   /** The actual `/api/chat` call, shared by the primary and fallback attempts. */
-  private async extractFactsWithModel(input: string, model: string): Promise<VerifiedFact | null> {
+  private async extractFactsWithModel(
+    input: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<VerifiedFact | null> {
     /*
       THE BADGE IS MARKED BUSY FOR THE DURATION OF THE REQUEST.
 
@@ -228,24 +247,31 @@ export class OllamaClient {
     */
     noteEngineActivity("busy", model);
     try {
-      const { data } = await this.client.post<ChatResponse>("/api/chat", {
-        model,
-        stream: false,
-        format: "json", // force JSON-only output from the model
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: `TEXT:\n${input}` },
-        ],
-        options: {
-          temperature: 0.1, // deterministic extraction
-          num_ctx: 8192,
-          // RESOURCE GOVERNOR: inject thread limit for CPU-constrained environments
-          num_thread: this.getThreadLimit(),
+      const { data } = await this.client.post<ChatResponse>(
+        "/api/chat",
+        {
+          model,
+          stream: false,
+          format: "json", // force JSON-only output from the model
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user", content: `TEXT:\n${input}` },
+          ],
+          options: {
+            temperature: 0.1, // deterministic extraction
+            num_ctx: 8192,
+            // RESOURCE GOVERNOR: inject thread limit for CPU-constrained environments
+            num_thread: this.getThreadLimit(),
+          },
+          // AGGRESSIVE VRAM UNLOADING — flush this model out of VRAM almost
+          // immediately after replying, so Playwright/GPU work is never starved.
+          keep_alive: KEEP_ALIVE,
         },
-        // AGGRESSIVE VRAM UNLOADING — flush this model out of VRAM almost
-        // immediately after replying, so Playwright/GPU work is never starved.
-        keep_alive: KEEP_ALIVE,
-      });
+        // PREEMPTIBLE INFERENCE: axios honours AbortSignal natively, so the
+        // engine's controller cancels the HTTP body mid-generation and Ollama
+        // drops the run server-side. `signal: undefined` is a passthrough.
+        signal ? { signal } : undefined,
+      );
 
       const content = data?.message?.content;
       if (!content) {
@@ -474,6 +500,23 @@ export class OllamaClient {
 function matchesModel(installed: string[], target: string): boolean {
   const bare = target.split(":")[0];
   return installed.some((name) => name === target || name.split(":")[0] === bare);
+}
+
+/**
+ * True when `error` is the engine's preemption abort rather than a real
+ * inference failure. Axios surfaces a `CanceledError` (`code: ERR_CANCELED`);
+ * fetch-style aborts surface an `AbortError` name; either may ALSO carry the
+ * caller's signal already fired. Any one of the three means "interrupted",
+ * never "broken" — so the caller returns null instead of failing over.
+ */
+function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true;
+  if (error instanceof Error) {
+    if (error.name === "AbortError" || error.name === "CanceledError") return true;
+    const code = (error as { code?: unknown }).code;
+    if (code === "ERR_CANCELED" || code === "ABORT_ERR") return true;
+  }
+  return false;
 }
 
 /**

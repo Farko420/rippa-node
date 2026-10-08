@@ -98,6 +98,14 @@ const STAGES: readonly ForageStage[] = ["acquire", "extract", "persist", "feed"]
  * the node is not going to need anyway; `waitForResume` is for parking between
  * passes, so an idle node sleeps on the priority queue instead of hammering the
  * database for work it is not allowed to start.
+ *
+ * `signal` is the live AbortController signal for the CURRENT pass. The stage
+ * checkpoints consult `shouldYield()`; the work INSIDE a stage (the Playwright
+ * navigation, the Ollama HTTP body) races `signal` — so a PRIORITY task
+ * arriving mid-scrape or mid-inference aborts the in-flight I/O at once
+ * instead of waiting for the next boundary. The signal is optional so older
+ * probes (and the verification harness stubs) keep working: without it the
+ * forager degrades to pure stage-boundary preemption.
  */
 export interface PreemptionProbe {
   /** True the moment the Mothership hands this node a task. */
@@ -106,13 +114,21 @@ export interface PreemptionProbe {
   waitForInterrupt(): Promise<void>;
   /** Resolves when the priority queue has drained and foraging may continue. */
   waitForResume(): Promise<void>;
+  /** Live abort signal for the current pass, or undefined when unarmed. */
+  signal?: AbortSignal;
 }
 
 /** What the engine hands the forager so it can reach the outside world. */
 export interface ForagerDeps {
   scraper: ScraperService;
   ollama: OllamaClient;
-  swarm: SwarmClient;
+  /**
+   * The Mothership link. Typed structurally (not as `SwarmClient`) so the
+   * idle tier depends on the two methods it actually uses — `pushForageDiscovery`
+   * for the learning loop, `requestForageTarget` for cloud-directed intake —
+   * and the verification harness can stub them without a full client.
+   */
+  swarm: Pick<SwarmClient, "pushForageDiscovery" | "requestForageTarget">;
 }
 
 /** The outcome of exactly one pass. */
@@ -150,6 +166,36 @@ export class AutonomousForager {
   private learned = 0;
   private fed = 0;
   private preemptions = 0;
+  /**
+   * TEST SEAM — forces `runPass` past the master/brain gate.
+   *
+   * Production never sets this: the gate (`NODE_ROLE === "master"` plus a
+   * ready Deep Brain) is what stops satellites and brainless nodes foraging.
+   * The verification harness sets it so the interrupt + remote-target paths
+   * can be exercised without a SQLite brain on disk.
+   */
+  forceEligibleForTests = false;
+  /**
+   * TEST SEAMS — persistence callbacks the harness injects.
+   *
+   * Production leaves every one `undefined` and the stages talk to SQLite
+   * directly. The harness supplies no-op callbacks so `persist` / `feed`
+   * bookkeeping (cooldowns, `markPlaceVerified`, `insertBrainChunk`) can run
+   * without a database file. Each is optional individually: set the ones the
+   * exercised path touches, leave the rest on the real implementation.
+   */
+  testHooks: {
+    recordCrawlCooldown?: (url: string, ms: number, reason: string) => void;
+    selectActiveCrawlCooldowns?: () => string[];
+    selectForageTargets?: (limit: number) => ForageTargetRow[];
+    selectScrapedSourceUrls?: () => string[];
+    insertRawLore?: (kind: string, text: string, url: string | null) => number;
+    setRawLoreStatus?: (id: number, status: string) => void;
+    insertVerifiedKnowledge?: (fact: unknown, sourceUrl: string | null) => number;
+    insertBrainChunk?: (chunk: unknown) => number;
+    markKnowledgeSynced?: (ids: number[]) => void;
+    markPlaceVerified?: (placeId: string | null, confidence?: number) => void;
+  } = {};
 
   constructor(private readonly deps: ForagerDeps) {}
 
@@ -168,7 +214,7 @@ export class AutonomousForager {
   async runPass(probe: PreemptionProbe): Promise<ForageOutcome> {
     // Satellites are stateless, and a Master whose brain failed to open would
     // otherwise throw straight out of `getDeepBrain()` below.
-    if (env.NODE_ROLE !== "master" || !isDeepBrainReady()) {
+    if (!this.forceEligibleForTests && (env.NODE_ROLE !== "master" || !isDeepBrainReady())) {
       return { status: "skipped", message: "no local brain on this node.", fed: false };
     }
 
@@ -177,7 +223,7 @@ export class AutonomousForager {
     }
 
     try {
-      const session = this.session ?? this.openSession();
+      const session = this.session ?? (await this.openSession(probe));
       if (!session) {
         return {
           status: "empty",
@@ -255,8 +301,8 @@ export class AutonomousForager {
   }
 
   /** Opens a session for the next target, or returns null when there is none. */
-  private openSession(): ForageSession | null {
-    const target = this.nextTarget();
+  private async openSession(probe: PreemptionProbe): Promise<ForageSession | null> {
+    const target = await this.nextTarget(probe);
     if (!target) return null;
     this.session = {
       target,
@@ -276,20 +322,30 @@ export class AutonomousForager {
   /**
    * THE CHOICE, in priority order:
    *
-   *   1. whatever `selectForageTargets` reports as most overdue;
-   *   2. a seed source, but only once the brain's own backlog is clear.
+   *   1. a `forage_target` from the Mothership — a map location with a low
+   *      `confidence_score`, or a place unverified for months — when the cloud
+   *      has a forage queue to answer from;
+   *   2. whatever `selectForageTargets` reports as most overdue locally;
+   *   3. a seed source, but only once the brain's own backlog is clear.
+   *
+   * The Mothership is asked FIRST so cloud-directed verification wins over
+   * local staleness: the fleet learns what the map needs, not just what this
+   * mirror noticed. An older cloud (or an unreachable one) answers null and
+   * the node forages locally — identical behaviour to before, no log spam.
    *
    * Resuming is handled before this point — `runPass` only calls it when there
    * is no saved session, so a resumed pass can never be talked out of its
    * cursor by a newer, more interesting target.
    */
-  private nextTarget(): ForageTargetRow | null {
+  private async nextTarget(probe: PreemptionProbe): Promise<ForageTargetRow | null> {
+    const remote = await this.nextRemoteTarget(probe);
+    if (remote) return remote;
     const now = Date.now();
     // Read fresh on every pick, so a cooldown armed mid-pass takes effect on
     // the NEXT selection — this is the explicit "queue advances past the
     // zero-yield URL" step, not a side effect of anything else.
     const cooled = this.cooledDownUrls();
-    for (const candidate of selectForageTargets(TARGET_BATCH_LIMIT)) {
+    for (const candidate of this.localTargets()) {
       const key = targetKey(candidate);
       // A URL still under its zero-yield cooldown is skipped outright — it was
       // read, it yielded nothing, and re-reading it sooner adds no knowledge.
@@ -306,6 +362,62 @@ export class AutonomousForager {
   }
 
   /**
+   * THE MOTHERSHIP'S PICK — a cloud-directed `forage_target`.
+   *
+   * Returns null (forage locally) when the cloud has no forage queue, has
+   * nothing queued right now, or cannot be reached — all three are normal on
+   * an idle node and none is worth a log line. A yielded probe also returns
+   * null: a PRIORITY task arrived while the request was in flight, and the
+   * pass must hand control back rather than start work it cannot finish.
+   *
+   * Cooldowns and backoff are honoured for remote targets too: a URL the node
+   * already knows yielded nothing is not re-scraped just because the cloud
+   * suggested it again.
+   */
+  private async nextRemoteTarget(probe: PreemptionProbe): Promise<ForageTargetRow | null> {
+    let remote: import("../network/SwarmClient").ForageTarget | null = null;
+    try {
+      remote = await this.deps.swarm.requestForageTarget(probe.signal);
+    } catch {
+      return null;
+    }
+    if (!remote || probe.shouldYield() || probe.signal?.aborted) return null;
+    const now = Date.now();
+    if (remote.url) {
+      if (this.cooledDownUrls().has(remote.url)) return null;
+      if ((this.backoffUntil.get(`remote:${remote.url}`) ?? 0) > now) return null;
+    }
+    if (remote.lastVerified && !remote.url && recentlyVerified(remote as never, now)) return null;
+    console.log(
+      `[Swarm] Foraging Mothership target "${remote.label}" — ` +
+        "fresh trail conditions, access rules and history.",
+    );
+    return {
+      kind: "incomplete_place",
+      url: remote.url,
+      label: remote.label,
+      place_id: remote.placeId ?? null,
+      lore_id: null,
+      last_verified: remote.lastVerified ?? null,
+      raw_text: null,
+    };
+  }
+
+  /**
+   * LOCAL QUEUE — the mirror's own backlog. Reads through the test seam when
+   * the harness injects one, so verification runs without a SQLite file.
+   */
+  private localTargets(): ForageTargetRow[] {
+    try {
+      const hook = this.testHooks.selectForageTargets;
+      if (hook) return hook(TARGET_BATCH_LIMIT);
+      return selectForageTargets(TARGET_BATCH_LIMIT);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * THE QUEUE'S "DO NOT RE-READ" SET — every URL currently under a zero-yield
    * cooldown. Guarded because a database hiccup must never take down the idle
    * loop: an empty set merely forgets the cooldown for one pass (recoverable),
@@ -313,6 +425,8 @@ export class AutonomousForager {
    */
   private cooledDownUrls(): Set<string> {
     try {
+      const hook = this.testHooks.selectActiveCrawlCooldowns;
+      if (hook) return new Set(hook());
       return new Set(selectActiveCrawlCooldowns());
     } catch {
       return new Set();
@@ -327,7 +441,13 @@ export class AutonomousForager {
    * question to be asking.
    */
   private nextSeed(): ForageTargetRow | null {
-    const scraped = new Set(selectScrapedSourceUrls());
+    let scraped: Set<string>;
+    try {
+      const hook = this.testHooks.selectScrapedSourceUrls;
+      scraped = new Set(hook ? hook() : selectScrapedSourceUrls());
+    } catch {
+      scraped = new Set();
+    }
     const cooled = this.cooledDownUrls();
     // Seeds obey the same cooldown as every other URL — a seed that yielded
     // nothing is no more worth a second visit than a mirrored place is.
@@ -354,7 +474,7 @@ export class AutonomousForager {
         await this.acquire(session, probe);
         break;
       case "extract":
-        await this.extract(session);
+        await this.extract(session, probe);
         break;
       case "persist":
         this.persist(session);
@@ -374,16 +494,19 @@ export class AutonomousForager {
    * gets one headless page load, written to `raw_lore` immediately so a crash
    * later in the pass still leaves the evidence on disk.
    *
-   * THE INTERRUPT RACE. A Playwright navigation cannot be cancelled — the only
-   * way out is to abandon the await and let the page finish on its own. Racing
-   * the scrape against the interrupt signal is what makes "instant preemption"
-   * true rather than aspirational: a priority task no longer waits out a 30s
-   * navigation it was going to interrupt anyway. The cost is honest and stated
-   * here — that stage's work is discarded and re-run on resume.
+   * THE INTERRUPT RACE. Playwright navigation honours the engine's
+   * AbortController directly (see ScraperService.scrape), so a PRIORITY task
+   * arriving mid-page-load cancels the navigation at once instead of waiting
+   * out a 30s load it was going to interrupt anyway. The race against the
+   * interrupt signal below stays as the second tripwire: an abort that lands
+   * between stages — or on a path with no signal — still yields at once.
    */
   private async acquire(session: ForageSession, probe: PreemptionProbe): Promise<void> {
     const { target } = session;
 
+    if (probe.signal?.aborted) {
+      throw new PreemptedError("scrape abandoned before it began");
+    }
     if (target.raw_text && target.raw_text.trim()) {
       session.text = target.raw_text;
       // Same yield accounting as the network path — a zero-candidate text is
@@ -396,7 +519,7 @@ export class AutonomousForager {
     }
 
     const scrape = withTimeout(
-      this.deps.scraper.scrape(target.url).then((result) => result.text),
+      this.deps.scraper.scrape(target.url, probe.signal).then((result) => result.text),
       SCRAPE_TIMEOUT_MS,
       `scrape of ${target.url}`,
     );
@@ -409,13 +532,16 @@ export class AutonomousForager {
       scrape,
       probe.waitForInterrupt().then(() => null),
     ]);
-    if (interrupted === null) {
+    if (interrupted === null || probe.signal?.aborted) {
+      // THE INTERRUPT: the engine fired its AbortController, which already
+      // cancelled the Playwright navigation / fetch inside `scrape()`. The
+      // deck is clear — throw so the pass yields with its cursor intact.
       throw new PreemptedError(`scrape of ${target.url}`);
     }
 
     session.text = interrupted;
     if (!session.loreId) {
-      session.loreId = insertRawLore("forage", interrupted, target.url);
+      session.loreId = this.hookableInsertRawLore("forage", interrupted, target.url);
     }
     this.noteYield(session);
   }
@@ -439,7 +565,12 @@ export class AutonomousForager {
     if (session.candidates > 0) return;
     const url = session.target.url;
     if (!url) return;
-    recordCrawlCooldown(url, ZERO_YIELD_COOLDOWN_MS, "0 place candidates");
+    const hook = this.testHooks.recordCrawlCooldown;
+    if (hook) {
+      hook(url, ZERO_YIELD_COOLDOWN_MS, "0 place candidates");
+    } else {
+      recordCrawlCooldown(url, ZERO_YIELD_COOLDOWN_MS, "0 place candidates");
+    }
     console.log(
       `[Swarm] 0 place candidates from "${session.target.label}" — ` +
         `URL marked completed, cooled down for 7 days.`,
@@ -449,13 +580,19 @@ export class AutonomousForager {
   /**
    * STAGE 2 — EXTRACT ONE SCORED FACT.
    *
-   * A null result is a normal outcome, not an error: the model was unreachable
-   * or returned something unparseable. The evidence stays in `raw_lore` and the
-   * row keeps its `unverified` status, so the very next pass retries it for
-   * free.
+   * A null result is a normal outcome, not an error: the model was unreachable,
+   * returned something unparseable, OR was preempted mid-generation (the
+   * engine's AbortController cancels the Ollama HTTP body and `extractFacts`
+   * resolves null). The evidence stays in `raw_lore` and the row keeps its
+   * `unverified` status, so the very next pass retries it for free.
    */
-  private async extract(session: ForageSession): Promise<void> {
-    session.fact = await this.deps.ollama.extractFacts(session.text ?? "");
+  private async extract(session: ForageSession, probe: PreemptionProbe): Promise<void> {
+    session.fact = await this.deps.ollama.extractFacts(session.text ?? "", probe.signal);
+    if (session.fact === null && probe.signal?.aborted) {
+      // Preempted mid-inference: the GPU run is already dead. Yield with the
+      // scraped text intact so resume continues at `persist`, not `acquire`.
+      throw new PreemptedError("inference aborted mid-generation");
+    }
   }
 
   /**
@@ -485,12 +622,13 @@ export class AutonomousForager {
   private persist(session: ForageSession): void {
     const { target, fact } = session;
     const zeroYield = session.candidates === 0;
+    const hooks = this.testHooks;
 
     // No usable fact — but extraction COMPLETED, so the crawl succeeded.
     if (!fact) {
       // COMPLETED/VISITED, even though 0 candidates were extracted.
-      if (target.place_id) markPlaceVerified(target.place_id);
-      if (session.loreId) setRawLoreStatus(session.loreId, zeroYield ? "completed" : "unverified");
+      if (target.place_id) this.hookableMarkPlaceVerified(target.place_id);
+      if (session.loreId) this.hookableSetRawLoreStatus(session.loreId, zeroYield ? "completed" : "unverified");
       console.log(
         zeroYield
           ? `[Swarm] 0 place candidates from "${target.label}" — marked completed; URL cools down for 7 days.`
@@ -500,15 +638,17 @@ export class AutonomousForager {
     }
 
     if (fact.confidence_score > CONFIDENCE_THRESHOLD) {
-      session.knowledgeId = insertVerifiedKnowledge(fact);
+      session.knowledgeId = hooks.insertVerifiedKnowledge
+        ? hooks.insertVerifiedKnowledge(fact, target.url)
+        : insertVerifiedKnowledge(fact);
       session.promoted = true;
-      if (session.loreId) setRawLoreStatus(session.loreId, "extracted");
+      if (session.loreId) this.hookableSetRawLoreStatus(session.loreId, "extracted");
       console.log(
         `[Swarm] Learned [${fact.category}] from "${target.label}" ` +
           `(confidence ${fact.confidence_score.toFixed(2)}): ${fact.fact_summary}`,
       );
     } else {
-      if (session.loreId) setRawLoreStatus(session.loreId, "unverified");
+      if (session.loreId) this.hookableSetRawLoreStatus(session.loreId, "unverified");
       console.log(
         `[Swarm] Below the confidence gate for "${target.label}" ` +
           `(${fact.confidence_score.toFixed(2)} ≤ ${CONFIDENCE_THRESHOLD}) — filing to quarantine only.`,
@@ -528,19 +668,21 @@ export class AutonomousForager {
       the two cases never overlap here.
     */
     if (target.place_id && target.kind === "incomplete_place") {
-      insertBrainChunk({
+      const chunk = {
         placeId: target.place_id,
         category: fact.category,
         text: fact.fact_summary,
         sourceUrl: target.url,
         confidence: fact.confidence_score,
-      });
+      };
+      if (hooks.insertBrainChunk) hooks.insertBrainChunk(chunk);
+      else insertBrainChunk(chunk);
     }
     // Stamped for every place target, and only here: reaching this line means
     // the evidence was actually in hand. See the header on why a failure must
     // never advance this cursor.
     if (target.place_id) {
-      markPlaceVerified(target.place_id);
+      this.hookableMarkPlaceVerified(target.place_id);
     }
   }
 
@@ -587,7 +729,9 @@ export class AutonomousForager {
     });
 
     if (fed && session.knowledgeId !== null) {
-      markKnowledgeSynced([session.knowledgeId]);
+      const hook = this.testHooks.markKnowledgeSynced;
+      if (hook) hook([session.knowledgeId]);
+      else markKnowledgeSynced([session.knowledgeId]);
     }
 
     /*
@@ -599,7 +743,7 @@ export class AutonomousForager {
       already means the same thing for a promoted fact.
     */
     if (fed && target.kind === "unverified_lore" && session.loreId !== null) {
-      setRawLoreStatus(session.loreId, "quarantined");
+      this.hookableSetRawLoreStatus(session.loreId, "quarantined");
     }
 
     return {
@@ -638,6 +782,41 @@ export class AutonomousForager {
     const key = targetKey(target);
     this.backoffCount.delete(key);
     this.backoffUntil.delete(key);
+  }
+
+  /**
+   * Persistence through the test seam when the harness injects one.
+   *
+   * Three tiny wrappers (not one generic "db" object) so each call site keeps
+   * its own signature and production reads exactly as before — the hook check
+   * is the only new line on each path.
+   */
+  private hookableInsertRawLore(kind: string, text: string, url: string | null): number {
+    const hook = this.testHooks.insertRawLore;
+    if (hook) return hook(kind, text, url);
+    return insertRawLore(kind, text, url);
+  }
+
+  private hookableSetRawLoreStatus(id: number, status: string): void {
+    const hook = this.testHooks.setRawLoreStatus;
+    if (hook) {
+      hook(id, status);
+      return;
+    }
+    setRawLoreStatus(id, status);
+  }
+
+  private hookableMarkPlaceVerified(placeId: string | null, confidence?: number): void {
+    const hook = this.testHooks.markPlaceVerified;
+    if (hook) {
+      hook(placeId, confidence);
+      return;
+    }
+    // Confidence is upstream metadata (fed to /api/swarm/learn); the local
+    // stamp is just "visited now". Null place (a seed URL with no mirror row)
+    // has nothing to stamp, so skip rather than crash the pass.
+    if (!placeId) return;
+    markPlaceVerified(placeId);
   }
 }
 

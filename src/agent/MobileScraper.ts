@@ -162,8 +162,15 @@ const DESKTOP_UA =
  * Throws on a non-2xx response or an empty document, matching the desktop
  * scraper's contract exactly so the forager's failure and backoff handling is
  * identical on either engine.
+ *
+ * PREEMPTIBLE: `signal` aborts the fetch when a PRIORITY task arrives. The
+ * timeout signal is linked (not replaced) so an explicit abort wins over the
+ * navigation deadline instead of one clobbering the other.
  */
-export async function scrapeMobile(url: string): Promise<MobileScrapeResult> {
+export async function scrapeMobile(url: string, signal?: AbortSignal): Promise<MobileScrapeResult> {
+  throwIfAborted(signal);
+  const timeout = AbortSignal.timeout(NAV_TIMEOUT_MS);
+  const combined = linkSignals(signal, timeout);
   const response = await fetch(url, {
     method: "GET",
     redirect: "follow",
@@ -172,7 +179,7 @@ export async function scrapeMobile(url: string): Promise<MobileScrapeResult> {
       "Accept-Language": "en-AU,en;q=0.9",
       "User-Agent": DESKTOP_UA,
     },
-    signal: AbortSignal.timeout(NAV_TIMEOUT_MS),
+    signal: combined,
   });
 
   if (!response.ok) {
@@ -189,6 +196,7 @@ export async function scrapeMobile(url: string): Promise<MobileScrapeResult> {
   }
 
   const html = (await response.text()).slice(0, MAX_RESPONSE_BYTES);
+  throwIfAborted(signal);
   const title = extractTitle(html) || url;
   const text = htmlToText(html);
 
@@ -198,5 +206,22 @@ export async function scrapeMobile(url: string): Promise<MobileScrapeResult> {
 
   return { url, title, text };
 }
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/** Throws a preemption-flavoured abort when `signal` is already fired. */
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : new Error("Aborted");
+  }
+}
+
+/**
+ * Links an optional caller signal with the navigation timeout.
+ *
+ * Returns `undefined` when neither exists (plain fetch), the single live
+ * signal when only one exists, or a combined signal that fires when EITHER
+ * fires — so a PRIORITY preempt and the nav deadline can each win honestly.
+ */
+function linkSignals(first?: AbortSignal, second?: AbortSignal): AbortSignal | undefined {
+  if (first && second) return AbortSignal.any([first, second]);
+  return first ?? second;
+}

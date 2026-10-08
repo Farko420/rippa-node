@@ -461,7 +461,7 @@ export class ScraperService {
   }
 
   /** Scrapes a URL and returns sanitized body text. Throws on navigation failure / empty page. */
-  async scrape(url: string): Promise<ScrapeResult> {
+  async scrape(url: string, signal?: AbortSignal): Promise<ScrapeResult> {
     /*
       THE MOBILE FALLBACK, taken BEFORE any Playwright call.
 
@@ -470,10 +470,13 @@ export class ScraperService {
       early would mean constructing a Chromium context on a device that cannot
       run one. The returned shape is identical either way, so the caller (the
       idle forager) has no idea which engine produced the text.
+
+      PREEMPTIBLE: the caller's AbortSignal is forwarded so a PRIORITY task
+      arriving mid-scrape kills the fetch immediately.
     */
     if (!this.canUseBrowser) {
       publishScrape("idle", "Lightweight fetch scraper in use (no Chromium on this runtime).", url);
-      return scrapeMobile(url);
+      return scrapeMobile(url, signal);
     }
 
     /*
@@ -494,7 +497,7 @@ export class ScraperService {
       console.log(
         "[Scraper] No Chromium available — this node will use the lightweight fetch scraper.",
       );
-      return scrapeMobile(url);
+      return scrapeMobile(url, signal);
     }
 
     /*
@@ -516,7 +519,7 @@ export class ScraperService {
           error instanceof Error ? error.message : String(error)
         }. Using the lightweight fetch scraper instead.`,
       );
-      return scrapeMobile(url);
+      return scrapeMobile(url, signal);
     }
     /*
       RESOURCE GOVERNOR — MEMORY GUARD.
@@ -533,7 +536,7 @@ export class ScraperService {
         "[GOVERNOR] Memory limit exceeded — using lightweight fetch scraper.",
         url,
       );
-      return scrapeMobile(url);
+      return scrapeMobile(url, signal);
     }
 
     /*
@@ -563,10 +566,17 @@ export class ScraperService {
     try {
       const page = await context.newPage();
       publishScrape("navigate", `[NAVIGATE] ${url}`, url);
-      const response = await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: NAV_TIMEOUT_MS,
-      });
+      // PREEMPTIBLE NAVIGATION: Playwright has no native AbortSignal for
+      // `page.goto`, so the goto races a promise that rejects the instant the
+      // engine's controller fires. The page/context close in `finally` then
+      // frees Chromium for the incoming PRIORITY task.
+      const response = await raceWithAbort(
+        page.goto(url, {
+          waitUntil: "domcontentloaded",
+          timeout: NAV_TIMEOUT_MS,
+        }),
+        signal,
+      );
 
       const status = response?.status();
       publishScrape(
@@ -577,6 +587,7 @@ export class ScraperService {
       if (status !== undefined && status >= 400) {
         throw new Error(`HTTP ${status} for ${url}`);
       }
+      throwIfScrapeAborted(signal);
 
       // Let lazy-loaded content settle, but never block longer than the cap.
       await page.waitForLoadState("networkidle", { timeout: NETWORK_IDLE_CAP_MS }).catch(() => undefined);
@@ -585,6 +596,7 @@ export class ScraperService {
       // Taken before extraction so the operator sees the page as Chromium rendered
       // it, not as the sanitiser will go on to strip it down to.
       await this.captureViewport(page, url);
+      throwIfScrapeAborted(signal);
       const text = await extractSanitizedBody(page);
 
       if (!text) {
@@ -694,6 +706,44 @@ async function extractSanitizedBody(page: Page): Promise<string> {
     .replace(/\n{3,}/g, "\n\n")
     .trim()
     .slice(0, MAX_TEXT_CHARS);
+}
+
+/**
+ * Races a Playwright promise against an AbortSignal.
+ *
+ * Playwright's navigation API predates AbortSignal, so cancellation is a race:
+ * when the engine fires its controller the race rejects immediately while the
+ * underlying goto is abandoned with the context close. No signal (or an
+ * already-settled promise) means this is a transparent passthrough.
+ */
+function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("Aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(signal.reason instanceof Error ? signal.reason : new Error("Aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Throws when the engine preempted the scrape between navigation steps. */
+function throwIfScrapeAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : new Error("Aborted");
+  }
 }
 
 /**

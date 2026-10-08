@@ -411,6 +411,44 @@ export const BRAIN_INGEST_FALLBACK_PATH = FORAGE_QUARANTINE_PATH;
 /** The routes tried, in order, by {@link SwarmClient.ingestBrainFacts}. */
 const BRAIN_INGEST_ROUTES: readonly string[] = [BRAIN_INGEST_PATH, BRAIN_INGEST_FALLBACK_PATH];
 
+/**
+ * THE LEARNING-LOOP SYNC ROUTE — where foraged facts silently update the
+ * global fact database and bump the location's confidence score.
+ *
+ * Tried FIRST by `pushForageDiscovery`, ahead of the quarantine routes, so a
+ * current Mothership records the fact directly into the 20k+ store. Older
+ * clouds 404 it and the push falls through to quarantine exactly as before —
+ * the downgrade is remembered, so the missing route is probed once, not on
+ * every pass forever.
+ */
+export const SWARM_LEARN_PATH = "/api/swarm/learn";
+
+/**
+ * A background research assignment handed down by the Mothership.
+ *
+ * Returned by `requestForageTarget`: a map location with a low
+ * `confidence_score`, or a place that has not been verified in months. When
+ * the Mothership has no dedicated forage queue (older cloud) the call returns
+ * `null` and the node falls back to its LOCAL database queue — it still
+ * forages, just from its own mirror instead of a cloud assignment.
+ */
+export interface ForageTarget {
+  /** Human-readable place name ("Lamington National Park"). */
+  label: string;
+  /** Page to scrape for fresh trail conditions / access rules / history. */
+  url: string | null;
+  /** Mirrored place this updates, when the cloud knows the id. */
+  placeId: string | null;
+  /** 0-1 (or 0-100, normalised on read) — low means "needs verification". */
+  confidenceScore?: number | null;
+  /** ISO timestamp of the last verification, when the cloud tracks one. */
+  lastVerified?: string | null;
+  /** Hint for the extractor ("stale_place" | "unverified_lore" | ...). */
+  kind?: string | null;
+  /** Free-form reason the cloud picked this ("confidence 0.31", ...). */
+  reason?: string | null;
+}
+
 /** One unit of heavy research work handed to an idle node. */
 export interface FleetTask {
   id: string;
@@ -454,6 +492,21 @@ export class SwarmClient {
    * {@link SwarmClient.pushForageDiscovery}.
    */
   private quarantineUnsupported = false;
+  /**
+   * Set once the Mothership has answered 404/405 on the learn route, after
+   * which discoveries go straight to quarantine. Same downgrade-remembering
+   * shape as `quarantineUnsupported`: probe the new route once, then stop
+   * asking a cloud that does not have it.
+   */
+  private learnUnsupported = false;
+  /**
+   * Set once the Mothership has answered 404/405 on the forage-target route,
+   * after which the node forages from its LOCAL database queue without asking.
+   * A single boolean (not a backoff) because "route does not exist" is
+   * permanent for this cloud version — retrying it every pass is pure uplink
+   * spam for an answer that cannot change until the cloud ships the route.
+   */
+  private forageTargetUnsupported = false;
   /**
    * Index into {@link CAPABILITY_ROUTES} of the route that last worked, so a
    * Mothership lacking the preferred one is probed once rather than on every
@@ -1068,12 +1121,12 @@ export class SwarmClient {
    * facts and the wrong one for "this page says the creek is closed and nobody
    * else knows yet". Foraging therefore pushes the moment it learns something.
    *
-   * WHY A FALLBACK. The quarantine route is the intended home, but a Mothership
-   * that has not shipped it answers 404/405, and a forager that only logged a
-   * warning would drop every discovery it ever made. On the first such answer
-   * the client permanently switches to `/api/swarm/submit`, which every
-   * deployment already accepts — and records that it did so, so a missing
-   * endpoint cannot become one failed request per discovery, forever.
+   * THE LEARNING LOOP. The fact is tried FIRST against `/api/swarm/learn`,
+   * where the Mothership silently updates the global 20k+ fact database and
+   * increments the location's confidence score. A current cloud records it
+   * there; an older cloud 404s and the push falls through to quarantine, then
+   * to `/api/swarm/submit` — the same downgrade-remembering chain as before,
+   * so a missing route is probed once, not on every pass forever.
    *
    * The node's id and api key travel in the body as well as the Authorization
    * header, because the Mothership attributes a quarantine record to the node
@@ -1087,7 +1140,14 @@ export class SwarmClient {
       apiKey: env.NODE_API_KEY,
       mothershipUrl: env.MOTHERSHIP_URL,
     };
-    const route = this.quarantineUnsupported ? FORAGE_FALLBACK_PATH : FORAGE_QUARANTINE_PATH;
+    // Learn first (current cloud), then quarantine, then the legacy submit.
+    // Each downgrade is remembered below, so the chain shortens itself
+    // permanently against an older Mothership instead of re-probing.
+    const route = !this.learnUnsupported
+      ? SWARM_LEARN_PATH
+      : this.quarantineUnsupported
+        ? FORAGE_FALLBACK_PATH
+        : FORAGE_QUARANTINE_PATH;
 
     try {
       await this.client.post(route, body);
@@ -1098,6 +1158,16 @@ export class SwarmClient {
       return true;
     } catch (error) {
       const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (route === SWARM_LEARN_PATH && (status === 404 || status === 405 || status === 501)) {
+        // Current-cloud route missing — remember it and fall through to the
+        // quarantine chain rather than re-probing a 404 on every discovery.
+        this.learnUnsupported = true;
+        console.warn(
+          `[Swarm] Mothership has no ${SWARM_LEARN_PATH} (HTTP ${status}) — ` +
+            `feeding discoveries to ${FORAGE_QUARANTINE_PATH} instead.`,
+        );
+        return this.pushForageDiscovery(payload);
+      }
       if (route === FORAGE_QUARANTINE_PATH && (status === 404 || status === 405)) {
         // Remember the downgrade so the next discovery goes straight to the
         // endpoint that works instead of re-probing one that does not exist.
@@ -1114,8 +1184,57 @@ export class SwarmClient {
   }
 
   /**
+   * REQUESTS A BACKGROUND RESEARCH ASSIGNMENT — the idle tier's intake line.
+   *
+   * When the node has nothing assigned it asks the Mothership for a
+   * `forage_target`: a map location with a low `confidence_score`, or a place
+   * that has not been verified in months. The Mothership answers with the
+   * target (or an explicit "nothing right now"); an older cloud without the
+   * route answers 404/405/501 and this returns `null` FOREVER after — the node
+   * then forages from its LOCAL database queue instead of spamming an endpoint
+   * that cannot exist on this cloud version.
+   *
+   * NEVER THROWS. An unreachable Mothership must not stop the idle loop; it
+   * just means "forage locally this pass".
+   */
+  async requestForageTarget(signal?: AbortSignal): Promise<ForageTarget | null> {
+    if (this.forageTargetUnsupported) return null;
+    try {
+      const { data } = await this.client.post(
+        "/api/swarm/forage-target",
+        {
+          nodeCode: currentNodeIdentity()?.code ?? env.NODE_NAME,
+          nodeId: env.NODE_NAME,
+          role: env.NODE_ROLE,
+          apiKey: env.NODE_API_KEY,
+        },
+        signal ? { signal } : undefined,
+      );
+      const target = normaliseForageTarget(data);
+      if (target) {
+        console.log(
+          `[Swarm] Forage assignment from Mothership — "${target.label}"` +
+            (target.reason ? ` (${target.reason})` : "") +
+            ".",
+        );
+      }
+      return target;
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.code === "ERR_CANCELED") return null;
+      if (error instanceof Error && error.name === "AbortError") return null;
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status === 404 || status === 405 || status === 501) {
+        // No forage queue on this cloud — remember it and forage locally.
+        this.forageTargetUnsupported = true;
+        return null;
+      }
+      return null;
+    }
+  }
+
+  /**
    * Asks the Mothership to generate a patch, used when the node has no usable
-   * local model. Returns "" when the endpoint is absent or fails â€” the caller
+   * local model. Returns "" when the endpoint is absent or fails — the caller
    * then reports the original failure rather than stalling.
    */
   async requestSkillPatch(systemPrompt: string, userPrompt: string): Promise<string> {
@@ -1127,9 +1246,24 @@ export class SwarmClient {
       const body = (data ?? {}) as { patch?: string; code?: string; result?: string };
       return String(body.patch ?? body.code ?? body.result ?? "");
     } catch (error) {
-      console.warn(`[Swarm] Cloud patch request failed â€” ${describeError(error)}`);
+      console.warn(`[Swarm] Cloud patch request failed — ${describeError(error)}`);
       return "";
     }
+  }
+
+  /**
+   * FOR TESTS AND OPERATORS: forget the remembered route downgrades.
+   *
+   * The learn / forage-target / quarantine fallbacks are permanent for a cloud
+   * version, so they are sticky by design — but a Mothership that SHIPS the
+   * route mid-process (deploy while the node runs) would otherwise never be
+   * re-probed. The heartbeat calls this when it sees a version change; tests
+   * call it to reset the client between cases.
+   */
+  resetRouteDowngrades(): void {
+    this.learnUnsupported = false;
+    this.forageTargetUnsupported = false;
+    this.quarantineUnsupported = false;
   }
 
 
@@ -1461,6 +1595,58 @@ function parseFleetTask(raw: unknown): FleetTask | null {
 const MAX_FACTS_PER_TASK = 25;
 /** Used when the queue does not say. Deliberately modest for a first run. */
 const DEFAULT_MAX_FACTS_PER_TASK = 8;
+
+/**
+ * Reads a Mothership `forage_target` answer into a {@link ForageTarget}.
+ *
+ * Accepts the target bare, under `target` / `forage_target` / `data`, or as
+ * the first entry of a `targets` array — the cloud's envelope is its own
+ * business, and a node that guesses wrong drops an assignment it was handed.
+ * Returns `null` for "nothing queued" (explicit nulls, `{ "target": null }`,
+ * `{ "has_target": false }`) AND for "the response made no sense": both mean
+ * "forage locally this pass", and neither deserves a log line on an idle node.
+ *
+ * A label is the one non-negotiable field — a target with no name is not a
+ * target, it is a malformed row. The URL may be absent (a place the cloud
+ * wants re-verified from the mirror); the forager then works from stored
+ * text rather than a fresh scrape.
+ */
+function normaliseForageTarget(raw: unknown): ForageTarget | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const root = raw as Record<string, unknown>;
+  if (root["has_target"] === false) return null;
+  const envelope =
+    root["target"] && typeof root["target"] === "object"
+      ? (root["target"] as Record<string, unknown>)
+      : root["forage_target"] && typeof root["forage_target"] === "object"
+        ? (root["forage_target"] as Record<string, unknown>)
+        : root["data"] && typeof root["data"] === "object"
+          ? (root["data"] as Record<string, unknown>)
+          : Array.isArray(root["targets"])
+            ? ((root["targets"] as unknown[])[0] as Record<string, unknown> | undefined)
+            : root;
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) return null;
+  const label = firstString(envelope, ["label", "name", "title", "place_name"]);
+  if (!label) return null;
+  const url = firstString(envelope, ["url", "source_url", "target", "link"]);
+  const placeId = firstString(envelope, ["placeId", "place_id", "id"]);
+  const kind = firstString(envelope, ["kind", "type", "targetKind", "target_kind"]);
+  const reason = firstString(envelope, ["reason", "detail", "note"]);
+  const lastVerified = firstString(envelope, ["last_verified", "lastVerified", "verified_at"]);
+  const confidenceRaw =
+    envelope["confidenceScore"] ?? envelope["confidence_score"] ?? envelope["confidence"];
+  const confidenceScore =
+    typeof confidenceRaw === "number" && Number.isFinite(confidenceRaw) ? confidenceRaw : null;
+  return {
+    label,
+    url: url ?? null,
+    placeId: placeId ?? null,
+    confidenceScore,
+    lastVerified: lastVerified ?? null,
+    kind: kind ?? null,
+    reason: reason ?? null,
+  };
+}
 
 function describeError(error: unknown): string {
   if (axios.isAxiosError(error)) {
