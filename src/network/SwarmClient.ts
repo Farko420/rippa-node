@@ -103,6 +103,14 @@ export interface HeartbeatPayload {
    * ordering — so a node whose clock is wrong cannot wedge the sync.
    */
   power_config_applied_at: string | null;
+  /**
+   * ZERO-TOUCH ONLINE GATE (epic §1): true once the baseline model
+   * (`qwen2.5-coder:7b` or the RAM-appropriate pick) is installed, false
+   * while still pulling, null when untracked (unmanaged nodes). The
+   * Mothership uses this to decide whether this node is truly Online for
+   * inference work — a node still pulling weights must not be handed prompts.
+   */
+  model_ready: boolean | null;
 }
 
 export interface SwarmTask {
@@ -532,6 +540,13 @@ export class SwarmClient {
   private powerConfigApplied: () => string | null = () => null;
   /** Remote-command executor hooks, supplied by the host. */
   private commandHandlers: CommandHandlers | null = null;
+  /**
+   * ZERO-TOUCH ONLINE GATE (epic §1): true once the baseline model is
+   * installed, false while still pulling, null when the host does not track
+   * it (unmanaged nodes). Advertised as `model_ready` so the Mothership only
+   * hands inference work to nodes that can do it.
+   */
+  private modelReady: () => boolean | null = () => null;
 
   /*
     TASK-FETCH BACKOFF STATE (see fetchTasks).
@@ -614,11 +629,17 @@ export class SwarmClient {
     commandHandlers?: CommandHandlers;
     /** The power-config stamp this node last applied (the shadow echo). */
     powerConfigApplied?: () => string | null;
+    /**
+     * ZERO-TOUCH ONLINE GATE (epic §1): whether the baseline model is
+     * installed. The closure reads live boot state; null = untracked.
+     */
+    modelReady?: () => boolean | null;
   }): void {
     if (sources.connectedSatellites) this.connectedSatellites = sources.connectedSatellites;
     if (sources.efficiency) this.efficiency = sources.efficiency;
     if (sources.commandHandlers) this.commandHandlers = sources.commandHandlers;
     if (sources.powerConfigApplied) this.powerConfigApplied = sources.powerConfigApplied;
+    if (sources.modelReady) this.modelReady = sources.modelReady;
   }
 
   /**
@@ -633,6 +654,20 @@ export class SwarmClient {
     try {
       const stamp = this.powerConfigApplied();
       return typeof stamp === "string" && stamp.trim() ? stamp.trim() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Reads the zero-touch model gate, tolerating a provider that throws.
+   * Same rule as every other provider: a throwing source degrades to null
+   * ("the node did not say") rather than failing the heartbeat.
+   */
+  private readModelReady(): boolean | null {
+    try {
+      const ready = this.modelReady();
+      return typeof ready === "boolean" ? ready : null;
     } catch {
       return null;
     }
@@ -681,6 +716,9 @@ export class SwarmClient {
       // this is read synchronously with the rest of the payload, so a value the
       // host updates concurrently cannot end up half-applied.
       power_config_applied_at: this.readPowerConfigApplied(),
+      // ZERO-TOUCH ONLINE GATE (epic §1): only a model-ready node is truly
+      // Online for inference work. Read synchronously for the same reason.
+      model_ready: this.readModelReady(),
     };
 
     try {
@@ -1703,13 +1741,16 @@ function firstString(source: Record<string, unknown>, keys: string[]): string | 
 }
 
 /**
- * Extracts queued work from a heartbeat reply.
+ * Extracts queued work from a heartbeat reply — the universal "Pull".
  *
- * Tolerates the shapes a Mothership may realistically use: a bare array, or an
- * envelope under `tasks` / `pending_tasks` / `queue`. Entries without an `id`
- * are dropped — a task the node cannot report a result against is a task it
- * cannot acknowledge, and acknowledging it would corrupt the fleet's view of
- * what is still outstanding.
+ * Tolerates the shapes a Mothership may realistically use: a bare array, an
+ * envelope under `tasks` / `pending_tasks` / `queue` / `assigned_tasks`, ONE
+ * task object under `task` / `assigned_task` / `priority_task` (camelCase
+ * `priorityTask` too), or a `forage_target` / `forageTarget` object (wrapped
+ * into a synthetic FORAGE task so the engine can claim it like any other).
+ * Entries without an `id` are dropped — a task the node cannot report a
+ * result against is a task it cannot acknowledge, and acknowledging it would
+ * corrupt the fleet's view of what is still outstanding.
  *
  * STATUS IS CARRIED, AND TERMINAL STATES ARE FILTERED. The cloud may hand back
  * the whole queue including work that is already done, in flight elsewhere, or
@@ -1719,10 +1760,46 @@ function firstString(source: Record<string, unknown>, keys: string[]): string | 
  */
 function parseTaskPayload(payload: unknown): SwarmTask[] {
   if (!payload || typeof payload !== "object") return [];
+  if (Array.isArray(payload)) return normaliseTaskEntries(payload);
   const root = payload as Record<string, unknown>;
-  const raw = Array.isArray(root) ? root : (root["tasks"] ?? root["pending_tasks"] ?? root["queue"]);
-  if (!Array.isArray(raw)) return [];
+  // Plural queue envelopes first (the common shape).
+  for (const key of ["tasks", "pending_tasks", "queue", "assigned_tasks", "assignedTasks", "pendingTasks"]) {
+    const raw = root[key];
+    if (Array.isArray(raw)) return normaliseTaskEntries(raw);
+  }
+  // Singular envelopes: ONE task object handed inline (priority_task), or a
+  // forage_target wrapped into a synthetic FORAGE task the engine can claim.
+  for (const key of ["task", "assigned_task", "assignedTask", "priority_task", "priorityTask"]) {
+    const single = root[key];
+    if (single && typeof single === "object" && !Array.isArray(single)) {
+      const tasks = normaliseTaskEntries([single]);
+      if (tasks.length > 0) return tasks;
+    }
+  }
+  const forage = root["forage_target"] ?? root["forageTarget"];
+  if (forage && typeof forage === "object" && !Array.isArray(forage)) {
+    const record = forage as Record<string, unknown>;
+    const id = firstString(record, ["id", "taskId", "task_id"]) ?? `forage-${Date.now()}`;
+    const payloadField = record["payload"] ?? record["input"] ?? record["data"];
+    const wrapped: SwarmTask = {
+      id,
+      type: "FORAGE",
+      ...(payloadField && typeof payloadField === "object"
+        ? { payload: { ...(payloadField as Record<string, unknown>), forageTarget: record } }
+        : { payload: { forageTarget: record } }),
+      status: "pending",
+    };
+    return [wrapped];
+  }
+  // A bare task object that simply IS the body.
+  if (typeof root["id"] === "string" && (root["id"] as string).trim()) {
+    return normaliseTaskEntries([root]);
+  }
+  return [];
+}
 
+/** Normalises raw queue entries into claimable {@link SwarmTask}s. */
+function normaliseTaskEntries(raw: unknown[]): SwarmTask[] {
   const tasks: SwarmTask[] = [];
   for (const entry of raw) {
     if (!entry || typeof entry !== "object") continue;

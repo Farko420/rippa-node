@@ -210,8 +210,14 @@ export class AutonomousForager {
    * Resumes a saved session when there is one, otherwise picks a fresh target.
    * Never throws: an idle-time failure must not be able to take down the
    * priority loop that would otherwise recover from it.
+   *
+   * `forcedTarget` pins the pass to a Mothership-directed target (the
+   * heartbeat's `forage_target`, wrapped as a FORAGE task). When present it
+   * wins over the usual Mothership-first/local-fallback choice — the cloud
+   * told this node exactly what to verify, so asking the cloud again would
+   * only risk being handed something else.
    */
-  async runPass(probe: PreemptionProbe): Promise<ForageOutcome> {
+  async runPass(probe: PreemptionProbe, forcedTarget?: ForageTargetRow): Promise<ForageOutcome> {
     // Satellites are stateless, and a Master whose brain failed to open would
     // otherwise throw straight out of `getDeepBrain()` below.
     if (!this.forceEligibleForTests && (env.NODE_ROLE !== "master" || !isDeepBrainReady())) {
@@ -223,7 +229,7 @@ export class AutonomousForager {
     }
 
     try {
-      const session = this.session ?? (await this.openSession(probe));
+      const session = this.session ?? (await this.openSession(probe, forcedTarget));
       if (!session) {
         return {
           status: "empty",
@@ -301,8 +307,8 @@ export class AutonomousForager {
   }
 
   /** Opens a session for the next target, or returns null when there is none. */
-  private async openSession(probe: PreemptionProbe): Promise<ForageSession | null> {
-    const target = await this.nextTarget(probe);
+  private async openSession(probe: PreemptionProbe, forcedTarget?: ForageTargetRow): Promise<ForageSession | null> {
+    const target = forcedTarget ?? (await this.nextTarget(probe));
     if (!target) return null;
     this.session = {
       target,

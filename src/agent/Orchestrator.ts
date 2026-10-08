@@ -8,7 +8,7 @@ import { executeSkill } from "../services/skillExecutor";
 import { runLocalInference } from "../services/ollamaManager";
 import { healTask } from "../services/taskManager";
 import { startLocalAiDiscovery, type LocalAiStatus } from "../services/localAi";
-import { AutonomousForager } from "../services/autonomousForager";
+import { AutonomousForager, type PreemptionProbe } from "../services/autonomousForager";
 import { IngestionEngine } from "../services/ingestionEngine";
 import { TaskEngine, type TaskOutcome } from "../services/taskEngine";
 import { ResourceGovernor, DEFAULT_POWER_CONFIG, type PowerConfig } from "../services/resourceGovernor";
@@ -343,6 +343,17 @@ export class Orchestrator {
       case "INFER":
       case "INFERENCE":
         return this.handleAiInference(task);
+      /*
+        HEARTBEAT-PULLED FORAGE TARGETS (epic §2): the heartbeat may hand the
+        node a `forage_target` wrapped as a FORAGE task (see parseTaskPayload).
+        It runs as a priority pass — scrape via Playwright, extract via local
+        Ollama — and Pushes the learned fact via submitProfile/learn, exactly
+        like any other priority task. Runs through the forager's single-pass
+        path so evidence handling stays in one place.
+      */
+      case "FORAGE":
+      case "FORAGE_TARGET":
+        return this.handleForageTask(task);
       // TODO: wire real handlers as they are built, e.g.:
       //   case "scrape":   → Playwright headless scrape
       //   case "extract":  → Ollama structured extraction
@@ -583,6 +594,103 @@ export class Orchestrator {
       console.warn(`[Orchestrator] ${AI_INFERENCE} ${task.id} failed — ${message.split("\n")[0]}`);
       return { status: "failure", detail: message.split("\n")[0] ?? "inference failed", reported: true };
     }
+  }
+
+  /**
+   * FORAGE — a heartbeat-pulled `forage_target` executed as priority work.
+   *
+   * THE PUSH HALF OF THE HANDSHAKE (epic §2): scrape with Playwright, extract
+   * with local Ollama, then Push the learned fact back via `submitProfile`
+   * (`/api/swarm/submit`) — and the forager's own learn path
+   * (`/api/swarm/learn`) when the pass produces a discovery. `reported: true`
+   * because this handler files its own result; the engine's generic
+   * `task_result` would double-report the same task.
+   *
+   * Runs one forager pass with the Mothership's target pinned: when the
+   * payload carries `forageTarget` (the heartbeat wrapper) it is forced as
+   * the pass target; otherwise the forager picks its usual
+   * Mothership-first/local-fallback target. The `swarm` dep the forager
+   * already holds does the actual Push, so this handler only reports the
+   * task-level outcome.
+   */
+  private async handleForageTask(task: SwarmTask): Promise<TaskOutcome> {
+    const startedAt = Date.now();
+    const payload = (task.payload ?? {}) as Record<string, unknown>;
+    const pinned =
+      payload["forageTarget"] && typeof payload["forageTarget"] === "object"
+        ? (payload["forageTarget"] as Record<string, unknown>)
+        : null;
+    try {
+      // A pinned target arrives as the raw Mothership object; normalise it
+      // into the ForageTargetRow shape the pass expects (snake_case, one of
+      // the three forage kinds — a directed verification is a stale place).
+      const forcedTarget = pinned
+        ? {
+            kind: "stale_place" as const,
+            url: String(pinned["url"] ?? pinned["sourceUrl"] ?? pinned["link"] ?? "") || null,
+            label: String(pinned["label"] ?? pinned["name"] ?? pinned["title"] ?? task.id),
+            place_id: typeof pinned["placeId"] === "string" ? (pinned["placeId"] as string) : typeof pinned["place_id"] === "string" ? (pinned["place_id"] as string) : null,
+            lore_id: null,
+            last_verified: null,
+            raw_text: typeof pinned["text"] === "string" ? (pinned["text"] as string) : null,
+          }
+        : undefined;
+      const outcome = await this.forager.runPass(this.buildPriorityProbe(), forcedTarget);
+      const durationMs = Date.now() - startedAt;
+      if (outcome.status === "preempted") {
+        return { status: "skipped", detail: "preempted by newer priority work", reported: false };
+      }
+      if (outcome.status === "learned") {
+        await this.swarm.submitProfile({
+          kind: "forage_result",
+          taskId: task.id,
+          status: "success",
+          target: outcome.target?.label ?? task.id,
+          fed: outcome.fed,
+          durationMs,
+        });
+        return { status: "success", detail: `foraged ${outcome.target?.label ?? task.id}`, reported: true };
+      }
+      // "skipped" (nothing to learn) still Pushes — the Mothership must see
+      // the target was visited, or it hands it out again next heartbeat.
+      await this.swarm.submitProfile({
+        kind: "forage_result",
+        taskId: task.id,
+        status: "skipped",
+        target: outcome.target?.label ?? task.id,
+        detail: outcome.status,
+        durationMs,
+      });
+      return { status: "skipped", detail: `forage pass ${outcome.status}`, reported: true };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.swarm.submitProfile({
+        kind: "forage_result",
+        taskId: task.id,
+        status: "failed",
+        error: message.split("\n")[0] ?? "forage failed",
+        durationMs: Date.now() - startedAt,
+      });
+      console.warn(`[Orchestrator] FORAGE ${task.id} failed — ${message.split("\n")[0]}`);
+      return { status: "failure", detail: message.split("\n")[0] ?? "forage failed", reported: true };
+    }
+  }
+
+  /**
+   * A never-yielding probe for priority FORAGE passes.
+   *
+   * The engine's own probe reports `shouldYield: true` while a priority task
+   * is in flight — which is exactly when THIS handler runs. Reusing it would
+   * make the pass instantly "preempt" itself. Priority work never yields to
+   * itself, so the probe answers false and never interrupts; the abort signal
+   * is omitted for the same reason.
+   */
+  private buildPriorityProbe(): PreemptionProbe {
+    return {
+      shouldYield: () => false,
+      waitForInterrupt: () => new Promise<void>(() => { /* never interrupts */ }),
+      waitForResume: () => Promise.resolve(),
+    };
   }
 }
 

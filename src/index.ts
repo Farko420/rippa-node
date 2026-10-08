@@ -222,13 +222,37 @@ async function main(): Promise<void> {
       happened to inherit. The env var is still honoured, and still wins, so an
       operator who has always set it that way is unaffected.
     */
-    const persistedManaged = readCurrentConfig()?.OLLAMA_MANAGED === true;
-    if (persistedManaged || process.env.RIPPA_OLLAMA_MANAGED === "true") {
+    /*
+      ZERO-TOUCH OLLAMA PROVISIONING (epic §1) — managed runtime is ON BY DEFAULT.
+
+      The Node is a zero-configuration extension of Rippa AI: on first boot it
+      silently ensures Ollama is present (host binary, silent official install,
+      or the contained portable runtime — see ensureZeroTouchOllama above) and
+      then supervises `ollama serve` itself, pulling `qwen2.5-coder:7b` (or the
+      RAM-appropriate model) with NO user env vars required.
+
+      Opt-out is explicit: `RIPPA_ZERO_TOUCH_OLLAMA=0` skips provisioning
+      entirely, and `RIPPA_OLLAMA_MANAGED=false` / persisted
+      `OLLAMA_MANAGED: false` returns to unmanaged (operator owns Ollama).
+      Anything else — first boot, no config, no env — provisions.
+    */
+    const zeroTouchOptOut =
+      (process.env.RIPPA_ZERO_TOUCH_OLLAMA ?? "").trim().toLowerCase() === "0" ||
+      (process.env.RIPPA_ZERO_TOUCH_OLLAMA ?? "").trim().toLowerCase() === "false" ||
+      (process.env.RIPPA_ZERO_TOUCH_OLLAMA ?? "").trim().toLowerCase() === "no" ||
+      (process.env.RIPPA_ZERO_TOUCH_OLLAMA ?? "").trim().toLowerCase() === "off";
+    const managedOptOut =
+      (process.env.RIPPA_OLLAMA_MANAGED ?? "").trim().toLowerCase() === "false" ||
+      (process.env.RIPPA_OLLAMA_MANAGED ?? "").trim().toLowerCase() === "0" ||
+      readCurrentConfig()?.OLLAMA_MANAGED === false;
+    const managedAtBoot = !zeroTouchOptOut && !managedOptOut;
+    if (managedAtBoot) {
       ollamaManager.setManaged(true);
     }
 
     /*
-      AWAIT THE MANAGED SPAWN BEFORE LOCALAI PROBES — the race fix.
+      AWAIT THE MANAGED SPAWN BEFORE LOCALAI PROBES — the race fix, extended
+      into the zero-touch Online gate (epic §1).
 
       `setManaged(true)` above only KICKS OFF `ollamaManager.start()` in the
       background (binary download, `ollama serve` spawn, then a multi-GB model
@@ -240,13 +264,28 @@ async function main(): Promise<void> {
       boot never wedges) for the server to answer /api/tags on the healed
       port, and nudges one model-pull pass so `qwen2.5-coder:7b` (or the
       RAM-appropriate model) is at least in flight before the first probe.
-      Unmanaged nodes skip this entirely — their Ollama is someone else's.
+
+      `waitForModelReady()` is the SECOND half of the gate: the Node must not
+      mark itself Online to the Mothership until the baseline model is actually
+      installed. Bounded (10 min default) so a stalled download degrades the
+      node instead of wedging boot; `zeroTouchModelReady` below is what the
+      heartbeat advertises and what gates swarm start. Unmanaged nodes skip
+      both — their Ollama is someone else's.
     */
-    const managedAtBoot = persistedManaged || process.env.RIPPA_OLLAMA_MANAGED === "true";
+    let zeroTouchModelReady = false;
     if (managedAtBoot) {
       try {
         const { ollamaManager: manager } = require("./services/ollamaManager") as typeof import("./services/ollamaManager");
-        await manager.waitForReady(90_000);
+        const serverUp = await manager.waitForReady(90_000);
+        if (serverUp) {
+          // Baseline model BEFORE Online: a node that heartbeats without a
+          // model gets handed inference work it cannot do. Bounded — a slow
+          // first pull degrades (model_ready: false) instead of wedging boot.
+          zeroTouchModelReady = await manager.waitForModelReady(10 * 60_000);
+          if (zeroTouchModelReady) {
+            console.log(`[Boot] Zero-touch provisioning complete — baseline model ready, node may mark itself Online.`);
+          }
+        }
       } catch (error) {
         console.warn(
           `[Boot] Managed Ollama not ready before LocalAI probe — continuing anyway: ${
@@ -388,7 +427,25 @@ async function main(): Promise<void> {
         had already applied (or worse, believe it had applied one it had not).
       */
       powerConfigApplied: () => readCurrentConfig()?.power_config_updated_at ?? null,
+      /*
+        ZERO-TOUCH ONLINE GATE (epic §1): the heartbeat advertises whether the
+        baseline model is installed. The closure reads the boot-time flag, which
+        starts false and flips true once `waitForModelReady()` resolves. The
+        Mothership must not hand inference work to a node still pulling weights.
+      */
+      modelReady: () => (managedAtBoot ? zeroTouchModelReady : null),
     });
+
+    /*
+      THE HEARTBEAT IS ALREADY THE UNIVERSAL PULL (epic §2): every
+      `sendHeartbeat()` reply is parsed for `pending_tasks` / `priority_task` /
+      `forage_target` and fanned out via `dispatchTasks` → the TaskEngine's
+      dispatch handler (registered in `TaskEngine.start()`), which claims each
+      task and runs it against local Ollama + Playwright, then Pushes the
+      result via `submitProfile` (`/api/swarm/submit`) or the learn loop
+      (`/api/swarm/learn`). No change needed here — this comment records the
+      contract so a future refactor does not split the pull off the heartbeat.
+    */
 
     /*
       AUTOMATIC MESH KEY SYNC.

@@ -70,6 +70,16 @@ export type TaskTier = "priority" | "idle";
 export type TaskStatus = "success" | "failure" | "skipped";
 
 /**
+ * SELF-HEALING CAP — consecutive failures before a task is requeued (epic §3).
+ *
+ * A task that keeps failing on THIS node (bad payload for this hardware, a
+ * model that cannot parse it) must be pushed back to the Mothership as an
+ * error state so it is cleanly requeued to ANOTHER machine — never retried
+ * here forever. Per task id; success resets the count. Exported for tests.
+ */
+export const MAX_CONSECUTIVE_TASK_FAILURES = 3;
+
+/**
  * What a priority handler reports back.
  *
  * `reported` exists because some handlers already report their own detailed
@@ -180,6 +190,12 @@ export class TaskEngine {
   private readonly idleGapMs: number;
   /** Ensures a permanently-unavailable brain is reported once, not every pass. */
   private skippedLogged = false;
+  /**
+   * Consecutive failure counts per task id — the requeue guard (epic §3).
+   * Success (or a skip) clears the entry; the third straight failure releases
+   * the task back to the Mothership instead of claiming it again.
+   */
+  private readonly consecutiveFailures = new Map<string, number>();
 
   constructor(private readonly deps: TaskEngineDeps) {
     this.priorityPollMs = deps.priorityPollMs ?? PRIORITY_POLL_MS;
@@ -689,6 +705,32 @@ export class TaskEngine {
         detail: outcome.detail,
         durationMs,
       });
+    }
+
+    // FATAL ERROR RECOVERY (epic §3): a task that consistently fails on THIS
+    // node is pushed back as an error state so the Mothership cleanly requeues
+    // it to another machine — never an infinite local retry loop. Success (or
+    // a skip — the task asked for nothing this node should retry) resets the
+    // count; the cap trips on the Nth straight failure.
+    if (outcome.status === "failure") {
+      const failures = (this.consecutiveFailures.get(task.id) ?? 0) + 1;
+      this.consecutiveFailures.set(task.id, failures);
+      if (failures >= MAX_CONSECUTIVE_TASK_FAILURES) {
+        this.consecutiveFailures.delete(task.id);
+        const reason =
+          `task failed ${failures} consecutive times on this node` +
+          (outcome.detail ? `: ${outcome.detail.slice(0, 300)}` : "") +
+          " — requeue to another machine";
+        console.warn(`[Swarm] Priority task ${task.id} hit the failure cap — releasing: ${reason}`);
+        try {
+          await this.deps.swarm.releaseTask(task, reason);
+        } catch {
+          // Best-effort: the error-state push above already told the
+          // Mothership this attempt failed, so its own timeout requeues anyway.
+        }
+      }
+    } else {
+      this.consecutiveFailures.delete(task.id);
     }
 
     console.log(

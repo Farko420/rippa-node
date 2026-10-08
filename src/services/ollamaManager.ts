@@ -429,6 +429,10 @@ class OllamaManager {
    * `timeoutMs` — boot never wedges on a broken runtime. Never throws for a
    * down server (resolves false); throws only when unmanaged, which is a
    * caller bug worth surfacing.
+   *
+   * ZERO-TOUCH CONTRACT (epic §1): the Node binds locally WITHOUT user-set
+   * env vars — the healed port is claimed + published into the live `env`
+   * before this returns, so every `env.OLLAMA_URL` reader agrees on one number.
    */
   async waitForReady(timeoutMs = 90_000): Promise<boolean> {
     if (!this.managed) throw new Error("waitForReady() requires managed mode (setManaged(true) first).");
@@ -454,6 +458,54 @@ class OllamaManager {
     }
     console.warn(`[OllamaManager] Managed Ollama did not answer within ${Math.round(timeoutMs / 1000)}s — continuing; LocalAI will pick it up when it lands.`);
     return false;
+  }
+
+  /**
+   * BLOCKING MODEL GATE — the zero-touch "Online" precondition (epic §1).
+   *
+   * `waitForReady()` only proves the SERVER answers; the Node must not mark
+   * itself Online to the Mothership until the baseline model
+   * (`qwen2.5-coder:7b`, or the RAM-appropriate pick) is actually installed.
+   * Waits (bounded) for `modelStatus === "ready"`, nudging one reconcile +
+   * one pull pass on the way. Resolves true when the model is usable, false
+   * on timeout — the caller keeps the node degraded (heartbeat stays quiet or
+   * advertises `model_ready: false`) instead of claiming Online it cannot honor.
+   * Never throws for a missing model; throws only when unmanaged.
+   */
+  async waitForModelReady(timeoutMs = 10 * 60_000): Promise<boolean> {
+    if (!this.managed) throw new Error("waitForModelReady() requires managed mode (setManaged(true) first).");
+    // Reconcile-first: a restored data dir may already hold the weights.
+    try {
+      await this.reconcileGeneration();
+    } catch { /* reconcile is best-effort; the pull below is the real gate */ }
+    if (this.hasModelReady()) return true;
+    // Nudge exactly one pull pass in the background; the loop below watches it land.
+    void this.pullGenerationModel().catch(() => { /* tile/terminal carry the error */ });
+    const deadline = Date.now() + Math.max(5_000, timeoutMs);
+    let lastLogged = 0;
+    while (Date.now() < deadline) {
+      // Read through the method: `modelStatus` narrows to a literal after the
+      // early return above, so a direct `=== "ready"` comparison here is
+      // flagged as unintentional. The method call defeats the narrowing.
+      if (this.hasModelReady()) return true;
+      // A reconcile tick may have landed the model via another path
+      // (manual `ollama pull`, restored backup); absorb it without waiting.
+      try {
+        if (await this.reconcileGeneration()) return true;
+      } catch { /* transient /api/tags failure — keep waiting */ }
+      if (Date.now() - lastLogged > 30_000) {
+        lastLogged = Date.now();
+        console.log(`[OllamaManager] Waiting for baseline model ${this.model}… (${this.modelStatus}${this.modelPullPercent !== null ? ` ${this.modelPullPercent}%` : ""})`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+    }
+    console.warn(`[OllamaManager] Baseline model ${this.model} not ready within ${Math.round(timeoutMs / 1000)}s — node stays degraded, pull continues in background.`);
+    return false;
+  }
+
+  /** True once the baseline generation model is installed and usable. */
+  isModelReady(): boolean {
+    return this.hasModelReady();
   }
 
   setModel(model: string): void {
@@ -1509,7 +1561,7 @@ class OllamaManager {
   }
 
   /** Read through a method so awaits cannot narrow `modelStatus` to a literal. */
-  private isModelReady(): boolean {
+  private hasModelReady(): boolean {
     return this.modelStatus === "ready";
   }
 
@@ -1547,11 +1599,11 @@ class OllamaManager {
    * timer at a time, exactly like the embedding chain.
    */
   private scheduleModelReconcile(delayMs: number): void {
-    if (this.modelReconcileTimer || this.isModelReady()) return;
+    if (this.modelReconcileTimer || this.hasModelReady()) return;
     this.modelReconcileTimer = setTimeout(() => {
       this.modelReconcileTimer = null;
       void this.reconcileGeneration().then((found) => {
-        if (found || this.isModelReady()) return;
+        if (found || this.hasModelReady()) return;
         this.scheduleModelReconcile(
           this.modelStatus === "pulling" ? MODEL_RECONCILE_FAST_MS : EMBEDDING_RECONCILE_SLOW_MS,
         );
@@ -1745,12 +1797,67 @@ export async function runLocalInference(input: LocalInferenceInput): Promise<Loc
   }
   if (Object.keys(options).length > 0) body["options"] = options;
   const timeout = typeof input.timeoutMs === "number" && input.timeoutMs > 0 ? input.timeoutMs : 180_000;
-  const { data } = await axios.post<{ response?: string }>(`${origin}/api/generate`, body, {
-    timeout,
-    proxy: false,
-  });
-  const text = String(data?.response ?? "").trim();
-  if (!text) throw new Error(`Local inference on ${model} returned an empty response.`);
-  return { text, model, port, durationMs: Date.now() - started };
+  try {
+    const { data } = await axios.post<{ response?: string }>(`${origin}/api/generate`, body, {
+      timeout,
+      proxy: false,
+    });
+    const text = String(data?.response ?? "").trim();
+    if (!text) throw new Error(`Local inference on ${model} returned an empty response.`);
+    return { text, model, port, durationMs: Date.now() - started };
+  } catch (error) {
+    // FATAL ERROR RECOVERY (epic §3): a crashed local Ollama must be restarted
+    // BEFORE the task fails. One synchronous restart attempt here, then one
+    // retry — if the server died mid-inference the retry lands on the revived
+    // process; if it is genuinely broken the retry error propagates and the
+    // caller reports failure upstream (the engine requeues past the cap).
+    if (!ollamaManager.isManaged()) throw error;
+    if (!isConnectionFailure(error)) throw error;
+    console.warn(`[Ollama] Inference connection failed — restarting managed Ollama before failing the task: ${describeInferenceError(error)}`);
+    try {
+      const healed = await ollamaManager.selfHeal();
+      if (!healed.healed) throw error;
+      await ollamaManager.waitForReady(60_000);
+    } catch {
+      throw error;
+    }
+    const { data } = await axios.post<{ response?: string }>(`${origin}/api/generate`, body, {
+      timeout,
+      proxy: false,
+    });
+    const text = String(data?.response ?? "").trim();
+    if (!text) throw new Error(`Local inference on ${model} returned an empty response.`);
+    return { text, model, port, durationMs: Date.now() - started };
+  }
+}
+
+/**
+ * True when `error` looks like a dead local server (refused/reset/timeout on
+ * loopback) rather than a model-level failure. Only these trigger the
+ * restart-before-fail path — a 4xx or an empty response is the model's answer,
+ * not a crash, and must not restart the server.
+ */
+function isConnectionFailure(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  if (error.response) return false;
+  const code = String((error as { code?: unknown }).code ?? "").toUpperCase();
+  return (
+    code === "ECONNREFUSED" ||
+    code === "ECONNRESET" ||
+    code === "EPIPE" ||
+    code === "ETIMEDOUT" ||
+    code === "ENOTFOUND" ||
+    /timeout/i.test(error.message ?? "")
+  );
+}
+
+/** One-line reason for the restart log (never the full axios dump). */
+function describeInferenceError(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const code = (error as { code?: unknown }).code;
+    const base = error.message || "connection failed";
+    return typeof code === "string" && code ? `${base} (${code})` : base.split("\n")[0];
+  }
+  return error instanceof Error ? error.message.split("\n")[0] : String(error).split("\n")[0];
 }
 
