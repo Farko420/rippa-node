@@ -625,6 +625,103 @@ check(
   "a supervisor must never stand itself down",
 );
 
+// --- 12. Process isolation: detached spawn + log-file stdio -------------------
+// The reported bug: the watchdog spawned the node with `stdio: "inherit"`,
+// so the node's output flowed into the watchdog's OWN console window — the
+// watchdog looked like, and acted as, the node console. The contract now is:
+// detached + hidden console + stdio to node.log on disk (or ignored), never
+// inherited/piped, and supervision is kept (no unref) so exit codes still
+// drive restarts and OTA handoffs.
+check(
+  "the supervised node is spawned detached into its own process group",
+  watchdog.nodeSpawnOptions().detached === true,
+  JSON.stringify(watchdog.nodeSpawnOptions()),
+);
+check(
+  "the supervised node gets a hidden console (no window, no focus steal)",
+  watchdog.nodeSpawnOptions().windowsHide === true,
+  JSON.stringify(watchdog.nodeSpawnOptions()),
+);
+check(
+  "the compiled watchdog no longer inherits the node's stdio",
+  (() => {
+    const src = fs.readFileSync(path.join(ROOT, "src", "watchdog.ts"), "utf8");
+    const block = src.slice(src.indexOf("function launchNode"));
+    // The launch block must route stdio to the log fd (or "ignore") — never
+    // the literal `stdio: "inherit"` / `stdio: "pipe"` spawn options that
+    // attach the node to the watchdog's console. (The word "inherit" also
+    // appears in explanatory comments, so match the option syntax, not the
+    // word.)
+    return (
+      !/stdio\s*:\s*["']inherit["']/.test(block) &&
+      !/stdio\s*:\s*["']pipe["']/.test(block) &&
+      block.includes("nodeSpawnOptions()") &&
+      (block.includes('"ignore"') || block.includes("openNodeLogFile"))
+    );
+  })(),
+  "launchNode must route stdio to node.log (or ignore), never inherit/pipe",
+);
+check(
+  "node.log lands beside watchdog.log in the persistent data directory",
+  (() => {
+    if (typeof watchdog.NODE_LOG_FILE !== "string") return false;
+    const fd = watchdog.openNodeLogFile();
+    if (fd === null) return false;
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* the open itself is the assertion; a close race is harmless */
+    }
+    return fs.existsSync(path.join(dataDir, watchdog.NODE_LOG_FILE));
+  })(),
+  path.join(dataDir, String(watchdog.NODE_LOG_FILE ?? "node.log")),
+);
+
+// --- 13. Watchdog backgrounding: packaged launches go headless ----------------
+// A double-clicked (or Run-key) watchdog must not own a visible console: a
+// bare packaged launch relaunches hidden via wscript (window style 0) and
+// exits, while CLI invocations and dev/test runs keep their console.
+check(
+  "the backgrounding gate is exported and honours the already-backgrounded flag",
+  (() => {
+    if (typeof watchdog.shouldBackgroundSelf !== "function") return false;
+    const prev = process.env.RIPPA_WATCHDOG_BACKGROUND;
+    process.env.RIPPA_WATCHDOG_BACKGROUND = "1";
+    const declined = watchdog.shouldBackgroundSelf(process.argv) === false;
+    if (prev === undefined) delete process.env.RIPPA_WATCHDOG_BACKGROUND;
+    else process.env.RIPPA_WATCHDOG_BACKGROUND = prev;
+    return declined;
+  })(),
+  "a hidden copy must supervise, never relaunch again",
+);
+check(
+  "foreground CLI flags never trigger a hidden relaunch",
+  typeof watchdog.shouldBackgroundSelf === "function" &&
+    ["--install", "--uninstall", "--status", "--help"].every((flag) => {
+      const prev = process.env.RIPPA_WATCHDOG_BACKGROUND;
+      delete process.env.RIPPA_WATCHDOG_BACKGROUND;
+      const declined = watchdog.shouldBackgroundSelf(["node", "rippa-watchdog.exe", flag]) === false;
+      if (prev === undefined) delete process.env.RIPPA_WATCHDOG_BACKGROUND;
+      else process.env.RIPPA_WATCHDOG_BACKGROUND = prev;
+      return declined;
+    }),
+  "an operator asking --status must keep their console",
+);
+check(
+  "dev and test runs never lose their terminal behind a hidden relaunch",
+  (() => {
+    // This harness runs under plain node (not a packaged exe) with
+    // RIPPA_NODE_EXE set — both must veto backgrounding.
+    const prev = process.env.RIPPA_WATCHDOG_BACKGROUND;
+    delete process.env.RIPPA_WATCHDOG_BACKGROUND;
+    const declined = watchdog.shouldBackgroundSelf(process.argv) === false;
+    if (prev === undefined) delete process.env.RIPPA_WATCHDOG_BACKGROUND;
+    else process.env.RIPPA_WATCHDOG_BACKGROUND = prev;
+    return declined && watchdog.isPackagedBuild() === false;
+  })(),
+  "backgrounding is a packaged-build-only behaviour",
+);
+
 // --- Cleanup -----------------------------------------------------------------
 // The temp data directory holds the lock and log these tests produced. Removing
 // it means a later run starts clean rather than inheriting a previous run's

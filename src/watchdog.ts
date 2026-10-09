@@ -121,6 +121,12 @@ const LOG_MAX_BYTES = 1024 * 1024;
 const RUN_ENTRY_NAME = "RippaWatchdog";
 /** Silent background launcher dropped into the per-user Startup folder. */
 const BG_LAUNCHER_FILE_NAME = "rippa-watchdog-bg.vbs";
+/** Ephemeral relaunch script the watchdog drops when backgrounding itself. */
+const SELF_BACKGROUND_LAUNCHER = "watchdog-hidden.vbs";
+/** Set on the hidden copy so it supervises instead of relaunching again. */
+const BACKGROUND_ENV = "RIPPA_WATCHDOG_BACKGROUND";
+/** File beside watchdog.log that captures the supervised node's stdio. */
+export const NODE_LOG_FILE = "node.log";
 /**
  * Test override for the per-user Startup folder, resolved through an env var
  * so the verification harness can assert on the generated launcher without
@@ -451,19 +457,6 @@ export function installStartupEntry(): void {
     return;
   }
 
-  const exe = watchdogExecutable();
-  const runKey = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-  const reg = spawnSync(
-    "reg.exe",
-    ["ADD", runKey, "/v", RUN_ENTRY_NAME, "/t", "REG_SZ", "/d", `"${exe}"`, "/f"],
-    { stdio: "ignore", windowsHide: true },
-  );
-  if (reg.status === 0) {
-    log(`registered at startup: HKCU Run -> ${exe}`);
-  } else {
-    log(`could not write the HKCU Run entry (reg.exe exited ${reg.status ?? "with an error"}).`);
-  }
-
   /*
     Second, independent mechanism: the per-user Startup folder — as a SILENT
     `.vbs` wrapper, not a `.cmd`. A `.cmd` launcher can only flash-and-hide a
@@ -473,8 +466,28 @@ export function installStartupEntry(): void {
     rewritten by an endpoint agent) still honour this folder, so a node on such
     a machine is not silently never-started.
   */
-  ensureSilentLauncher();
+  const launcher = ensureSilentLauncher();
   removeLegacyCmdLauncher();
+
+  // The Run key points at the SILENT launcher (wscript + window style 0), NOT
+  // at the watchdog exe directly. Pointing it at the exe is the bug this fix
+  // removes: logon would boot a visible console window that then doubles as
+  // the node console for every supervised child. When the launcher could not
+  // be written (roaming profile, locked folder), fall back to the exe so the
+  // node still starts — a visible window beats a dead fleet.
+  const target =
+    launcher !== null ? `wscript.exe "${launcher}"` : watchdogExecutable();
+  const runKey = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+  const reg = spawnSync(
+    "reg.exe",
+    ["ADD", runKey, "/v", RUN_ENTRY_NAME, "/t", "REG_SZ", "/d", target, "/f"],
+    { stdio: "ignore", windowsHide: true },
+  );
+  if (reg.status === 0) {
+    log(`registered at startup: HKCU Run -> ${target}`);
+  } else {
+    log(`could not write the HKCU Run entry (reg.exe exited ${reg.status ?? "with an error"}).`);
+  }
 }
 
 /** Removes both startup entries. Best-effort; safe to run when none exist. */
@@ -592,7 +605,129 @@ export async function applyStagedUpdate(targetExe: string): Promise<boolean> {
 }
 
 /**
- * Boots the worker and resolves once it has exited.
+ * Options that isolate the supervised node into its own hidden console.
+ *
+ * Exported (pure, no side effects) so the verification harness can assert the
+ * isolation contract — `detached` + `windowsHide` + no piped/inherited stdio —
+ * without spawning a process. The `stdio` value itself is chosen in
+ * {@link launchNode} (log file when openable, `"ignore"` otherwise); this only
+ * guarantees no callee can smuggle `inherit` or `pipe` back in by spreading
+ * over it.
+ */
+export function nodeSpawnOptions(): { detached: boolean; windowsHide: boolean } {
+  return { detached: true, windowsHide: true };
+}
+
+/**
+ * Opens (or creates) `node.log` in append mode for the supervised child's
+ * stdio. Rotated at the same 1 MB bound as `watchdog.log` so a chatty node
+ * cannot fill the disk across restarts. Returns null when the log cannot be
+ * opened — the child then runs with `stdio: "ignore"` rather than failing
+ * the launch.
+ */
+export function openNodeLogFile(): number | null {
+  try {
+    const dir = stagingDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, NODE_LOG_FILE);
+    try {
+      if (fs.existsSync(file) && fs.statSync(file).size > LOG_MAX_BYTES) {
+        fs.renameSync(file, `${file}.1`);
+      }
+    } catch {
+      /* rotation is best-effort; the append below still works */
+    }
+    return fs.openSync(file, "a");
+  } catch (error) {
+    log(`could not open ${NODE_LOG_FILE} (${describeError(error)}) — node output will be discarded.`);
+    return null;
+  }
+}
+
+/**
+ * Whether the watchdog should detach itself into a hidden background copy.
+ *
+ * True only for a bare, packaged launch on Windows (a double-click or the Run
+ * key) that has not already backgrounded: no foreground CLI flags
+ * (--install/--uninstall/--status/--help/-h) so an operator asking a question
+ * keeps their console, and no RIPPA-dev overrides (RIPPA_NODE_EXE /
+ * RIPPA_WATCHDOG_STARTUP_DIR / a non-packaged node run) so developers and the
+ * test harness never lose their terminal behind a hidden `wscript` relaunch.
+ */
+export function shouldBackgroundSelf(argv: string[]): boolean {
+  if (process.platform !== "win32") return false;
+  if (process.env[BACKGROUND_ENV] === "1") return false;
+  if (!isPackagedBuild()) return false;
+  if ((process.env.RIPPA_NODE_EXE ?? "").trim()) return false;
+  if ((process.env[STARTUP_DIR_OVERRIDE_ENV] ?? "").trim()) return false;
+  const foreground = new Set(["--install", "--uninstall", "--status", "--help", "-h", "/?"]);
+  if (argv.slice(2).some((arg) => foreground.has(arg))) return false;
+  return true;
+}
+
+/**
+ * Relaunches this watchdog hidden (window style 0) and returns true when the
+ * caller should exit immediately because the background copy owns supervision
+ * now. Returns false when no backgrounding is wanted or the relaunch failed —
+ * the caller then supervises in the foreground instead of going dark without
+ * a supervisor.
+ */
+export function backgroundSelf(): boolean {
+  if (!shouldBackgroundSelf(process.argv)) return false;
+  try {
+    const dir = stagingDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const launcher = path.join(dir, SELF_BACKGROUND_LAUNCHER);
+    // The hidden copy must supervise the SAME node invocation: forward every
+    // argument verbatim (e.g. a fleet `--config` path). Quoting uses the same
+    // `chr(34)` idiom as buildSilentLauncherScript — VBScript string doubling
+    // would corrupt paths containing spaces.
+    const quote = (value: string): string => `chr(34) & "${value.replace(/"/g, "")}" & chr(34)`;
+    const command = [watchdogExecutable(), ...process.argv.slice(2)].map(quote).join(' & " " & ');
+    const script =
+      "Set WshShell = CreateObject(\"WScript.Shell\")\r\n" +
+      `WshShell.Run ${command}, 0, False\r\n`;
+    fs.writeFileSync(launcher, script, "utf8");
+    // The hidden copy inherits this environment through wscript, so it sees
+    // BACKGROUND_ENV=1 and supervises instead of relaunching again. Without
+    // it every copy would spawn another copy — a fork bomb of hidden
+    // watchdogs, each holding no lock but each spawning a node.
+    const hidden = spawn("wscript.exe", [launcher], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env: { ...process.env, [BACKGROUND_ENV]: "1" },
+    });
+    hidden.unref();
+    // The launcher file is intentionally LEFT on disk: wscript parses it at
+    // startup, so deleting it here races the hidden copy's read and can leave
+    // the relaunch with nothing to run. The next launch overwrites it.
+    log("relaunched hidden (window style 0) — the background copy now supervises.");
+    return true;
+  } catch (error) {
+    log(`could not background into a hidden window (${describeError(error)}) — staying in the foreground.`);
+    return false;
+  }
+}
+
+/**
+ * True inside a packaged build of the watchdog (the exe `pkg` emits).
+ *
+ * Exported so the harness can assert the backgrounding gate keys off it.
+ */
+export function isPackagedBuild(): boolean {
+  try {
+    return (
+      typeof (process as NodeJS.Process & { pkg?: unknown }).pkg !== "undefined" ||
+      process.execPath.toLowerCase().endsWith(WATCHDOG_EXE_NAME)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Spawns the worker DETACHED and waits for its exit code.
  *
  * Arguments are forwarded verbatim so a node launched as
  * `rippa-node.exe --config D:\fleet\config.json` comes back the same way. The
@@ -606,10 +741,18 @@ export async function applyStagedUpdate(targetExe: string): Promise<boolean> {
  * on a Ghost Mode `start` — popped a console over the user's screen and took
  * the caret. That is exactly what a background service must never do.
  *
- * It does not cost the operator the node's log output: `stdio: "inherit"`
- * attaches the child to the watchdog's EXISTING console handles, so when the
- * watchdog was started from a terminal the logs still stream to that terminal.
- * What is suppressed is only the creation of a second, focus-stealing window.
+ * STRICT DETACHMENT. The child is spawned `detached` into its own process
+ * group with `windowsHide` (see {@link nodeSpawnOptions}), so Windows gives
+ * it a hidden console of its own — no window, no taskbar button, no focus
+ * steal on a restart or OTA handoff — and its stdio is routed to `node.log`
+ * on disk, or ignored when the log cannot be opened. `stdio: "inherit"` must
+ * NEVER return here: it would re-attach the node to whatever console the
+ * watchdog owns and bring back the exact "watchdog acts as the node console"
+ * symptom (node output in the watchdog's window, supervision dying with it).
+ *
+ * NO `unref()`: detachment isolates the console, it does not release
+ * supervision. The watchdog keeps the child handle and waits for its exit
+ * code — unrefing would let a restart or OTA handoff escape its supervisor.
  *
  * `env: { ...process.env, ... }` IS ALREADY CORRECT AND WAS NOT THE BUG. It
  * forwards the watchdog's entire environment, so anything exported before the
@@ -621,9 +764,16 @@ export async function applyStagedUpdate(targetExe: string): Promise<boolean> {
 function launchNode(nodeExe: string, args: string[]): ChildProcess {
   const cwd = nodeWorkingDirectory(nodeExe);
   log(`starting ${nodeExe} ${args.join(" ")}`.trim());
+  const logFd = openNodeLogFile();
+  const stdio: "ignore" | ["ignore", number, number] =
+    logFd === null ? "ignore" : ["ignore", logFd, logFd];
   const child = spawn(nodeExe, args, {
-    stdio: "inherit",
-    windowsHide: true,
+    ...nodeSpawnOptions(),
+    // The node's output goes to node.log on disk (or nowhere when the log
+    // cannot be opened) — never into this process's console. `inherit` here
+    // would re-attach the node to the watchdog's console window and bring back
+    // the "watchdog acts as the node console" symptom this fixes.
+    stdio,
     env: { ...process.env, [WATCHDOG_ENV_FLAG]: "1" },
     // Without this the child inherits the watchdog's own cwd (the Startup
     // folder) and silently loses the `.env` that carries RIPPA_OLLAMA_MANAGED
@@ -631,7 +781,19 @@ function launchNode(nodeExe: string, args: string[]): ChildProcess {
     // an auto-update" report.
     cwd,
   });
-  child.on("error", (error) => log(`could not start ${nodeExe}: ${describeError(error)}`));
+  const closeNodeLog = () => {
+    if (logFd === null) return;
+    try {
+      fs.closeSync(logFd);
+    } catch {
+      /* already closed — the fd is ours; the child holds its own dup */
+    }
+  };
+  child.on("close", closeNodeLog);
+  child.on("error", (error) => {
+    closeNodeLog();
+    log(`could not start ${nodeExe}: ${describeError(error)}`);
+  });
   return child;
 }
 
@@ -962,6 +1124,7 @@ function reportStatus(nodeExe: string): void {
   }
   console.log(`lock file: ${path.join(stage, WATCHDOG_LOCK_FILE)}`);
   console.log(`log:       ${path.join(stage, "watchdog.log")}`);
+  console.log(`node log:  ${path.join(stage, NODE_LOG_FILE)}`);
 }
 
 /** Entry point. Returns the process exit code. */
@@ -995,6 +1158,16 @@ export async function main(argv: string[]): Promise<number> {
     is idempotent, so a machine that is already registered pays one file
     comparison and nothing else.
   */
+  /*
+    A normal start first backgrounds itself (packaged Windows launches only),
+    then ensures the silent Startup wrapper points at this executable, THEN
+    supervises. Backgrounding first matters: the visible copy exits and the
+    hidden copy performs registration, so the Startup entry and Run key always
+    point at — and are written by — the process that will actually own the
+    lock. CLI invocations (--install/--status/--help) skip backgrounding so
+    the operator keeps their console.
+  */
+  if (backgroundSelf()) return EXIT_SHUTDOWN;
   ensureAutoStart();
 
   /*
