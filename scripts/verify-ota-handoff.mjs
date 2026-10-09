@@ -47,6 +47,9 @@ function runScript(scriptPath) {
     // stdin stays ignored — exactly what the node passes — because the script
     // must not depend on a console. stdout/stderr are piped only so a crash shows.
     stdio: ["ignore", "pipe", "pipe"],
+    // windowsHide: background verification must never flash a console over the
+    // operator's screen or steal OS focus on Windows.
+    windowsHide: true,
     timeout: 120_000,
   });
 }

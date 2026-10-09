@@ -13,7 +13,9 @@ const BUNDLE = path.join(__dirname, "..", ".parity", "bundle.json");
 const OUT = path.join(__dirname, "..", ".parity", "dashboard-brain.png");
 
 void (async () => {
-  const browser = await chromium.launch();
+  // headless:true — background verification must never open a visible browser
+  // GUI that steals OS focus from the operator's desktop.
+  const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1400, height: 1200 } });
   const errors: string[] = [];
   page.on("pageerror", (e) => errors.push(String(e)));

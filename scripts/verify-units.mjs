@@ -1705,7 +1705,7 @@ if (mothershipPresent) {
   // in through a file nothing else here reads.
   const tracked = execSync(
     "git ls-files",
-    { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+    { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, windowsHide: true },
   )
     .split(/\r?\n/)
     .filter(Boolean);

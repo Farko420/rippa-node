@@ -19,7 +19,9 @@ try {
   check("node boots", up);
   if (!up) throw new Error("node did not boot");
 
-  browser = await chromium.launch();
+  // headless:true — background verification must never open a visible browser
+  // GUI that steals OS focus from the operator's desktop.
+  browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1400, height: 1100 } });
   const errors = [];
   page.on("pageerror", (e) => errors.push(String(e)));
