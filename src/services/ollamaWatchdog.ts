@@ -78,6 +78,14 @@ export interface ZeroTouchPlan {
   hostBinary: string | null;
   /** True when the portable runtime will serve (the normal zero-touch path). */
   usingBundledRuntime: boolean;
+  /**
+   * True when the plan binds to an Ollama server the node did NOT start —
+   * the host's own service already answers on 11434. The boot sequence uses
+   * this to suppress `setManaged(true)` (see index.ts): without it the
+   * manager would still spawn the isolated runtime and the 1s HTTP probe
+   * above would be advisory only.
+   */
+  usingHostService?: boolean;
   /** The port the managed server should bind (already claimed free). */
   port: number;
   /** Model that will be ensured after the server answers. */
@@ -182,6 +190,24 @@ export function hostInstallerStagePath(): string {
   } catch {
     return path.join(os.tmpdir(), "rippa-ollama-host-install", name);
   }
+}
+
+/** True when an HTTP GET to /api/tags answers within the timeout. */
+async function ollamaHealthCheck(url: string, timeoutMs = 1000): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    await axios.get(url, { timeout: timeoutMs, signal: controller.signal, proxy: false });
+    clearTimeout(timer);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Checks if a host-side Ollama is already listening on the default port. */
+export async function isHostOllamaRunningOnPort(hostPort = DEFAULT_OLLAMA_PORT): Promise<boolean> {
+  return ollamaHealthCheck(`http://127.0.0.1:${hostPort}/api/tags`);
 }
 
 /** True when a TCP connect to 127.0.0.1:port succeeds (something answers). */
@@ -376,6 +402,28 @@ export async function ensureZeroTouchOllama(
     onProgress("disabled", null, "Zero-touch bootstrap disabled via RIPPA_ZERO_TOUCH_OLLAMA=0.");
     return plan;
   }
+
+  // PRIMARY CHECK: if the host already serves Ollama on the default port,
+  // abort the managed isolated startup entirely and bind the node to 11434.
+  // This prevents spawning a redundant, isolated Ollama instance when the
+  // host already has Ollama running on 11434.
+  const hostAlreadyRunning = await isHostOllamaRunningOnPort(DEFAULT_OLLAMA_PORT);
+  if (hostAlreadyRunning) {
+    const plan: ZeroTouchPlan = {
+      hostBinary: findHostOllamaBinary(),
+      usingBundledRuntime: false,
+      port: DEFAULT_OLLAMA_PORT,
+      model: recommendedPrimaryModel(),
+    };
+    lastPlan = plan;
+    onProgress(
+      "host-ollama",
+      null,
+      "[OllamaWatchdog] Using existing host Ollama service on port 11434",
+    );
+    return plan;
+  }
+
   let hostBinary = findHostOllamaBinary();
   if (hostBinary) {
     onProgress("detect", null, `Found host Ollama binary at ${hostBinary} — managed runtime stays isolated.`);

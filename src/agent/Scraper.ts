@@ -406,7 +406,18 @@ export class ScraperService {
       // Deliberately minimal. `--disable-blink-features=AutomationControlled`
       // is the only flag, and it is anti-bot-detection, not window control.
       // Anything that turns this into a visible window must not be added here.
-      args: ["--disable-blink-features=AutomationControlled"],
+      // `chromiumSandbox: true` keeps the renderer sandboxed, and `handleSIGINT`
+      // / `handleSIGTERM: false` stops Playwright installing its own signal
+      // handlers — the node owns shutdown and a handler race here once wedged
+      // teardown. No `headless: false`, no `channel:`, no `--headless=false`,
+      // `--start-maximized`, `--kiosk` or `--app=` — the headless constraint
+      // above is load-bearing (see getBrowser()). Teardown goes through
+      // `ScraperService.close()` on the node's own shutdown path, which is
+      // why Playwright must not also close it from a signal handler.
+      chromiumSandbox: true,
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      args: ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"],
     });
 
     // If Chromium dies underneath us, drop the handle so the next scrape relaunches.
