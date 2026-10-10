@@ -184,6 +184,24 @@ export interface RippaNodeConfig {
     */
    power_config_updated_at?: string;
 
+  /**
+   * STORAGE & CAPACITY — the node's persistent drive, as set by the Mothership's
+   * "Apply & Migrate" flow (SYSTEM_UPDATE_STORAGE) or hand-edited.
+   *
+   * `RIPPA_DATA_DIR` relocates the whole persistent tree (see utils/paths).
+   * The two capacity quotas are GB figures the node broadcasts on every
+   * heartbeat so the fleet board can show Scratch Drive / Safe Vault headroom.
+   *
+   * CARRIED THROUGH `normalizeConfig` FOR THE SAME REASON AS `GITHUB_OTA_TOKEN`:
+   * `writeConfig` writes what that function returns and is NOT a merge, so
+   * omitting them here would delete the operator's storage configuration on the
+   * next unrelated GUI save — the node would then reboot onto its OLD default
+   * directory, silently undoing a migration that had already copied the data.
+   */
+  RIPPA_DATA_DIR?: string;
+  SCRATCH_DRIVE_CAPACITY_GB?: number;
+  SAFE_VAULT_CAPACITY_GB?: number;
+
   ai_model?: string | null;
 }
 
@@ -272,6 +290,21 @@ function pickString(input: Record<string, unknown>, ...keys: string[]): string {
   return "";
 }
 
+/**
+ * Keeps only a sane capacity figure (GB) when normalising config.json.
+ *
+ * Returns `undefined` for anything absent or garbage so an unset capacity
+ * round-trips as the absence of a value — the same rule the AI fallback fields
+ * follow. The ceiling matches the Mothership's `normaliseGb`, so a value the
+ * fleet board would discard as junk is never persisted in the first place.
+ */
+function normalizeCapacityGb(value: unknown): number | undefined {
+  const num =
+    typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+  if (!Number.isFinite(num) || num <= 0 || num > 1024 * 1024) return undefined;
+  return Math.round(num * 100) / 100;
+}
+
 /** Fills optional/legacy fields with boot-safe defaults so zod always passes. */
 export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
   const record = (cfg ?? {}) as Record<string, unknown>;
@@ -333,6 +366,19 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
     PAIRED_MASTER_AT: pickString(record, "PAIRED_MASTER_AT") || undefined,
     MESH_KEY: pickString(record, "MESH_KEY") || undefined,
     MESH_KEY_ISSUER: pickString(record, "MESH_KEY_ISSUER") || undefined,
+    /*
+      STORAGE & CAPACITY — see the interface note. Present-optional like
+      GITHUB_OTA_TOKEN: absent means "not configured", never a fabricated
+      default, because a default capacity the operator never chose would be
+      broadcast to the fleet board as fact.
+    */
+    RIPPA_DATA_DIR: pickString(record, "RIPPA_DATA_DIR", "ripa_data_dir") || undefined,
+    SCRATCH_DRIVE_CAPACITY_GB: normalizeCapacityGb(
+      record["SCRATCH_DRIVE_CAPACITY_GB"] ?? record["scratch_drive_capacity_gb"],
+    ),
+    SAFE_VAULT_CAPACITY_GB: normalizeCapacityGb(
+      record["SAFE_VAULT_CAPACITY_GB"] ?? record["safe_vault_capacity_gb"],
+    ),
     /*
       ROTATION STATE IS CARRIED THROUGH HERE, for the same reason SATELLITE_REGISTRY
       is: `writeConfig` normalises and writes what this function returns — it does
@@ -638,6 +684,22 @@ export function applyConfigToEnv(cfg: ConfigInput | RippaNodeConfig | null, forc
   // keeps working and an unset config does not shadow it with a blank.
   if (config.IDLE_THROTTLE) {
     put("IDLE_THROTTLE", config.IDLE_THROTTLE);
+  }
+  /*
+    STORAGE & CAPACITY — pushed only when present, for the same reason as
+    GITHUB_OTA_TOKEN and IDLE_THROTTLE: `resolveDataDir` treats a BLANK
+    RIPPA_DATA_DIR as "no override" already, but writing blanks would shadow a
+    legitimate `.env` value the moment anything stopped trimming, and would
+    broadcast a capacity of "" as fact. Absent stays absent.
+  */
+  if (config.RIPPA_DATA_DIR) {
+    put("RIPPA_DATA_DIR", config.RIPPA_DATA_DIR);
+  }
+  if (config.SCRATCH_DRIVE_CAPACITY_GB !== undefined) {
+    put("SCRATCH_DRIVE_CAPACITY_GB", String(config.SCRATCH_DRIVE_CAPACITY_GB));
+  }
+  if (config.SAFE_VAULT_CAPACITY_GB !== undefined) {
+    put("SAFE_VAULT_CAPACITY_GB", String(config.SAFE_VAULT_CAPACITY_GB));
   }
 }
 

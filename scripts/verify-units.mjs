@@ -410,7 +410,235 @@ if (prevMaster === undefined) delete process.env.MASTER_LOCAL_URL; else process.
 */
 configModule.reloadEnv();
 
-// --- 8. Swap script generation -------------------------------------------------
+// --- 7d. STORAGE and CAPACITY (SYSTEM_UPDATE_STORAGE) --------------------------
+// UI-DRIVEN NODE STORAGE: the Apply and Migrate flow. The Mothership queues
+// `system_update_storage`; the node parses it, applies config, copies and
+// verifies persistent data, and (on a real change) exits 42. These checks pin
+// the wire spelling, the ack ordering, validation, and migrate/verify on
+// throwaway directories.
+check(
+  "task type SYSTEM_UPDATE_STORAGE maps to UPDATE_STORAGE",
+  adminCommandForTaskType("SYSTEM_UPDATE_STORAGE") === "UPDATE_STORAGE",
+);
+check(
+  "the bare UPDATE_STORAGE spelling is accepted too",
+  adminCommandForTaskType("UPDATE_STORAGE") === "UPDATE_STORAGE",
+);
+const storageAlias = parsePendingCommands({
+  pending_commands: [{ id: "stor-1", command: "system_update_storage" }],
+});
+check(
+  "the lowercase spelling survives pending_commands parsing",
+  storageAlias.length === 1 && storageAlias[0].command === "UPDATE_STORAGE",
+  JSON.stringify(storageAlias.map((a) => a.command)),
+);
+
+// The command is acknowledged in_progress BEFORE the handler runs, and the
+// payload reaches the handler verbatim — matching RESTART_NODE ordering.
+resetExecutedCommands();
+const storageAcks = [];
+const storageArgsSeen = [];
+await executePendingCommands(
+  [{ id: "stor-2", command: "UPDATE_STORAGE", args: { data_dir: "D:\\RippaNode" } }],
+  {
+    ...ackBase,
+    updateStorage: (args) => {
+      storageArgsSeen.push(args);
+      return true;
+    },
+    acknowledgeCommand: (command, detail, context) =>
+      storageAcks.push({ command, detail, context }),
+  },
+);
+check(
+  "UPDATE_STORAGE is acknowledged in_progress before it runs",
+  storageAcks.length >= 1 &&
+    storageAcks[0].command === "UPDATE_STORAGE" &&
+    storageAcks[0].context?.status === "in_progress",
+  JSON.stringify(storageAcks.map((a) => a.context?.status)),
+);
+check(
+  "the storage payload reaches the handler with its data_dir",
+  storageArgsSeen[0]?.data_dir === "D:\\RippaNode",
+  JSON.stringify(storageArgsSeen[0]),
+);
+
+// A refusing handler is reported honestly, exactly like a refused update.
+resetExecutedCommands();
+const storageRefused = [];
+await executePendingCommands([{ id: "stor-3", command: "UPDATE_STORAGE" }], {
+  ...ackBase,
+  updateStorage: () => false,
+  acknowledgeCommand: (command, detail, context) =>
+    storageRefused.push({ command, detail, context }),
+});
+check(
+  "a refused storage apply is acknowledged twice (in_progress, then failed)",
+  storageRefused.length === 2 &&
+    storageRefused[1].context?.status === "failed" &&
+    storageRefused[1].context?.commandId === "stor-3",
+  JSON.stringify(storageRefused.map((a) => a.context?.status)),
+);
+
+// Payload validation: relative paths, filesystem roots, and garbage
+// capacities are refused with a message the admin screen can show.
+const {
+  parseStorageConfigRequest,
+  applyStorageConfig,
+  buildStorageTelemetry,
+} = await load("dist/services/storageConfig.js");
+for (const [name, payload] of [
+  ["a relative path", { data_dir: "RippaNode" }],
+  ["a filesystem root", { data_dir: "C:\\" }],
+  ["an empty payload", {}],
+  ["a garbage capacity", { scratch_capacity_gb: "lots" }],
+  ["a negative capacity", { scratch_capacity_gb: -4 }],
+]) {
+  let refused = "";
+  try {
+    parseStorageConfigRequest(payload);
+  } catch (error) {
+    refused = error instanceof Error ? error.message : String(error);
+  }
+  check(`an unsafe storage request is refused (${name})`, refused.length > 0, refused);
+}
+check(
+  "a capacity-only request parses without a directory",
+  parseStorageConfigRequest({ scratch_capacity_gb: 50, safe_vault_capacity_gb: 200 })
+    .scratchCapacityGb === 50,
+);
+
+// --- 8e-iii. MIGRATION ON THROWAWAY DIRECTORIES --------------------------------
+// Config is written, persistent data is copied with runtime state left behind,
+// verification passes, and the migrated config names the new directory.
+// RIPPA_CONFIG_ROOT pins writeConfig to the sandbox; a chdir pins the .env
+// upsert there too, so the developer's real config is never touched.
+const prevStorageConfigRoot = process.env.RIPPA_CONFIG_ROOT;
+const prevStorageDataDir = process.env.RIPPA_DATA_DIR;
+const prevStorageScratch = process.env.SCRATCH_DRIVE_CAPACITY_GB;
+const prevStorageVault = process.env.SAFE_VAULT_CAPACITY_GB;
+const prevStorageCwd = process.cwd();
+const storageSandbox = fs.mkdtempSync(path.join(osMod.tmpdir(), "rippa-storage-"));
+const storageOld = path.join(storageSandbox, "old-store");
+const storageNew = path.join(storageSandbox, "new-store");
+fs.mkdirSync(storageOld, { recursive: true });
+fs.writeFileSync(path.join(storageOld, "local_knowledge.db"), "x".repeat(4096));
+fs.writeFileSync(path.join(storageOld, "local_knowledge.db-wal"), "w".repeat(128));
+fs.writeFileSync(
+  path.join(storageOld, "config.json"),
+  JSON.stringify({ NODE_NAME: "storage-verify", NODE_API_KEY: "verify-key-00000001" }),
+);
+fs.mkdirSync(path.join(storageOld, "models"), { recursive: true });
+fs.writeFileSync(path.join(storageOld, "models", "m.gguf"), "y".repeat(2048));
+fs.mkdirSync(path.join(storageOld, "bin"), { recursive: true });
+fs.writeFileSync(path.join(storageOld, "bin", "runtime.exe"), "z".repeat(16));
+fs.writeFileSync(path.join(storageOld, "node.log"), "noise");
+process.env.RIPPA_CONFIG_ROOT = storageOld;
+process.env.RIPPA_DATA_DIR = storageOld;
+process.chdir(storageSandbox);
+let storageReport = null;
+let storageApplyError = "";
+try {
+  storageReport = applyStorageConfig({
+    data_dir: storageNew,
+    scratch_capacity_gb: 25,
+    safe_vault_capacity_gb: 100,
+  });
+} catch (error) {
+  storageApplyError = error instanceof Error ? error.message : String(error);
+}
+check("a directory change applies without throwing", storageReport !== null, storageApplyError);
+check(
+  "the report names the move that happened",
+  storageReport !== null && storageReport.changed === true && storageReport.to === storageNew,
+  JSON.stringify(storageReport && { from: storageReport.from, changed: storageReport.changed }),
+);
+check(
+  "persistent files landed in the new directory",
+  fs.existsSync(path.join(storageNew, "local_knowledge.db")) &&
+    fs.existsSync(path.join(storageNew, "models", "m.gguf")) &&
+    fs.existsSync(path.join(storageNew, "config.json")),
+);
+check(
+  "the migrated bytes match the sources",
+  fs.statSync(path.join(storageNew, "local_knowledge.db")).size === 4096 &&
+    fs.statSync(path.join(storageNew, "models", "m.gguf")).size === 2048,
+);
+check(
+  "runtime state is NOT migrated (bin folder and logs stay behind)",
+  !fs.existsSync(path.join(storageNew, "bin")) && !fs.existsSync(path.join(storageNew, "node.log")),
+);
+const migratedCfg = JSON.parse(fs.readFileSync(path.join(storageNew, "config.json"), "utf8"));
+check(
+  "the migrated config names the new directory and capacities",
+  migratedCfg.RIPPA_DATA_DIR === storageNew &&
+    migratedCfg.SCRATCH_DRIVE_CAPACITY_GB === 25 &&
+    migratedCfg.SAFE_VAULT_CAPACITY_GB === 100,
+  JSON.stringify({
+    RIPPA_DATA_DIR: migratedCfg.RIPPA_DATA_DIR,
+    SCRATCH_DRIVE_CAPACITY_GB: migratedCfg.SCRATCH_DRIVE_CAPACITY_GB,
+  }),
+);
+check(
+  "the source directory survives as a backup (copy, never move)",
+  fs.existsSync(path.join(storageOld, "local_knowledge.db")),
+);
+
+// A capacity-only re-apply against the SAME directory reports changed=false,
+// so an at-least-once redelivery can never become a restart loop.
+process.env.RIPPA_CONFIG_ROOT = storageNew;
+process.env.RIPPA_DATA_DIR = storageNew;
+let noopReport = null;
+try {
+  noopReport = applyStorageConfig({ data_dir: storageNew, scratch_capacity_gb: 25 });
+} catch (error) {
+  noopReport = null;
+}
+check(
+  "re-applying the same directory reports changed=false (no restart needed)",
+  noopReport !== null && noopReport.changed === false,
+  JSON.stringify(noopReport && { changed: noopReport.changed }),
+);
+
+// A nested target (new dir inside the old one) must be refused, or the copy
+// would recurse into itself.
+process.env.RIPPA_DATA_DIR = storageOld;
+let nestedRefused = "";
+try {
+  applyStorageConfig({ data_dir: path.join(storageOld, "nested-inside") });
+} catch (error) {
+  nestedRefused = error instanceof Error ? error.message : String(error);
+}
+check("a nested target directory is refused", nestedRefused.length > 0, nestedRefused);
+
+// The heartbeat telemetry carries the storage block at the payload root,
+// spelled exactly as the Mothership normaliseHeartbeat reads it.
+process.env.RIPPA_DATA_DIR = storageNew;
+process.env.SCRATCH_DRIVE_CAPACITY_GB = "25";
+process.env.SAFE_VAULT_CAPACITY_GB = "100";
+const storageBeat = buildStorageTelemetry();
+check(
+  "the heartbeat telemetry carries the configured capacities",
+  storageBeat.scratch_capacity_gb === 25 && storageBeat.vault_capacity_gb === 100,
+  JSON.stringify(storageBeat),
+);
+check(
+  "the heartbeat telemetry names the active data directory",
+  storageBeat.storage_data_dir === storageNew,
+  String(storageBeat.storage_data_dir),
+);
+
+// Restore the developer environment and remove the sandbox.
+process.chdir(prevStorageCwd);
+if (prevStorageConfigRoot === undefined) delete process.env.RIPPA_CONFIG_ROOT;
+else process.env.RIPPA_CONFIG_ROOT = prevStorageConfigRoot;
+if (prevStorageDataDir === undefined) delete process.env.RIPPA_DATA_DIR;
+else process.env.RIPPA_DATA_DIR = prevStorageDataDir;
+if (prevStorageScratch === undefined) delete process.env.SCRATCH_DRIVE_CAPACITY_GB;
+else process.env.SCRATCH_DRIVE_CAPACITY_GB = prevStorageScratch;
+if (prevStorageVault === undefined) delete process.env.SAFE_VAULT_CAPACITY_GB;
+else process.env.SAFE_VAULT_CAPACITY_GB = prevStorageVault;
+fs.rmSync(storageSandbox, { recursive: true, force: true });
 // The script is what actually replaces the binary, so its contents are the
 // contract. These run against a temp dir and never execute the script.
 const swap = await load("dist/update/swapHandoff.js");

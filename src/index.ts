@@ -199,6 +199,16 @@ async function main(): Promise<void> {
     // CPU load needs two samples separated by an interval, so the sampler
     // must be running before the first heartbeat to report a real figure.
     startVitalsSampler();
+    /*
+      STORAGE USAGE for the heartbeat's Storage & Capacity block. The first
+      sample is taken asynchronously (a multi-GB models walk must not block
+      boot), so early beats report `null` — "not measured yet" — rather than a
+      fabricated zero, and the fleet board renders that honestly.
+    */
+    {
+      const { startStorageUsageSampler } = require("./services/storageConfig") as typeof import("./services/storageConfig");
+      startStorageUsageSampler();
+    }
 
     /*
       SEAMLESS OLLAMA STARTUP — opt-in, zero-touch supervision.
@@ -389,6 +399,38 @@ async function main(): Promise<void> {
         require("./config/nodeAuth").setP2pEnabled(enabled);
       },
       isP2pEnabled: () => require("./config/nodeAuth").p2pEnabled(),
+      /*
+        STORAGE & CAPACITY — write, migrate, verify, then REBOOT onto the new
+        drive. The handler is the same `applyStorageConfig` the queue-task
+        channel reaches through the Orchestrator, wired by reference so the two
+        channels can never drift (see the note at the top of adminCommands).
+
+        THE RETURN VALUE IS THE TRUTH ABOUT A NON-EXITING APPLY. A real
+        directory change exits via `shutdown(..., EXIT_RESTART)` — code 42,
+        which the Watchdog reads as "restart me at once" — so the node comes
+        back on the new path and its very next heartbeat carries the new
+        capacity telemetry. A capacity-only change (or a re-applied identical
+        config, which the at-least-once queue makes likely) reports
+        `changed: false` and returns true WITHOUT restarting: a redelivery
+        must never become a restart loop. Anything that throws is caught by
+        the heartbeat executor and acknowledged as `failed`, leaving the node
+        running from its old directory.
+      */
+      updateStorage: async (args: Record<string, unknown>) => {
+        const { applyStorageConfig } = require("./services/storageConfig") as typeof import("./services/storageConfig");
+        const report = applyStorageConfig(args);
+        if (!report.changed) {
+          console.log(
+            `[Boot] Storage configuration applied in place (data dir unchanged) — scratch ${report.scratchCapacityGb ?? "unset"} GB, vault ${report.safeVaultCapacityGb ?? "unset"} GB.`,
+          );
+          return true;
+        }
+        console.log(
+          `[Boot] Storage migrated ${report.from} → ${report.to} (${report.migrated.length} top-level entries) — restarting onto the new drive.`,
+        );
+        await shutdown("STORAGE_MIGRATION", EXIT_RESTART);
+        return true;
+      },
       // Sent BEFORE the shutdown sequence begins: the update and restart handlers
       // both end in process.exit(0), so anything reported afterwards would never
       // reach the Mothership and the command would sit in the queue unacked.
@@ -513,6 +555,7 @@ async function main(): Promise<void> {
         forceUpdate: adminCommands.forceUpdate,
         setP2pEnabled: adminCommands.setP2pEnabled,
         isP2pEnabled: adminCommands.isP2pEnabled,
+        updateStorage: adminCommands.updateStorage,
         acknowledgeCommand: adminCommands.acknowledgeCommand,
       },
       /*

@@ -21,7 +21,7 @@
     "test:release-workflow": "node scripts/verify-release-workflow.mjs",
     "test:watchdog": "npm run build && node scripts/verify-watchdog.mjs",
     "test:zero-touch": "npm run build && node scripts/verify-zero-touch.mjs",
-    "test:ota": "npm run build && node scripts/verify-ota-handoff.mjs",
+    "test:storage": "npm run build && node scripts/verify-storage.mjs",
     "test:mobile:update": "node scripts/build-mobile-worker.mjs && node scripts/verify-mobile-update.mjs",
     "test:engine": "npm run build && node scripts/verify-engine-cli.mjs && node scripts/verify-engine-health.mjs && node scripts/verify-managed-ollama-origin.mjs && node scripts/verify-ollama-pull.mjs",
     "test:engine:routes": "node scripts/verify-engine-routes.mjs && node scripts/verify-engine-ui.mjs",

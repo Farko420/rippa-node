@@ -91,6 +91,16 @@ export interface AdminCommandDeps {
   /** Enables or disables mesh routing. */
   setP2pEnabled: (enabled: boolean) => Promise<void> | void;
   /**
+   * Applies a Mothership-queued storage configuration (`SYSTEM_UPDATE_STORAGE`).
+   *
+   * Shares the same contract as `CommandHandlers.updateStorage`: a real
+   * directory change exits 42 from inside the handler, and `false` on a
+   * non-exit path means the request was refused or failed. Wired to the SAME
+   * implementation the heartbeat channel uses (see index.ts) so the two
+   * channels cannot drift.
+   */
+  updateStorage: (args: Record<string, unknown>) => Promise<boolean | void> | boolean | void;
+  /**
    * Reports an admin command back to the Mothership so its queue entry is
    * retired. Optional so a host with no uplink can omit it entirely.
    *
@@ -409,6 +419,28 @@ export class Orchestrator {
     if (typeof requested === "boolean") payloadArgs["enabled"] = requested;
     if (args["allow_downgrade"] === true) payloadArgs["allow_downgrade"] = true;
     if (args["allowDowngrade"] === true) payloadArgs["allowDowngrade"] = true;
+    /*
+      STORAGE KEYS ARE FORWARDED VERBATIM TOO — a SYSTEM_UPDATE_STORAGE task
+      that arrives on the queue-task channel carries its directory and
+      capacities in the payload, and dropping them would queue a migration for
+      "nowhere in particular", which the node refuses and reports as failed.
+      Strings and finite numbers only: anything else stays out of the payload
+      the daemon acts on.
+    */
+    for (const key of [
+      "data_dir",
+      "dataDir",
+      "scratch_capacity_gb",
+      "scratchCapacityGb",
+      "safe_vault_capacity_gb",
+      "vault_capacity_gb",
+      "vaultCapacityGb",
+      "safeVaultCapacityGb",
+    ]) {
+      const value = args[key];
+      if (typeof value === "string" && value.trim()) payloadArgs[key] = value.trim();
+      else if (typeof value === "number" && Number.isFinite(value)) payloadArgs[key] = value;
+    }
 
     const executed = await executePendingCommands(
       [
@@ -429,6 +461,7 @@ export class Orchestrator {
         forceUpdate: (options) => this.admin.forceUpdate(options),
         setP2pEnabled: (enabled) => this.admin.setP2pEnabled(enabled),
         isP2pEnabled: () => this.admin.isP2pEnabled(),
+        updateStorage: (storageArgs) => this.admin.updateStorage(storageArgs),
         // Routed through so the queue-task channel is acknowledged to the
         // Mothership on exactly the same terms as the heartbeat channel.
         ...(this.admin.acknowledgeCommand

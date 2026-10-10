@@ -1,4 +1,5 @@
 import { getSystemVitals, type SystemVitals } from "./telemetry";
+import { buildStorageTelemetry } from "./storageConfig";
 import { publishNodeEvent } from "./nodeEvents";
 import { ollamaManager } from "./ollamaManager";
 import { getCurrentVersion, getLastUpdatedAt } from "../update/updateStamp";
@@ -32,7 +33,8 @@ export type RemoteCommandName =
   | "RESTART_NODE"
   | "STOP_NODE"
   | "FORCE_UPDATE"
-  | "TOGGLE_P2P";
+  | "TOGGLE_P2P"
+  | "UPDATE_STORAGE";
 
 /**
  * `START` IS DELIBERATELY ABSENT FROM THIS LIST.
@@ -54,6 +56,7 @@ const COMMAND_ALLOWLIST: readonly RemoteCommandName[] = [
   "STOP_NODE",
   "FORCE_UPDATE",
   "TOGGLE_P2P",
+  "UPDATE_STORAGE",
 ];
 
 /**
@@ -96,6 +99,17 @@ const ADMIN_TASK_TYPES: Readonly<Record<string, RemoteCommandName>> = {
   STOP_SERVICE: "STOP_NODE",
   STOP_NODE_SERVICE: "STOP_NODE",
   TOGGLE_P2P: "TOGGLE_P2P",
+  /*
+    STORAGE & CAPACITY — the UI-driven "Apply & Migrate" flow. The Mothership
+    queues it as `system_update_storage`; the bare `UPDATE_STORAGE` spelling is
+    accepted too because the same task type arrives on the queue-task channel
+    where other admin types are spelled in caps. The payload carries
+    `data_dir`, `scratch_capacity_gb` and `safe_vault_capacity_gb`, and the
+    handler (storageConfig) ends in exit 42 on a real directory change so the
+    Watchdog reboots the node onto its new drive.
+  */
+  SYSTEM_UPDATE_STORAGE: "UPDATE_STORAGE",
+  UPDATE_STORAGE: "UPDATE_STORAGE",
 };
 
 /**
@@ -217,6 +231,21 @@ export interface HeartbeatTelemetry extends SystemVitals {
    * tell "no update on record" from "updated just now".
    */
   last_updated_at: string | null;
+  /**
+   * STORAGE & CAPACITY (0086 + 0101) — the Safe Vault / Scratch Drive block.
+   *
+   * Sent at the payload ROOT, spelled exactly as `normaliseHeartbeat` reads it
+   * on the Mothership (`scratch_used_gb`, `scratch_capacity_gb`,
+   * `vault_used_gb`, `vault_capacity_gb`, `storage_data_dir`). Nullable by
+   * contract: null means "did not report", which leaves the stored columns
+   * alone — a node that has never been configured reports nulls rather than
+   * zeros, so the fleet board can tell "no quota set" from "quota of 0".
+   */
+  storage_data_dir: string | null;
+  scratch_used_gb: number | null;
+  scratch_capacity_gb: number | null;
+  vault_used_gb: number | null;
+  vault_capacity_gb: number | null;
 }
 
 /**
@@ -259,6 +288,18 @@ export interface CommandHandlers {
   setP2pEnabled: (enabled: boolean) => Promise<void> | void;
   /** Reports the node's current P2P state, so TOGGLE_P2P can invert it. */
   isP2pEnabled: () => boolean;
+  /**
+   * Applies a Mothership-queued storage configuration (SYSTEM_UPDATE_STORAGE).
+   *
+   * The payload carries any of `data_dir`, `scratch_capacity_gb` and
+   * `safe_vault_capacity_gb`. A real DIRECTORY CHANGE exits the process with
+   * code 42 from inside the handler — after the caller has acknowledged the
+   * command — so the Watchdog reboots the node onto its new drive. Only the
+   * non-exit paths make the return value observable: `false` means the request
+   * was refused or failed, and the caller then reports `failed` upstream
+   * instead of letting a broken migration read as "completed".
+   */
+  updateStorage: (args: Record<string, unknown>) => Promise<boolean | void> | boolean | void;
   /**
    * Reports an admin command back to the Mothership so the queue entry is
    * retired. This is what stops an executed command being re-sent forever.
@@ -380,6 +421,10 @@ export function buildHeartbeatTelemetry(
     */
     current_version: getCurrentVersion(),
     last_updated_at: getLastUpdatedAt(),
+    /* STORAGE & CAPACITY — see the interface note. Sourced from the same
+       settings the SYSTEM_UPDATE_STORAGE command writes, so the first beat
+       after a migration already carries the new drive's numbers. */
+    ...buildStorageTelemetry(),
   };
 }
 
@@ -772,6 +817,57 @@ export async function executePendingCommands(
           await handlers.setP2pEnabled(next);
           break;
         }
+        case "UPDATE_STORAGE": {
+          /*
+            STORAGE & CAPACITY — write, migrate, verify, REBOOT.
+
+            Announced and acknowledged BEFORE the handler runs, for exactly the
+            reason RESTART_NODE and FORCE_UPDATE are: a successful apply ends
+            in process.exit(42) inside the handler, so anything published or
+            reported afterwards would never reach a browser or the Mothership.
+            "in_progress" rather than "completed" because the reboot has not
+            happened yet — the command id is what retires the queue entry
+            either way, and the node's very first beat on the new drive is the
+            real proof that it worked.
+          */
+          console.log("[Heartbeat] UPDATE_STORAGE — applying storage configuration.");
+          publishNodeEvent({
+            kind: "admin_command",
+            command: "UPDATE_STORAGE",
+            title: "Migrating Storage…",
+            detail:
+              "The Mothership asked this node to move or resize its storage. Persistent data is copied and verified, then the node restarts onto the new drive.",
+            blocking: true,
+          });
+          await acknowledge(handlers, "UPDATE_STORAGE", "accepted — applying storage configuration", {
+            ...ackContext,
+            status: "in_progress",
+          });
+          acknowledgedUpFront = true;
+          const applied = await handlers.updateStorage(entry.args ?? {});
+          if (applied === false) {
+            /*
+              NON-FATAL ABORT — same overlay-lift the FORCE_UPDATE abort paths
+              use. The handler returns `false` only when it did NOT exit, i.e.
+              when the request was refused or the migration failed; the node is
+              still running from its old directory and the dashboard must not
+              sit on "Migrating Storage…" forever.
+            */
+            await acknowledge(handlers, "UPDATE_STORAGE", "failed — the storage configuration was not applied", {
+              ...ackContext,
+              status: "failed",
+            });
+            publishNodeEvent({
+              kind: "admin_command",
+              command: "UPDATE_STORAGE_ABORTED",
+              title: "Storage update cancelled",
+              detail:
+                "Storage update cancelled: the configuration was not applied and the node is still using its current drive. Check the node log for the reason.",
+              blocking: false,
+            });
+          }
+          break;
+        }
       }
       executed.push(entry.command as RemoteCommandName);
       executedCommandIds.add(key);
@@ -824,6 +920,18 @@ export async function executePendingCommands(
           command: "FORCE_UPDATE_ABORTED",
           title: "Update cancelled",
           detail: `Update cancelled: the OTA pipeline failed before swapping (${reason}). The node is still on its current build.`,
+          blocking: false,
+        });
+      }
+      if (command === "UPDATE_STORAGE") {
+        // A thrown apply (bad payload, failed copy, failed verification) never
+        // exited the process, so the blocking "Migrating Storage…" overlay has
+        // to be lifted the same way a failed FORCE_UPDATE lifts its own.
+        publishNodeEvent({
+          kind: "admin_command",
+          command: "UPDATE_STORAGE_ABORTED",
+          title: "Storage update cancelled",
+          detail: `Storage update cancelled: ${reason}. The node is still using its current drive.`,
           blocking: false,
         });
       }
