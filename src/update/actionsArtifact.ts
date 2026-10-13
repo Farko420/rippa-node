@@ -1,4 +1,11 @@
-import { githubHeaders, resolveGitHubToken, GITHUB_REPO } from "./githubAsset";
+import fs from "node:fs";
+import path from "node:path";
+import {
+  currentReleaseAssetName,
+  githubHeaders,
+  resolveGitHubToken,
+  GITHUB_REPO,
+} from "./githubAsset";
 
 /**
  * CI/CD ARTIFACT-BASED OTA — the latest SUCCESSFUL BUILD, not the latest tag.
@@ -257,4 +264,278 @@ export async function fetchLatestArtifactBuild(
     artifactName: artifact.name!,
     ...(run.created_at ? { createdAt: run.created_at } : {}),
   };
+}
+
+/* ===========================================================================
+   THE GITHUB ACTIONS RUN URL — the shape a `FORCE_UPDATE` actually carries.
+
+   WHAT WAS BROKEN. The Mothership's FORCE_UPDATE arrives with a `download_url`
+   that names a CI RUN:
+
+       https://github.com/Farko420/rippa-node/actions/runs/1234567890
+
+   That is an HTML page, not an asset. The OTA pipeline fed it to the RELEASE
+   resolver, which asked `/repos/{repo}/releases/latest` for an asset list — a
+   release that has nothing to do with the run — and then streamed the run URL
+   itself, which answers HTTP 404 to a GET. The node logged
+   "HTTP 404 downloading …" and stayed on the old build, which is exactly the
+   reported symptom. Nothing was wrong with the token or the repo: the URL was
+   being asked for the wrong thing entirely.
+
+   WHAT THE RUN URL ACTUALLY POINTS AT. A run's `actions/upload-artifact` output
+   IS the deployment unit, and it is reachable through the API:
+
+       GET /repos/{repo}/actions/runs/{run_id}/artifacts  → pick the artifact
+       GET /repos/{repo}/actions/artifacts/{id}/zip       → the bytes (ALWAYS a
+                                                            zip, never a bare exe)
+
+   Both endpoints require authentication on a private repository, so
+   {@link resolveActionsRunDownload} refuses to pretend: without a token it
+   reports exactly which env var is missing instead of letting the anonymous 404
+   speak for itself. The zip is unpacked by the caller (see
+   `OtaUpdater.downloadArtifactZip`), because staging an archive named
+   `temp_update.exe` fails the PE check and would brick the node if that check
+   ever moved.
+   =========================================================================== */
+
+/** A run page on github.com: `/<owner>/<repo>/actions/runs/<id>`. */
+const ACTIONS_RUN_PAGE_PATTERN =
+  /^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)/i;
+
+/** The same run through the API: `/repos/<owner>/<repo>/actions/runs/<id>`. */
+const ACTIONS_RUN_API_PATTERN =
+  /^https?:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)/i;
+
+/**
+ * Matches either URL form, capturing `[owner, repo, runId]`.
+ *
+ * A trailing path (`/attempts/2`) is deliberately tolerated: GitHub's UI links
+ * a re-run as `.../actions/runs/<id>/attempts/<n>`, and the artifact list is
+ * keyed on the RUN, so the attempt number is not part of what we ask for.
+ */
+function actionsRunMatch(url: string): RegExpExecArray | null {
+  const trimmed = (url ?? "").trim();
+  return ACTIONS_RUN_PAGE_PATTERN.exec(trimmed) ?? ACTIONS_RUN_API_PATTERN.exec(trimmed);
+}
+
+/** True when `url` names a GitHub Actions RUN rather than a release asset. */
+export function isActionsRunUrl(url: string): boolean {
+  return actionsRunMatch(url) !== null;
+}
+
+/** The `owner/name` a run URL belongs to, or null when it is not a run URL. */
+export function repoFromActionsUrl(url: string): string | null {
+  const match = actionsRunMatch(url);
+  return match ? `${match[1]}/${match[2]}` : null;
+}
+
+/**
+ * The monotonic run id a run URL names, or null.
+ *
+ * Guarded rather than `Number(match[3])` bare: a truncated URL
+ * (`.../actions/runs/`) matches nothing at all, and a value that is not a safe
+ * integer would be interpolated into an API path and 404 there instead of being
+ * reported as the malformed URL it is.
+ */
+export function actionsRunIdFromUrl(url: string): number | null {
+  const match = actionsRunMatch(url);
+  if (!match) return null;
+  const id = Number(match[3]);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+/** A resolved, authenticated Actions-artifact download. */
+export interface ActionsRunDownload {
+  /** `api.github.com` artifact zip endpoint — ALWAYS an archive. */
+  url: string;
+  /** Headers for that GET, carrying the Bearer token. */
+  headers: Record<string, string>;
+  /** The run the artifact came from — the monotonic deployment id. */
+  runId: number;
+  /** Artifact name that was selected, for the log line. */
+  artifactName: string;
+  /** Version parsed out of the run's title, when it carries one. */
+  version?: string;
+}
+
+/** Knobs for {@link resolveActionsRunDownload}; both have safe defaults. */
+export interface ActionsRunResolveOptions {
+  /** Prefix for emitted log lines (`[OTA]` vs `[Updater]`). */
+  logPrefix?: string;
+  /** Sink the caller re-throws into its own failure message. */
+  diagnostics?: string[];
+}
+
+/**
+ * Resolves ONE specific run's artifact build — the run the Mothership named.
+ *
+ * Distinct from {@link fetchLatestArtifactBuild}, which asks "what is the newest
+ * successful run?" This one is TOLD which run to install, so it must not fall
+ * back to a newer one: an operator re-sending a FORCE_UPDATE for a known-good
+ * build has to get THAT build, not whatever CI happened to finish since.
+ *
+ * Never throws: every failure is logged (and pushed into `diagnostics`) and
+ * answered with `null`, so the caller reports a truthful FAILED update instead
+ * of crashing the node mid-command.
+ */
+export async function fetchRunArtifactBuild(
+  repo: string,
+  runId: number,
+  options: { logPrefix?: string; diagnostics?: string[] } = {},
+): Promise<ArtifactBuild | null> {
+  const prefix = options.logPrefix ?? "[Updater]";
+  const emit = (line: string): void => {
+    console.warn(line);
+    options.diagnostics?.push(line);
+  };
+
+  let payload: unknown;
+  try {
+    const response = await fetch(workflowRunArtifactsApiUrl(repo, runId), {
+      headers: githubHeaders(),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) {
+      emit(
+        `${prefix} Artifact list for GitHub Actions run ${runId} returned HTTP ${response.status}` +
+          (response.status === 404
+            ? " — the run does not exist, or the configured token cannot see this private repository"
+            : "") +
+          ".",
+      );
+      return null;
+    }
+    payload = await response.json();
+  } catch (error) {
+    emit(
+      `${prefix} Could not list the artifacts for GitHub Actions run ${runId} — ` +
+        `${error instanceof Error ? error.message : String(error)}.`,
+    );
+    return null;
+  }
+
+  const artifact = selectWorkflowArtifact(payload);
+  if (!artifact || typeof artifact.id !== "number" || typeof artifact.name !== "string") {
+    emit(
+      `${prefix} GitHub Actions run ${runId} published no installable artifact ` +
+        `(expected "${WORKFLOW_ARTIFACT_NAME}", or any non-expired .zip/.exe).`,
+    );
+    return null;
+  }
+
+  return {
+    runId,
+    headSha: "",
+    zipUrl: workflowArtifactZipApiUrl(repo, artifact.id),
+    artifactName: artifact.name,
+    ...(artifact.size_in_bytes ? { sizeInBytes: artifact.size_in_bytes } : {}),
+  };
+}
+
+/**
+ * Turns a GitHub Actions RUN URL into an authenticated artifact download.
+ *
+ * Returns `null` when `url` is not a run URL at all (the caller keeps its
+ * existing release-asset path), and also when the run cannot be resolved — in
+ * which case the diagnostics say why, so the 404 that follows is explained
+ * rather than mysterious.
+ */
+export async function resolveActionsRunDownload(
+  url: string,
+  options: ActionsRunResolveOptions = {},
+): Promise<ActionsRunDownload | null> {
+  const prefix = options.logPrefix ?? "[Updater]";
+  const emit = (line: string): void => {
+    console.warn(line);
+    options.diagnostics?.push(line);
+  };
+
+  if (!isActionsRunUrl(url)) return null;
+
+  const repo = repoFromActionsUrl(url);
+  const runId = actionsRunIdFromUrl(url);
+  if (!repo || runId === null) {
+    emit(
+      `${prefix} The advertised GitHub Actions URL is malformed (${url.trim()}) — expected ` +
+        "https://github.com/<owner>/<repo>/actions/runs/<id>.",
+    );
+    return null;
+  }
+
+  /*
+    THE TOKEN IS MANDATORY HERE, NOT OPTIONAL.
+
+    `actions/*` endpoints are never readable anonymously, on a public OR a
+    private repository, so there is no anonymous mode to degrade into. Naming the
+    missing variable is the whole point: an operator staring at
+    "HTTP 404 downloading .../actions/runs/123" has no way to know the fix is one
+    `.env` line.
+  */
+  if (!resolveGitHubToken()) {
+    emit(
+      `${prefix} Downloading GitHub Actions run ${runId} requires a token — set ` +
+        "GITHUB_OTA_TOKEN (or RIPPA_GITHUB_TOKEN / GITHUB_TOKEN) in the node's .env " +
+        "or config.json. Actions artifacts are never readable anonymously.",
+    );
+    return null;
+  }
+
+  const build = await fetchRunArtifactBuild(repo, runId, {
+    logPrefix: prefix,
+    ...(options.diagnostics ? { diagnostics: options.diagnostics } : {}),
+  });
+  if (!build) return null;
+
+  emit(
+    `${prefix} Resolved GitHub Actions run ${runId} to artifact "${build.artifactName}" — ` +
+      `${build.zipUrl} (the payload is a ZIP and will be unpacked).`,
+  );
+
+  return {
+    url: build.zipUrl,
+    /*
+      The artifact endpoint ALWAYS serves an archive, so `application/octet-stream`
+      would describe the wrong thing; the GitHub JSON accept plus the Bearer token
+      is what this API expects (and what the fleet updater already uses for the
+      very same endpoint).
+    */
+    headers: workflowZipHeaders(),
+    runId: build.runId,
+    artifactName: build.artifactName,
+    ...(build.version ? { version: build.version } : {}),
+  };
+}
+
+/**
+ * Finds the compiled node inside an unpacked workflow artifact.
+ *
+ * EXACT NAME FIRST, then any `.exe` EXCLUDING the watchdog. Installing the
+ * supervisor over the worker is a silent, total failure — the machine comes back
+ * running a watchdog that spawns no node and reports the host offline — so the
+ * watchdog is never a candidate, not even as a last resort.
+ *
+ * Shared by both updaters so a change to the artifact layout (a new subfolder, a
+ * renamed exe) cannot be fixed in one and missed in the other.
+ */
+export function findWorkflowExe(
+  dir: string,
+  preferred: string = currentReleaseAssetName(),
+): string | null {
+  const files: string[] = [];
+  const walk = (current: string, depth: number): void => {
+    if (depth > 4) return;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else files.push(full);
+    }
+  };
+  walk(dir, 0);
+
+  const exes = files.filter((file) => file.toLowerCase().endsWith(".exe"));
+  const exact = exes.find(
+    (file) => path.basename(file).toLowerCase() === preferred.toLowerCase(),
+  );
+  if (exact) return exact;
+  return exes.find((file) => !/watchdog/i.test(path.basename(file))) ?? null;
 }

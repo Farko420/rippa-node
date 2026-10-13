@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import axios from "axios";
+import extract from "extract-zip";
 import { env } from "../config";
 import { APP_VERSION, APP_VERSION_RESOLVED, isVersionNewer, isVersionOlder } from "../version";
 import {
@@ -10,6 +11,7 @@ import {
   currentReleaseAssetName,
   resolveGitHubAssetDownload,
 } from "./githubAsset";
+import { findWorkflowExe, resolveActionsRunDownload } from "./actionsArtifact";
 import type { LatestVersionInfo, SwarmClient } from "../network/SwarmClient";
 import {
   HANDOFF_STAMP,
@@ -431,25 +433,34 @@ export class OtaUpdater {
   }
 
   /**
-   * Streams the new executable to `partialPath`.
+   * Stages the new build into `partialPath`, from whichever payload the
+   * Mothership advertised.
    *
-   * The Mothership's Authorization header is only replayed for same-origin URLs,
-   * so a signed CDN link never receives this node's API key.
+   * THREE PAYLOAD SHAPES, ONE VERIFICATION. The URL in `latest.download_url`
+   * can be:
    *
-   * A GitHub URL is handled by {@link resolveGitHubAssetDownload} instead. That is
-   * what fixes the private-repo 404: `.../releases/latest/download/rippa-node.exe`
-   * answers 404 to ANY anonymous request when the repository is private — which
-   * is indistinguishable from "the asset does not exist" — so the node fetched a
-   * correct URL, with a correct asset name, and could never succeed. When a token
-   * is configured the download is switched to GitHub's authenticated API asset
-   * endpoint with `Accept: application/octet-stream`; with no token the URL is
-   * used unchanged, which is exactly right for a public repository.
+   *   1. a GITHUB ACTIONS RUN (`.../actions/runs/<id>`) — resolved to that run's
+   *      artifact ZIP and unpacked ({@link downloadArtifactZip});
+   *   2. a GitHub RELEASE asset — resolved to the authenticated API endpoint by
+   *      {@link resolveGitHubAssetDownload}. That is what fixes the private-repo
+   *      404: `.../releases/latest/download/rippa-node.exe` answers 404 to ANY
+   *      anonymous request when the repository is private — indistinguishable
+   *      from "the asset does not exist" — so the node fetched a correct URL,
+   *      with a correct asset name, and could never succeed;
+   *   3. anything else (a Mothership-signed CDN link), streamed as-is. The
+   *      Mothership's Authorization header is replayed ONLY for same-origin
+   *      URLs, so a third-party link never receives this node's API key.
    *
-   * WHY THE RESOLUTION'S LOG LINES ARE COLLECTED AND RE-THROWN. The resolver
-   * already prints each failure it survives (401 vs 404 vs no asset). This
-   * method gathers the same lines and appends them to the error it throws, so
-   * the single line the Mothership records as a FAILED update carries the actual
-   * cause instead of a bare "HTTP 404" that three different faults all produce.
+   * All three end in {@link verifyStagedFile}: size floor, PE ("MZ") magic and,
+   * when the Mothership published one, SHA-256. Nothing is promoted to the real
+   * `temp_update.exe` name until that passes.
+   *
+   * WHY THE RESOLUTION'S LOG LINES ARE COLLECTED AND RE-THROWN. The resolvers
+   * already print each failure they survive (401 vs 404 vs no asset vs no
+   * token). This method hands them a shared `diagnostics` sink, which the
+   * streaming step appends to the error it throws — so the single line the
+   * Mothership records as a FAILED update carries the actual cause instead of a
+   * bare "HTTP 404" that four different faults all produce.
    */
   private async download(
     latest: LatestVersionInfo,
@@ -460,6 +471,37 @@ export class OtaUpdater {
     let downloadUrl = latest.downloadUrl;
 
     const diagnostics: string[] = [];
+
+    /*
+      THE GITHUB ACTIONS RUN URL IS TRIED FIRST — it is the shape a FORCE_UPDATE
+      actually carries, and it is NOT a release asset. `resolveGitHubAssetDownload`
+      below would ask `/releases/latest` for an asset list that has nothing to do
+      with the run and then stream the run PAGE, which answers HTTP 404: the
+      reported symptom. `resolveActionsRunDownload` returns null for anything
+      that is not a run URL, so the release path is untouched.
+    */
+    const actionsTarget = await resolveActionsRunDownload(latest.downloadUrl, {
+      logPrefix: "[OTA]",
+      diagnostics,
+    });
+    if (actionsTarget) {
+      downloadUrl = actionsTarget.url;
+      Object.assign(headers, actionsTarget.headers);
+      console.log(
+        `[OTA] GitHub Actions run ${actionsTarget.runId} → artifact ` +
+          `"${actionsTarget.artifactName}" (unpacking the ZIP to find ` +
+          `${currentReleaseAssetName()}).`,
+      );
+      const archiveDigest = await this.downloadArtifactZip(
+        downloadUrl,
+        headers,
+        partialPath,
+        actionsTarget.artifactName,
+      );
+      await this.verifyStagedFile(latest, partialPath, updateFileName, archiveDigest);
+      return;
+    }
+
     const authenticated = await resolveGitHubAssetDownload(latest.downloadUrl, {
       logPrefix: "[OTA]",
       diagnostics,
@@ -472,13 +514,86 @@ export class OtaUpdater {
       headers["Authorization"] = `Bearer ${env.NODE_API_KEY}`;
     }
 
+    const streamedDigest = await this.streamTo(downloadUrl, headers, partialPath, diagnostics);
+    await this.verifyStagedFile(latest, partialPath, updateFileName, streamedDigest);
+  }
+
+  /**
+   * Streams an Actions artifact ZIP and extracts the compiled node from it.
+   *
+   * `actions/artifacts/{id}/zip` ALWAYS serves an archive, never a bare exe, so
+   * staging it verbatim would hand the swap a ZIP named `temp_update.exe` — which
+   * fails the PE check, and would brick the node outright if that check ever
+   * moved. The archive goes to a scratch file, is unpacked, and the exe inside is
+   * COPIED to `partialPath`, after which size/PE/checksum verification runs
+   * unchanged, on the real executable.
+   *
+   * COPY, NOT MOVE: the staging directory and its scratch child can sit on
+   * different volumes, where `renameSync` throws EXDEV — which reads as a
+   * mysterious "update aborted" on exactly the machines that need the update.
+   *
+   * @returns the SHA-256 of the ARCHIVE. The Mothership may have published that
+   *          digest rather than the binary's, and {@link verifyStagedFile}
+   *          accepts either.
+   */
+  private async downloadArtifactZip(
+    url: string,
+    headers: Record<string, string>,
+    partialPath: string,
+    artifactName: string,
+  ): Promise<string> {
+    const scratch = path.join(path.dirname(partialPath), "artifact");
+    const zipPath = `${partialPath}.zip`;
+    const unpackDir = path.join(scratch, "unpacked");
+
+    fs.rmSync(scratch, { recursive: true, force: true });
+    fs.mkdirSync(unpackDir, { recursive: true });
+    try {
+      const archiveDigest = await this.streamTo(url, headers, zipPath);
+      await extract(zipPath, { dir: unpackDir });
+      const exe = findWorkflowExe(unpackDir);
+      if (!exe) {
+        throw new Error(
+          `the GitHub Actions artifact "${artifactName}" published no ` +
+            `${currentReleaseAssetName()} — it contained: ${describeEntries(unpackDir)}`,
+        );
+      }
+      fs.copyFileSync(exe, partialPath);
+      console.log(`[OTA] Unpacked ${path.basename(exe)} from the GitHub Actions artifact.`);
+      return archiveDigest;
+    } finally {
+      // Pure intermediate state: leaving ~126 MB of it behind on every failed
+      // attempt is how the persistent data directory fills up.
+      fs.rmSync(scratch, { recursive: true, force: true });
+      fs.rmSync(zipPath, { force: true });
+    }
+  }
+
+  /**
+   * Streams `url` to `target`, returning the SHA-256 of what was written.
+   *
+   * Shared by both routes so an artifact download and a release-asset download
+   * report identically — an operator debugging a stalled update should not have
+   * to know which one fed it.
+   *
+   * NO SIZE OR SIGNATURE CHECK HAPPENS HERE. On the artifact route the file
+   * streamed is a ZIP, so the MZ magic and the `MIN_UPDATE_BYTES` floor only make
+   * sense on the exe inside it — those live in {@link verifyStagedFile}, which
+   * both routes end in.
+   */
+  private async streamTo(
+    url: string,
+    headers: Record<string, string>,
+    target: string,
+    diagnostics: string[] = [],
+  ): Promise<string> {
     // One line, however many the resolution produced, appended to any failure so
     // the log never shows a 404 without the reason it was a 404.
     const cause = (): string => (diagnostics.length ? ` ${diagnostics.join(" ")}` : "");
 
     let response;
     try {
-      response = await axios.get(downloadUrl, {
+      response = await axios.get(url, {
         responseType: "stream",
         timeout: DOWNLOAD_TIMEOUT_MS,
         headers,
@@ -493,7 +608,7 @@ export class OtaUpdater {
       */
       if (axios.isAxiosError(error) && error.response?.status === 404) {
         throw new Error(
-          `HTTP 404 downloading ${downloadUrl} — either no release asset named ` +
+          `HTTP 404 downloading ${url} — either no release asset named ` +
             `"${currentReleaseAssetName()}" exists on the latest release, or the repository ` +
             `is PRIVATE and no GITHUB_OTA_TOKEN is configured (a private repo 404s every ` +
             `anonymous request). ${OTA_404_HINT}${cause()}`,
@@ -503,7 +618,7 @@ export class OtaUpdater {
       // a rejected token is the single most likely misconfiguration here.
       if (axios.isAxiosError(error) && (error.response?.status === 401 || error.response?.status === 403)) {
         throw new Error(
-          `HTTP ${error.response?.status} downloading ${downloadUrl} — GitHub rejected the ` +
+          `HTTP ${error.response?.status} downloading ${url} — GitHub rejected the ` +
             `configured token: ${statusExplanation(error.response?.status ?? 0)}${cause()}`,
         );
       }
@@ -525,17 +640,41 @@ export class OtaUpdater {
           yield chunk;
         }
       },
-      fs.createWriteStream(partialPath),
+      fs.createWriteStream(target),
     );
 
-    if (bytes < MIN_UPDATE_BYTES) {
+    return hash.digest("hex");
+  }
+
+  /**
+   * Confirms what was staged is a REAL Windows executable of a plausible size
+   * and — when the Mothership published one — matches the expected SHA-256.
+   *
+   * This is what makes the zip route trustworthy: the artifact endpoint could
+   * return a 200 with an HTML error page, a truncated archive, or a superseded
+   * binary, and the only thing standing between any of those and a bricked node
+   * is the MZ magic read here.
+   *
+   * EITHER DIGEST IS ACCEPTED, and the reason is the artifact route. There the
+   * streamed bytes are the ARCHIVE while the staged file is the exe extracted
+   * from it, so a checksum describing either one is a valid integrity check —
+   * and a checksum that matches NEITHER is refused.
+   */
+  private async verifyStagedFile(
+    latest: LatestVersionInfo,
+    partialPath: string,
+    updateFileName: string,
+    streamedDigest?: string,
+  ): Promise<void> {
+    const { size } = fs.statSync(partialPath);
+    if (size < MIN_UPDATE_BYTES) {
       throw new Error(
-        `download is only ${bytes} bytes — expected at least ${formatMb(MIN_UPDATE_BYTES)}`,
+        `download is only ${formatMb(size)} — expected at least ${formatMb(MIN_UPDATE_BYTES)}`,
       );
     }
 
-    // Windows only: the payload must be a real PE executable, not an HTML
-    // error page or a JSON body that happened to return HTTP 200.
+    // Windows only: the payload must be a real PE executable, not an HTML error
+    // page or a JSON body that happened to return HTTP 200.
     if (updateFileName.toLowerCase().endsWith(".exe")) {
       const header = await readFirstBytes(partialPath, 2);
       if (header.toString("latin1") !== "MZ") {
@@ -544,9 +683,13 @@ export class OtaUpdater {
     }
 
     if (latest.sha256) {
-      const digest = hash.digest("hex");
-      if (digest.toLowerCase() !== latest.sha256.toLowerCase()) {
-        throw new Error(`checksum mismatch (expected ${latest.sha256}, got ${digest})`);
+      const expected = latest.sha256.trim().toLowerCase();
+      let matched = streamedDigest?.toLowerCase() === expected;
+      if (!matched) matched = (await sha256OfFile(partialPath)).toLowerCase() === expected;
+      if (!matched) {
+        throw new Error(
+          `checksum mismatch (expected ${latest.sha256}, got ${streamedDigest ?? "no digest"})`,
+        );
       }
       console.log("[OTA] Checksum verified.");
     } else {
@@ -627,6 +770,46 @@ async function readFirstBytes(filePath: string, count: number): Promise<Buffer> 
 
 function formatMb(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Streams a file through SHA-256 and returns the hex digest.
+ *
+ * A separate pass rather than a hash fed by the download stream, because the
+ * artifact route hashes the EXTRACTED EXE — a file that never passed through the
+ * download stream at all. Only reached when the Mothership published a checksum
+ * that the streamed bytes did not already match.
+ */
+async function sha256OfFile(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of fs.createReadStream(filePath)) {
+    hash.update(chunk as Buffer);
+  }
+  return hash.digest("hex");
+}
+
+/**
+ * Names inside a directory, for an error message. Never throws.
+ *
+ * Why it exists at all: "the artifact published no rippa-node.exe" is
+ * unactionable without knowing what it DID publish — a renamed exe, a nested
+ * folder, or an empty archive are three different fixes.
+ */
+function describeEntries(dir: string): string {
+  try {
+    const names: string[] = [];
+    const walk = (current: string, depth: number): void => {
+      if (depth > 4) return;
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        names.push(entry.name);
+        if (entry.isDirectory()) walk(path.join(current, entry.name), depth + 1);
+      }
+    };
+    walk(dir, 0);
+    return names.length ? names.slice(0, 20).join(", ") : "(nothing)";
+  } catch {
+    return "(could not be listed)";
+  }
 }
 
 /**

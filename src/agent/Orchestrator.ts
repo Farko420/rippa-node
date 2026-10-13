@@ -1,5 +1,5 @@
 import { SwarmClient, type SwarmTask } from "../network/SwarmClient";
-import { ScraperService } from "./Scraper";
+import { ScraperService, countPlaceCandidates } from "./Scraper";
 import { OllamaClient } from "./OllamaClient";
 import { OtaUpdater } from "../update/OtaUpdater";
 import { APP_VERSION } from "../version";
@@ -48,6 +48,41 @@ const DYNAMIC_SKILL = "DYNAMIC_SKILL";
  * because the cloud and the queue do not always agree on case.
  */
 const AI_INFERENCE = "AI_INFERENCE";
+
+/**
+ * The `scrape` task type — the Mothership's directed web-scraping work.
+ *
+ * The Mothership assigns `{ url }` (with `target` / `sourceUrl` accepted as
+ * aliases, because the cloud and the queue have never fully agreed on a key) in
+ * `task.payload`; the node fetches that page with the SAME engine the idle
+ * forager uses and POSTs the sanitized body text back via `submitProfile` (kind
+ * `scrape_result`).
+ *
+ * WHY THE MOTHERSHIP NEEDS THIS AT ALL: the page text is the payload it cannot
+ * fetch itself — JS-rendered pages, per-IP content, geo-fenced pages. A node
+ * running headless Chromium on a residential connection is the only thing in the
+ * fleet that can see it.
+ *
+ * Normalised like every other task type, so `scrape`, `SCRAPE` and `Scrape` all
+ * land on the same handler instead of two of the three being silently skipped.
+ */
+const SCRAPE = "SCRAPE";
+
+/**
+ * The `llm_query` task type — the Mothership's local-LLM fallback.
+ *
+ * The Mothership assigns `{ prompt, model?, system?, temperature?, maxTokens? }`
+ * and the node answers with its LOCAL model (the reconciled generation model,
+ * `qwen2.5-coder:7b` on a machine with enough RAM), filed back as a
+ * `llm_query_result`. This is the "the cloud's own model is unavailable or the
+ * prompt must not leave the node" path, so it deliberately never touches an
+ * external API.
+ *
+ * Same payload and same engine as `AI_INFERENCE`; only the report kind and the
+ * log label differ, which is why both are served by one implementation
+ * ({@link Orchestrator.runLocalModelTask}).
+ */
+const LLM_QUERY = "LLM_QUERY";
 
 /**
  * Hooks the fleet controller supplies so an ADMIN task can actually be carried
@@ -354,6 +389,21 @@ export class Orchestrator {
       case "INFERENCE":
         return this.handleAiInference(task);
       /*
+        THE TWO HANDLERS THAT WERE MISSING — the reported
+        `Unhandled task type "scrape"` / `"llm_query"` skip.
+
+        Both types are named in the Mothership's contract and both arrived at the
+        `default:` branch below, which logged a warning and answered `skipped`.
+        The task then sat in the cloud's queue looking assigned-but-undone, which
+        is indistinguishable from a node ignoring its work. Neither needs new
+        machinery: `scrape` drives the scraper the forager already uses, and
+        `llm_query` drives the local model the `ai_inference` path already uses.
+      */
+      case SCRAPE:
+        return this.handleScrapeTask(task);
+      case LLM_QUERY:
+        return this.handleLlmQuery(task);
+      /*
         HEARTBEAT-PULLED FORAGE TARGETS (epic §2): the heartbeat may hand the
         node a `forage_target` wrapped as a FORAGE task (see parseTaskPayload).
         It runs as a priority pass — scrape via Playwright, extract via local
@@ -365,7 +415,6 @@ export class Orchestrator {
       case "FORAGE_TARGET":
         return this.handleForageTask(task);
       // TODO: wire real handlers as they are built, e.g.:
-      //   case "scrape":   → Playwright headless scrape
       //   case "extract":  → Ollama structured extraction
       //   case "verify":   → confidence scoring → verified_knowledge
       default:
@@ -582,12 +631,47 @@ export class Orchestrator {
    * -report the same task.
    */
   private async handleAiInference(task: SwarmTask): Promise<TaskOutcome> {
+    return this.runLocalModelTask(task, AI_INFERENCE, "ai_inference_result");
+  }
+
+  /**
+   * LLM_QUERY — the Mothership's local-LLM fallback, served by the SAME engine
+   * as `ai_inference`.
+   *
+   * Payload shape (all optional except `prompt`):
+   * `{ prompt, model?, system?, temperature?, maxTokens? }`.
+   *
+   * The ONLY differences from `ai_inference` are the log label and the reported
+   * kind (`llm_query_result`), which is exactly why the work itself is not
+   * duplicated: two copies of "prompt in, model text out" would drift, and the
+   * one that drifted would be the one nobody was looking at.
+   *
+   * `reported: true` on every path — this handler files its own result and the
+   * engine's generic `task_result` would double-report the same task.
+   */
+  private async handleLlmQuery(task: SwarmTask): Promise<TaskOutcome> {
+    return this.runLocalModelTask(task, LLM_QUERY, "llm_query_result");
+  }
+
+  /**
+   * THE ONE IMPLEMENTATION behind `ai_inference` and `llm_query`.
+   *
+   * `label` is what the log line calls the task; `reportKind` is the `kind` the
+   * result is filed under. Everything else — prompt extraction, the local
+   * inference call, the success/failure reporting — is shared, so a fix to one
+   * task type is a fix to both.
+   */
+  private async runLocalModelTask(
+    task: SwarmTask,
+    label: string,
+    reportKind: string,
+  ): Promise<TaskOutcome> {
     const payload = task.payload ?? {};
     const prompt = String(payload["prompt"] ?? payload["input"] ?? payload["query"] ?? "").trim();
     if (!prompt) {
-      console.warn(`[Orchestrator] ${AI_INFERENCE} task ${task.id} had no prompt — skipping.`);
+      console.warn(`[Orchestrator] ${label} task ${task.id} had no prompt — skipping.`);
       await this.swarm.submitProfile({
-        kind: "ai_inference_result",
+        kind: reportKind,
         taskId: task.id,
         status: "skipped",
         error: "task carried no prompt",
@@ -597,35 +681,122 @@ export class Orchestrator {
     const startedAt = Date.now();
     try {
       // Static import at the top (pkg snapshot cannot resolve dynamic imports).
+      /*
+        `model` is LEFT UNDEFINED when the task carries none, and that is what
+        makes `runLocalInference` use the node's OWN reconciled generation model
+        (`qwen2.5-coder:7b` on a machine with the RAM for it). Pinning a model
+        here would ignore a fleet-wide model change, and on a low-RAM satellite
+        would ask for weights that were deliberately never pulled.
+      */
       const result = await runLocalInference({
         prompt,
         model: typeof payload["model"] === "string" ? payload["model"] : undefined,
         system: typeof payload["system"] === "string" ? payload["system"] : undefined,
         temperature: typeof payload["temperature"] === "number" ? payload["temperature"] : undefined,
-        maxTokens: typeof payload["maxTokens"] === "number" ? payload["maxTokens"] : undefined,
+        // `max_tokens` accepted too: the queue has always sent the snake_case key.
+        maxTokens: numberOr(payload["maxTokens"] ?? payload["max_tokens"], 0) || undefined,
       });
       const durationMs = Date.now() - startedAt;
       await this.swarm.submitProfile({
-        kind: "ai_inference_result",
+        kind: reportKind,
         taskId: task.id,
         status: "success",
         output: result.text,
         model: result.model,
         durationMs,
       });
-      console.log(`[Orchestrator] ${AI_INFERENCE} ${task.id} completed in ${durationMs}ms (${result.model}).`);
+      console.log(`[Orchestrator] ${label} ${task.id} completed in ${durationMs}ms (${result.model}).`);
       return { status: "success", detail: `inferred in ${durationMs}ms`, reported: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.swarm.submitProfile({
-        kind: "ai_inference_result",
+        kind: reportKind,
         taskId: task.id,
         status: "failed",
         error: message.split("\n")[0] ?? "inference failed",
         durationMs: Date.now() - startedAt,
       });
-      console.warn(`[Orchestrator] ${AI_INFERENCE} ${task.id} failed — ${message.split("\n")[0]}`);
+      console.warn(`[Orchestrator] ${label} ${task.id} failed — ${message.split("\n")[0]}`);
       return { status: "failure", detail: message.split("\n")[0] ?? "inference failed", reported: true };
+    }
+  }
+
+  /**
+   * SCRAPE — a Mothership-directed headless scrape.
+   *
+   * Payload shape: `{ url }`, with `target` / `sourceUrl` accepted as aliases.
+   *
+   * The URL is fetched with the SAME engine the idle forager uses: Playwright /
+   * headless Chromium on a desktop node, and the lightweight `fetch` scraper on a
+   * runtime that has no Chromium (the APK). That routing already lives inside
+   * {@link ScraperService.scrape}, so a scrape task behaves identically however
+   * this node is deployed — including the Chromium bootstrap, the governor's
+   * browser-slot cap, and the 20k-character payload cap.
+   *
+   * The sanitized body text is filed back as a `scrape_result`: that text IS the
+   * payload the Mothership cannot fetch itself (JS-rendered, geo-fenced or
+   * per-IP pages), so it is sent whole rather than summarised here. The local
+   * model is deliberately NOT consulted — extraction is the `extract` task's job,
+   * and spending GPU time on every scrape would make this node a bottleneck
+   * rather than a sensor.
+   *
+   * `reported: true` on every path, because this handler files its own result and
+   * the engine's generic `task_result` would double-report the same task.
+   */
+  private async handleScrapeTask(task: SwarmTask): Promise<TaskOutcome> {
+    const payload = (task.payload ?? {}) as Record<string, unknown>;
+    const url = String(payload["url"] ?? payload["target"] ?? payload["sourceUrl"] ?? "").trim();
+    if (!url) {
+      console.warn(`[Orchestrator] ${SCRAPE} task ${task.id} had no url — skipping.`);
+      await this.swarm.submitProfile({
+        kind: "scrape_result",
+        taskId: task.id,
+        status: "skipped",
+        error: "task carried no url",
+      });
+      return { status: "skipped", detail: "task carried no url", reported: true };
+    }
+
+    const startedAt = Date.now();
+    try {
+      const result = await this.scraper.scrape(url);
+      const durationMs = Date.now() - startedAt;
+      await this.swarm.submitProfile({
+        kind: "scrape_result",
+        taskId: task.id,
+        status: "success",
+        url: result.url,
+        title: result.title,
+        text: result.text,
+        chars: result.text.length,
+        /*
+          A cheap yield hint, not a verdict: how many lines look like a named
+          place or carry coordinates. The Mothership can use it to decide whether
+          the page is worth an `extract` task without downloading the text first.
+        */
+        placeCandidates: countPlaceCandidates(result.text),
+        durationMs,
+      });
+      console.log(
+        `[Orchestrator] ${SCRAPE} ${task.id} completed in ${durationMs}ms (${result.text.length} chars).`,
+      );
+      return {
+        status: "success",
+        detail: `scraped ${result.text.length} chars in ${durationMs}ms`,
+        reported: true,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.swarm.submitProfile({
+        kind: "scrape_result",
+        taskId: task.id,
+        status: "failed",
+        url,
+        error: message.split("\n")[0] ?? "scrape failed",
+        durationMs: Date.now() - startedAt,
+      });
+      console.warn(`[Orchestrator] ${SCRAPE} ${task.id} failed — ${message.split("\n")[0]}`);
+      return { status: "failure", detail: message.split("\n")[0] ?? "scrape failed", reported: true };
     }
   }
 

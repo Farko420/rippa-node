@@ -5,7 +5,10 @@
  * exe runs, with a stub SwarmClient that records exactly what it was asked to do.
  */
 import fs from "node:fs";
+import os from "node:os";
+import http from "node:http";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { ROOT, check, warn, results } from "./verify-harness.mjs";
@@ -2261,6 +2264,361 @@ check(
 check(
   "a renamed artifact still resolves via the .zip/.exe fallbacks",
   actions.selectWorkflowArtifact({ artifacts: [{ id: 6, name: "build.zip" }] })?.id === 6,
+);
+
+// --- THE GITHUB ACTIONS RUN URL — the shape a FORCE_UPDATE actually carries ---
+/*
+ * THE REPORTED 404. The Mothership's FORCE_UPDATE advertises a CI RUN
+ * (https://github.com/<owner>/<repo>/actions/runs/<id>), which is an HTML page
+ * and NOT a release asset. Fed to the release resolver it produced a genuine
+ * "HTTP 404 downloading ..." and the node stayed on the old build forever. These
+ * checks pin the URL grammar, the resolution of that run's OWN artifact, and the
+ * Bearer header that makes a private repository readable at all.
+ */
+const RUN_PAGE = "https://github.com/Farko420/rippa-node/actions/runs/4242";
+const RUN_API = "https://api.github.com/repos/Farko420/rippa-node/actions/runs/4242";
+check("an Actions run PAGE url is recognised", actions.isActionsRunUrl(RUN_PAGE) === true);
+check("an Actions run API url is recognised", actions.isActionsRunUrl(RUN_API) === true);
+check(
+  "a release URL is NOT mistaken for an Actions run",
+  actions.isActionsRunUrl(
+    "https://github.com/Farko420/rippa-node/releases/latest/download/rippa-node.exe",
+  ) === false,
+);
+check(
+  "the repo is parsed out of both run URL forms",
+  actions.repoFromActionsUrl(RUN_PAGE) === "Farko420/rippa-node" &&
+    actions.repoFromActionsUrl(RUN_API) === "Farko420/rippa-node",
+);
+check(
+  "the run id is parsed out of both run URL forms",
+  actions.actionsRunIdFromUrl(RUN_PAGE) === 4242 && actions.actionsRunIdFromUrl(RUN_API) === 4242,
+);
+check(
+  "a re-run's /attempts/ url still names the RUN",
+  actions.actionsRunIdFromUrl(`${RUN_PAGE}/attempts/2`) === 4242,
+);
+check(
+  "a run URL with no id yields null, never NaN",
+  actions.actionsRunIdFromUrl("https://github.com/o/r/actions/runs/") === null &&
+    actions.repoFromActionsUrl("https://github.com/o/r/actions/runs/") === null,
+);
+
+// THE RESOLUTION ITSELF, with fetch stubbed: the RUN's artifact list is queried
+// (never the release feed) and the answer is the authenticated zip endpoint.
+{
+  const REAL_FETCH = globalThis.fetch;
+  const REAL_WARN = console.warn;
+  const savedToken = process.env.GITHUB_OTA_TOKEN;
+  const savedRippa = process.env.RIPPA_GITHUB_TOKEN;
+  delete process.env.RIPPA_GITHUB_TOKEN;
+  try {
+    process.env.GITHUB_OTA_TOKEN = "ghp_actions_run";
+    let asked = [];
+    const lines = [];
+    console.warn = (line) => lines.push(String(line));
+    globalThis.fetch = async (url) => {
+      asked.push(String(url));
+      return { ok: true, json: async () => ({ artifacts: [{ id: 99, name: "rippa-node-windows" }] }) };
+    };
+    const target = await actions.resolveActionsRunDownload(RUN_PAGE, { logPrefix: "[OTA]" });
+    check(
+      "an Actions run URL resolves to the artifact ZIP endpoint (never the run page)",
+      target?.url === "https://api.github.com/repos/Farko420/rippa-node/actions/artifacts/99/zip",
+      JSON.stringify(target),
+    );
+    check(
+      "the artifact download carries GITHUB_OTA_TOKEN as a Bearer header",
+      target?.headers?.Authorization === "Bearer ghp_actions_run",
+      JSON.stringify(target?.headers),
+    );
+    check(
+      "the run id and artifact name travel with the download",
+      target?.runId === 4242 && target?.artifactName === "rippa-node-windows",
+      JSON.stringify(target),
+    );
+    check(
+      "the RUN's artifact list is queried, not the release feed",
+      asked.length === 1 &&
+        asked[0] ===
+          "https://api.github.com/repos/Farko420/rippa-node/actions/runs/4242/artifacts",
+      JSON.stringify(asked),
+    );
+    check(
+      "the resolution logs the run and the artifact it chose",
+      lines.some((l) => l.includes("run 4242") && l.includes("rippa-node-windows")),
+      JSON.stringify(lines),
+    );
+
+    // NO TOKEN — the diagnosis must name the env var, or the 404 that follows is
+    // indistinguishable from a missing artifact.
+    delete process.env.GITHUB_OTA_TOKEN;
+    asked = [];
+    lines.length = 0;
+    const noToken = await actions.resolveActionsRunDownload(RUN_PAGE, { logPrefix: "[OTA]" });
+    check("without a token the run URL is NOT resolved (no anonymous actions API)", noToken === null);
+    check("without a token no API call is wasted", asked.length === 0, JSON.stringify(asked));
+    check(
+      "the missing-token diagnosis names GITHUB_OTA_TOKEN and config.json",
+      lines.some((l) => l.includes("GITHUB_OTA_TOKEN") && l.includes("config.json")),
+      JSON.stringify(lines),
+    );
+
+    // A 404 FROM THE ARTIFACT LIST — reported as such, and never thrown.
+    process.env.GITHUB_OTA_TOKEN = "ghp_actions_run";
+    lines.length = 0;
+    globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
+    const missing = await actions.resolveActionsRunDownload(RUN_API, { logPrefix: "[OTA]" });
+    check("a 404 from the artifact list resolves to null (never throws)", missing === null);
+    check(
+      "the 404 explains it is the run or the token, not a missing asset",
+      lines.some((l) => l.includes("404") && /token/i.test(l)),
+      JSON.stringify(lines),
+    );
+  } finally {
+    globalThis.fetch = REAL_FETCH;
+    console.warn = REAL_WARN;
+    if (savedToken === undefined) delete process.env.GITHUB_OTA_TOKEN;
+    else process.env.GITHUB_OTA_TOKEN = savedToken;
+    if (savedRippa === undefined) delete process.env.RIPPA_GITHUB_TOKEN;
+    else process.env.RIPPA_GITHUB_TOKEN = savedRippa;
+  }
+}
+
+// THE EXE INSIDE THE ARTIFACT. Installing the watchdog over the worker is a
+// silent, total failure, so the exact name wins and the supervisor is never a
+// fallback candidate.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rippa-artifact-"));
+  try {
+    fs.mkdirSync(path.join(dir, "dist"));
+    fs.writeFileSync(path.join(dir, "dist", "rippa-node.exe"), "MZ");
+    fs.writeFileSync(path.join(dir, "rippa-node-watchdog.exe"), "MZ");
+    check(
+      "the compiled node is found inside a nested artifact folder",
+      path.basename(actions.findWorkflowExe(dir) ?? "") === "rippa-node.exe",
+      String(actions.findWorkflowExe(dir)),
+    );
+    fs.rmSync(path.join(dir, "dist", "rippa-node.exe"));
+    check(
+      "with only the watchdog present, nothing is installed",
+      actions.findWorkflowExe(dir) === null,
+      String(actions.findWorkflowExe(dir)),
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A minimal STORED (uncompressed) ZIP writer — no dependencies.
+ *
+ * WHY HAND-ROLLED: the suite has to prove the OTA pipeline unpacks a real
+ * archive, and `extract-zip` only READS. A hand-built STORED archive is ~40
+ * lines of well-specified format, versus a new build dependency in a repository
+ * whose whole install is deliberately small.
+ */
+function makeStoredZip(entries) {
+  const table = new Int32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[i] = c;
+  }
+  const crc32 = (buf) => {
+    let crc = -1;
+    for (const byte of buf) crc = (crc >>> 8) ^ table[(crc ^ byte) & 0xff];
+    return (crc ^ -1) >>> 0;
+  };
+
+  const local = [];
+  const central = [];
+  let offset = 0;
+  for (const { name, data } of entries) {
+    const nameBuf = Buffer.from(name, "utf8");
+    const crc = crc32(data);
+    const header = Buffer.alloc(30);
+    header.writeUInt32LE(0x04034b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt32LE(crc, 14);
+    header.writeUInt32LE(data.length, 18);
+    header.writeUInt32LE(data.length, 22);
+    header.writeUInt16LE(nameBuf.length, 26);
+    local.push(header, nameBuf, data);
+
+    const entry = Buffer.alloc(46);
+    entry.writeUInt32LE(0x02014b50, 0);
+    entry.writeUInt16LE(20, 4);
+    entry.writeUInt16LE(20, 6);
+    entry.writeUInt32LE(crc, 16);
+    entry.writeUInt32LE(data.length, 20);
+    entry.writeUInt32LE(data.length, 24);
+    entry.writeUInt16LE(nameBuf.length, 28);
+    entry.writeUInt32LE(offset, 42);
+    central.push(entry, nameBuf);
+    offset += header.length + nameBuf.length + data.length;
+  }
+
+  const centralBuf = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralBuf.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...local, centralBuf, end]);
+}
+
+// --- THE UNZIP PATH, END TO END ----------------------------------------------
+/*
+ * The GitHub Actions artifact endpoint ALWAYS serves a ZIP, so the OTA pipeline
+ * has to unpack it and stage the exe inside. This drives the real
+ * `downloadArtifactZip` against a real HTTP server and a real archive — because
+ * a resolver that returns the right URL still leaves the node bricked if the
+ * bytes are staged as a ZIP named `temp_update.exe`.
+ */
+{
+  const { OtaUpdater } = await load("dist/update/OtaUpdater.js");
+
+  const exeBytes = Buffer.concat([Buffer.from("MZ"), Buffer.alloc(1_200_000, 0x41)]);
+  const goodZip = makeStoredZip([
+    { name: "rippa-node.exe", data: exeBytes },
+    { name: "rippa-node-watchdog.exe", data: Buffer.from("MZ") },
+  ]);
+  const watchdogOnlyZip = makeStoredZip([{ name: "rippa-node-watchdog.exe", data: Buffer.from("MZ") }]);
+  const archiveDigest = createHash("sha256").update(goodZip).digest("hex");
+
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/zip" });
+    res.end(req.url === "/watchdog-only.zip" ? watchdogOnlyZip : goodZip);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rippa-ota-"));
+  const partial = path.join(dir, "temp_update.exe.part");
+  const updater = new OtaUpdater({});
+  try {
+    const digest = await updater.downloadArtifactZip(
+      `${origin}/artifact.zip`,
+      {},
+      partial,
+      "rippa-node-windows",
+    );
+    const staged = fs.readFileSync(partial);
+    check(
+      "the Actions ZIP is unpacked and the node exe is staged (not the archive)",
+      staged.subarray(0, 2).toString("latin1") === "MZ" && staged.length === exeBytes.length,
+      `${staged.subarray(0, 2).toString("latin1")} / ${staged.length} bytes`,
+    );
+    check(
+      "the ARCHIVE's digest is returned so a published checksum can be verified",
+      digest === archiveDigest,
+      digest,
+    );
+    check(
+      "no scratch archive or unpack directory is left behind",
+      !fs.existsSync(`${partial}.zip`) && !fs.existsSync(path.join(dir, "artifact")),
+    );
+
+    // A checksum describing the ARCHIVE is accepted for the exe it contained.
+    await updater.verifyStagedFile(
+      { version: "9.9.9", downloadUrl: `${origin}/artifact.zip`, sha256: archiveDigest },
+      partial,
+      "rippa-node.exe",
+      digest,
+    );
+    check("a published ARCHIVE checksum verifies the extracted exe", true);
+
+    // A checksum matching NEITHER the archive nor the exe is refused.
+    let refused = null;
+    try {
+      await updater.verifyStagedFile(
+        { version: "9.9.9", downloadUrl: `${origin}/artifact.zip`, sha256: "0".repeat(64) },
+        partial,
+        "rippa-node.exe",
+        digest,
+      );
+    } catch (error) {
+      refused = String(error?.message ?? error);
+    }
+    check("a checksum matching neither the archive nor the exe is refused", /checksum mismatch/.test(refused ?? ""), String(refused));
+
+    // An artifact with no worker in it must NEVER install the watchdog over it.
+    let emptyError = null;
+    try {
+      await updater.downloadArtifactZip(
+        `${origin}/watchdog-only.zip`,
+        {},
+        partial,
+        "rippa-node-windows",
+      );
+    } catch (error) {
+      emptyError = String(error?.message ?? error);
+    }
+    check(
+      "an artifact carrying only the watchdog is refused, and says what it found",
+      /published no rippa-node\.exe/.test(emptyError ?? "") && /watchdog/i.test(emptyError ?? ""),
+      String(emptyError),
+    );
+  } finally {
+    server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// THE WIRING, ASSERTED AT THE SOURCE. A resolver nothing calls changes nothing,
+// and a resolved ZIP that is streamed verbatim fails the PE check — so both the
+// branch and the unpack are pinned here.
+check(
+  "the Mothership OTA path resolves an Actions run URL before the release feed",
+  otaSource.includes("resolveActionsRunDownload(") &&
+    otaSource.indexOf("resolveActionsRunDownload(") <
+      otaSource.indexOf("await resolveGitHubAssetDownload("),
+  `run@${otaSource.indexOf("resolveActionsRunDownload(")} release@${otaSource.indexOf(
+    "await resolveGitHubAssetDownload(",
+  )}`,
+);
+check(
+  "the Actions artifact is unpacked before the staged file is verified",
+  otaSource.includes('from "extract-zip"') &&
+    otaSource.includes("await extract(zipPath, { dir: unpackDir })") &&
+    otaSource.indexOf("await this.downloadArtifactZip(") <
+      otaSource.indexOf("await this.verifyStagedFile("),
+);
+
+// --- THE TWO MISSING TASK HANDLERS -------------------------------------------
+/*
+ * The reported `Unhandled task type "scrape"` / `"llm_query"` skip: both types
+ * are named in the Mothership's contract and both fell to the `default:` branch,
+ * which logs a warning and answers `skipped` — the task then sat in the cloud's
+ * queue looking assigned-but-undone. The handlers are private and need a live
+ * scraper/model, so the mapping itself is asserted at the source.
+ */
+const orchestratorSource = readFileSync(
+  path.join(ROOT, "src", "agent", "Orchestrator.ts"),
+  "utf8",
+);
+check(
+  "the orchestrator maps the `scrape` task type to the Playwright scraper",
+  orchestratorSource.includes('const SCRAPE = "SCRAPE"') &&
+    /case SCRAPE:\s*\r?\n\s*return this\.handleScrapeTask\(task\);/.test(orchestratorSource) &&
+    orchestratorSource.includes("await this.scraper.scrape(url)"),
+);
+check(
+  "the orchestrator maps `llm_query` to the local Ollama engine",
+  orchestratorSource.includes('const LLM_QUERY = "LLM_QUERY"') &&
+    /case LLM_QUERY:\s*\r?\n\s*return this\.handleLlmQuery\(task\);/.test(orchestratorSource) &&
+    orchestratorSource.includes("runLocalInference("),
+);
+check(
+  "both new handlers file their own result kind (no double reporting)",
+  orchestratorSource.includes('kind: "scrape_result"') &&
+    orchestratorSource.includes('"llm_query_result"'),
+);
+check(
+  "`scrape` is no longer listed as an unwired TODO",
+  !/case "scrape":\s*→/.test(orchestratorSource),
 );
 
 // THE FRESHNESS RULE. Run IDs decide when both sides have one — this is the
