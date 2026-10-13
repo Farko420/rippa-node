@@ -85,6 +85,24 @@ const SCRAPE = "SCRAPE";
 const LLM_QUERY = "LLM_QUERY";
 
 /**
+ * The `deep_research` task type — the Mothership's retrieval-augmented research
+ * work, and the one kind every research dispatcher in the fleet shares.
+ *
+ * The Mothership queues it from the member chat (`deep-research.server.ts`), the
+ * Admin Co-Pilot's shadow dispatch, the mass place scrub
+ * (`place-scrub.server.ts`) and the RI ripple sweeper — all under this single
+ * kind, told apart by the `task_marker` in the payload rather than by a kind of
+ * their own. The node's job is identical in every case: fetch what the web says
+ * about the subject, run the LOCAL model over it, and file atomic source-grounded
+ * facts back as a `research_result`.
+ *
+ * Normalised like every other task type, so `deep_research`, `DEEP_RESEARCH` and
+ * `Deep_Research` all land on the same handler instead of two of the three being
+ * silently skipped.
+ */
+const DEEP_RESEARCH = "DEEP_RESEARCH";
+
+/**
  * Hooks the fleet controller supplies so an ADMIN task can actually be carried
  * out. Kept as a constructor option rather than reaching for module state, so the
  * orchestrator stays testable and the boot sequence in index.ts owns the wiring.
@@ -403,6 +421,26 @@ export class Orchestrator {
         return this.handleScrapeTask(task);
       case LLM_QUERY:
         return this.handleLlmQuery(task);
+      /*
+        THE THIRD MISSING HANDLER — the reported
+        `Unhandled task type "deep_research"` skip.
+
+        `deep_research` has been in the Mothership's `SWARM_TASK_KINDS` since the
+        swarm shipped, and it is the kind four separate dispatchers queue: the
+        member chat's mid-conversation research, the Admin Co-Pilot's shadow
+        dispatch, the mass place scrub, and the RI ripple sweeper. The node had no
+        branch for it, so every one of those fell to `default:`, was logged as
+        unhandled and answered `skipped` — leaving the row claimed-but-undone in
+        the cloud, which is indistinguishable from a node ignoring its work.
+
+        Unlike `scrape` and `llm_query` this one is not a single existing call:
+        it is the RAG path, and it is composed from machinery this class already
+        owns — the Playwright scraper fetches the sources, the local Ollama model
+        synthesises them — rather than a second copy of either.
+      */
+      case DEEP_RESEARCH:
+      case "DEEP_RESEARCH_TASK":
+        return this.handleDeepResearch(task);
       /*
         HEARTBEAT-PULLED FORAGE TARGETS (epic §2): the heartbeat may hand the
         node a `forage_target` wrapped as a FORAGE task (see parseTaskPayload).
@@ -889,6 +927,169 @@ export class Orchestrator {
    * itself, so the probe answers false and never interrupts; the abort signal
    * is omitted for the same reason.
    */
+  /**
+   * DEEP_RESEARCH — the Mothership's RAG task: fetch the sources, synthesise
+   * them with the LOCAL model, file the answer as a `research_result`.
+   *
+   * WHY THIS IS A COMPOSITION AND NOT A NEW ENGINE. Both halves already exist and
+   * are already governed: {@link ScraperService.scrape} is the same Playwright
+   * path `scrape` and the idle forager use (Chromium bootstrap, Governor
+   * browser-slot cap, 20k-character page cap), and `runLocalInference` is the
+   * same dynamic-port Ollama call `ai_inference` and `llm_query` use. Deep
+   * research is the RETRIEVE-then-GENERATE step that was missing between them, so
+   * it is written as exactly that and nothing more.
+   *
+   * PAYLOAD SHAPES IT ACCEPTS. The Mothership queues this kind from four places
+   * and they do not agree on keys, so the handler reads the union rather than one
+   * caller's spelling:
+   *
+   *   member chat    `{ entity, entity_key, instruction, requestedBy }`
+   *   place scrub    `{ name, place_id, instruction, system_prompt, context }`
+   *   ripple/forage  `{ entity, instruction }`
+   *   direct ask     `{ query | topic, url | urls[], prompt }`
+   *
+   * THE ANSWER'S SHAPE IS THE MOTHERSHIP'S, NOT OURS: `{ subject, facts: [{ fact,
+   * category, confidence, sourceUrl }] }`, which is the return shape both the
+   * member-chat instruction and the scrub's `return_shape` spell out. The prose
+   * the model wrote travels beside it as `summary`, because the scrub's
+   * deliverable IS prose and dropping it would make this handler useless to the
+   * one caller that asked for text.
+   *
+   * AN EMPTY ANSWER IS A REAL ANSWER. A node that cannot ground a fact returns an
+   * empty list instead of guessing, and that is filed as a success — the contract
+   * the dispatch instruction states, and the reason this handler never
+   * manufactures a fact to look productive.
+   *
+   * `reported: true` on every path: this handler files its own result and the
+   * engine's generic `task_result` would double-report the same task.
+   */
+  private async handleDeepResearch(task: SwarmTask): Promise<TaskOutcome> {
+    const payload = (task.payload ?? {}) as Record<string, unknown>;
+    const subject =
+      firstString(payload, ["entity", "subject", "name", "place", "query", "topic", "title"]) ?? task.id;
+    const instruction = firstString(payload, ["instruction", "prompt", "task", "question"]);
+    const systemPrompt = firstString(payload, ["system_prompt", "systemPrompt"]);
+    const urls = collectResearchUrls(payload);
+    const knownContext = collectResearchContext(payload);
+    const startedAt = Date.now();
+
+    /*
+      NOTHING TO RESEARCH IS A SKIP, NOT A FAILURE. A payload that lost its
+      subject, its instruction and its URLs is one this node cannot act on, and
+      `skipped` retires it upstream instead of leaving it claimed. An id-only
+      subject is the tell: no dispatcher sends a research task without naming what
+      to research.
+    */
+    if (!instruction && urls.length === 0 && !knownContext.trim() && subject === task.id) {
+      console.warn(
+        `[Orchestrator] ${DEEP_RESEARCH} task ${task.id} carried no subject, instruction or url — skipping.`,
+      );
+      await this.swarm.submitProfile({
+        kind: "research_result",
+        taskId: task.id,
+        status: "skipped",
+        error: "task carried no subject, instruction or url",
+      });
+      return { status: "skipped", detail: "task carried no subject, instruction or url", reported: true };
+    }
+
+    try {
+      /*
+        RETRIEVE. Scrape failures are collected rather than thrown: a task with
+        three URLs where one is dead still has two sources, and failing the whole
+        job on the dead one would throw away work already done. The list travels
+        upstream, so the Mothership can see which of ITS sources a node could not
+        reach — the half it cannot observe any other way.
+      */
+      const sources: Array<{ url: string; title: string }> = [];
+      const sourceBlocks: string[] = [];
+      const failed: string[] = [];
+      for (const url of urls) {
+        try {
+          const page = await this.scraper.scrape(url);
+          sources.push({ url: page.url, title: page.title });
+          sourceBlocks.push(`SOURCE: ${page.url}\n${page.title}\n${page.text}`);
+        } catch (error) {
+          failed.push(`${url} (${firstLineOf(error)})`);
+        }
+      }
+      if (urls.length > 0 && sources.length === 0) {
+        throw new Error(`every source failed to fetch: ${failed.join("; ")}`);
+      }
+      const sourcesText = sourceBlocks.join("\n\n").slice(0, MAX_RESEARCH_CORPUS_CHARS);
+
+      // GENERATE — against the LOCAL model, over the pages this node just
+      // fetched. The Mothership's own instruction wins when it sent one; the
+      // model is never asked to invent its own brief.
+      const inference = await runLocalInference({
+        prompt: buildResearchPrompt({ subject, instruction, knownContext, sources: sourcesText }),
+        system: systemPrompt ?? RESEARCH_SYSTEM_PROMPT,
+      });
+      const parsed = parseResearchOutput(inference.text, subject);
+
+      /*
+        THE EXTRACTION FALLBACK, for a model that answered in prose. Prose alone
+        is not what the brain ingests, and `extractFacts` is this node's existing
+        schema-validated `verified_knowledge` path (the forager and the ingestion
+        engine both file through it), so ONE call over the sources recovers at
+        least one groundable fact. It runs ONLY when the reply was not structured:
+        a valid answer with an empty facts array is the model saying "nothing
+        verifiable", and re-asking would be the node arguing with its own model.
+      */
+      let facts = parsed.facts;
+      if (!parsed.structured && facts.length === 0 && sourcesText.trim()) {
+        const extracted = await this.ollama.extractFacts(sourcesText);
+        if (extracted) {
+          facts = [
+            {
+              fact: extracted.fact_summary,
+              category: extracted.category,
+              confidence: extracted.confidence_score,
+              sourceUrl: sources[0]?.url ?? null,
+            },
+          ];
+        }
+      }
+
+      const durationMs = Date.now() - startedAt;
+      await this.swarm.submitProfile({
+        kind: "research_result",
+        taskId: task.id,
+        status: "success",
+        subject: parsed.subject,
+        facts,
+        summary: parsed.summary,
+        sources,
+        // Omitted entirely when every source answered — an empty array would read
+        // as "some source failed" to a human skimming the fleet log.
+        ...(failed.length > 0 ? { failedSources: failed } : {}),
+        model: inference.model,
+        durationMs,
+      });
+      console.log(
+        `[Orchestrator] ${DEEP_RESEARCH} ${task.id} completed in ${durationMs}ms — ` +
+          `${facts.length} fact(s) from ${sources.length} source(s).`,
+      );
+      return {
+        status: "success",
+        detail: `researched ${parsed.subject} — ${facts.length} fact(s) from ${sources.length} source(s)`,
+        reported: true,
+      };
+    } catch (error) {
+      const detail = firstLineOf(error);
+      await this.swarm.submitProfile({
+        kind: "research_result",
+        taskId: task.id,
+        status: "failed",
+        subject,
+        error: detail || "deep research failed",
+        durationMs: Date.now() - startedAt,
+      });
+      console.warn(`[Orchestrator] ${DEEP_RESEARCH} ${task.id} failed — ${detail}`);
+      return { status: "failure", detail: detail || "deep research failed", reported: true };
+    }
+  }
+
   private buildPriorityProbe(): PreemptionProbe {
     return {
       shouldYield: () => false,
@@ -896,6 +1097,295 @@ export class Orchestrator {
       waitForResume: () => Promise.resolve(),
     };
   }
+}
+
+/*
+  ── THE DEEP-RESEARCH HELPERS ────────────────────────────────────────────────
+
+  Module-level and pure, so `handleDeepResearch` reads as a sequence of steps
+  (resolve the subject, fetch, generate, file) rather than a nest of parsing.
+  Nothing here touches the network, the model or the database.
+*/
+
+/**
+ * HOW MANY SOURCE PAGES ONE RESEARCH TASK MAY FETCH.
+ *
+ * Three. Every scrape holds the Governor's browser slot for the length of a full
+ * navigation and this node has exactly one browser, so a task that walked an
+ * unbounded URL list would starve the `scrape` tasks the Mothership is waiting
+ * on. Three is enough for a place (an official page, a forum thread, a mapping
+ * site) and bounded enough to stay a sensor rather than a crawler.
+ */
+const MAX_RESEARCH_SOURCES = 3;
+
+/** Ceiling on the fetched source text handed to the model, in characters. */
+const MAX_RESEARCH_CORPUS_CHARS = 12_000;
+
+/**
+ * Ceiling on the context the Mothership already sent (a scrub's `known_facts`),
+ * in characters. Smaller than the source budget on purpose: those facts are
+ * already in the corpus upstream, and the model's job is to ADD to them.
+ */
+const MAX_RESEARCH_CONTEXT_CHARS = 4_000;
+
+/**
+ * Ceiling on facts per answer, matching the Mothership's own
+ * `MAX_FACTS_PER_TASK`: the cloud truncates at 25, so anything past it would be
+ * uploaded only to be discarded.
+ */
+const MAX_RESEARCH_FACTS = 25;
+
+/** Ceiling on the prose half of an answer, so one rambling reply cannot bloat a profile. */
+const MAX_RESEARCH_SUMMARY_CHARS = 8_000;
+
+/**
+ * ONE FACT, in the shape the Mothership's `deep_research` contract asks for.
+ *
+ * `fact` / `category` / `confidence` are the member-chat and scrub return shape
+ * (`member-research.ts`, `place-scrub.ts`); `sourceUrl` is the scrub's extra
+ * field, forwarded when the model cites one and otherwise filled from the page
+ * the fact came out of. Both dispatchers are served by one answer, because the
+ * node does not get to decide which of them is reading.
+ */
+export interface ResearchFact {
+  fact: string;
+  category: string;
+  confidence: number;
+  sourceUrl: string | null;
+}
+
+/**
+ * THE SYSTEM PROMPT FOR A RESEARCH TASK.
+ *
+ * Both rules are about the one failure this handler could cause: an invented
+ * fact landing in the corpus every member's answers are drawn from. So the model
+ * is told to answer ONLY in the Mothership's JSON shape, to ground every fact in
+ * a source it was handed, and that an EMPTY list is a valid answer — the same
+ * three rules `buildDeepResearchInstruction` states on the dispatch side,
+ * restated here because a node must not depend on the cloud's wording to stay
+ * honest.
+ */
+const RESEARCH_SYSTEM_PROMPT =
+  "You are Rippa AI, the research arm of the Rippa Adventures swarm. " +
+  "You are given a subject and, usually, the text of source pages that were just fetched for you. " +
+  "Return atomic, source-grounded facts about the subject. " +
+  "Reply with ONLY a JSON object, no prose and no markdown fence: " +
+  '{"subject": string, "facts": [{"fact": string, "category": string, "confidence": number, "sourceUrl": string|null}]}. ' +
+  "Every fact MUST be stated in a source you were given, and `sourceUrl` must name it. " +
+  "Never invent coordinates, elevations, access notes, hazards or place names, and never use your own general knowledge. " +
+  "An empty facts array is a valid, honest answer when the sources do not support a fact.";
+
+/** The first non-empty string among `keys`, trimmed, or null. */
+function firstString(source: Record<string, unknown>, keys: readonly string[]): string | null {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+/**
+ * EVERY SOURCE URL a research payload points at, deduped and capped.
+ *
+ * `url` / `sourceUrl` / `source_url` / `target` are the spellings the four
+ * dispatchers use for one page, and `urls` is the list form a direct ask may
+ * carry. `context.place` is deliberately NOT mined for a URL: a scrub names a
+ * place rather than a page, and turning a name into a URL would be the node
+ * guessing at a source. http(s) only — the scraper drives a browser, and a
+ * `file:` or `data:` URL from a task payload is a request this node will not
+ * honour.
+ */
+function collectResearchUrls(payload: Record<string, unknown>): string[] {
+  const candidates: unknown[] = [
+    payload["url"],
+    payload["sourceUrl"],
+    payload["source_url"],
+    payload["target"],
+    ...(Array.isArray(payload["urls"]) ? (payload["urls"] as unknown[]) : []),
+  ];
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const url = candidate.trim();
+    if (!url || seen.has(url) || !/^https?:\/\//i.test(url)) continue;
+    seen.add(url);
+    urls.push(url);
+    if (urls.length >= MAX_RESEARCH_SOURCES) break;
+  }
+  return urls;
+}
+
+/**
+ * The text a research payload ALREADY carries, as one labelled block.
+ *
+ * A scrub hands the node `context.known_facts` — what the mesh already verified —
+ * and a direct ask may inline `text` / `raw_text` for a page the Mothership
+ * fetched itself. Both are labelled, because the instruction tells the model not
+ * to re-derive what it was handed.
+ */
+function collectResearchContext(payload: Record<string, unknown>): string {
+  const blocks: string[] = [];
+  const rawContext = payload["context"];
+  const context =
+    rawContext && typeof rawContext === "object" ? (rawContext as Record<string, unknown>) : null;
+  const known = Array.isArray(context?.["known_facts"]) ? (context["known_facts"] as unknown[]) : [];
+  const facts = known
+    .filter((fact): fact is string => typeof fact === "string" && !!fact.trim())
+    .map((fact) => `  - ${fact.trim()}`);
+  if (facts.length > 0) blocks.push(`FACTS THE MESH ALREADY HOLDS:\n${facts.join("\n")}`);
+  for (const key of ["text", "raw_text", "rawText", "content"]) {
+    const value = payload[key];
+    if (typeof value === "string" && value.trim()) blocks.push(value.trim());
+  }
+  return blocks.join("\n\n").slice(0, MAX_RESEARCH_CONTEXT_CHARS);
+}
+
+/** Best-effort extraction of the first balanced JSON object in a string. */
+function extractJsonObject(content: string): string | null {
+  const unfenced = content.replace(/```(?:json)?/gi, "").trim();
+  const start = unfenced.indexOf("{");
+  const end = unfenced.lastIndexOf("}");
+  if (start === -1 || end <= start) return null;
+  return unfenced.slice(start, end + 1);
+}
+
+/**
+ * ONE fact from the model, normalised — or null when the entry says nothing.
+ *
+ * Both dispatchers' field names are accepted (`fact` from the member chat and the
+ * scrub, `fact_summary` from this node's own `verified_knowledge` shape, which is
+ * what the extraction fallback returns), and confidence is normalised to 0–1
+ * exactly as `parseFactPayload` does: a model that answers `85` means eighty-five
+ * percent. A missing confidence becomes the neutral 0.5 rather than dropping an
+ * otherwise grounded fact — the field is required upstream, and a fact with no
+ * number is still a fact the model read in a source.
+ */
+function normaliseResearchFact(candidate: unknown, sourceUrl: string | null): ResearchFact | null {
+  if (!candidate || typeof candidate !== "object") return null;
+  const row = candidate as Record<string, unknown>;
+  const text = firstString(row, ["fact", "fact_summary", "summary", "text", "statement"]);
+  if (!text) return null;
+  const raw = row["confidence"] ?? row["confidence_score"] ?? row["score"];
+  let confidence = typeof raw === "number" && Number.isFinite(raw) ? raw : 0.5;
+  if (confidence > 1 && confidence <= 100) confidence /= 100;
+  const cited = firstString(row, ["sourceUrl", "source_url", "url"]);
+  return {
+    fact: text.slice(0, 1_000),
+    category: (firstString(row, ["category", "type", "kind"]) ?? "description").slice(0, 80),
+    confidence: Math.max(0, Math.min(1, confidence)),
+    sourceUrl: cited && /^https?:\/\//i.test(cited) ? cited : sourceUrl,
+  };
+}
+
+/**
+ * PARSES THE MODEL'S ANSWER into the Mothership's return shape.
+ *
+ * TOLERANT, because a local 7B model returns JSON most of the time, JSON wrapped
+ * in commentary some of the time, and plain prose the rest. The first JSON object
+ * in the reply is tried; unusable fact entries are dropped rather than failing the
+ * whole answer; and a reply with no JSON at all comes back as `structured: false`
+ * with the prose as `summary`, which is the signal the caller uses to reach for
+ * the strict extraction path. Nothing here invents a fact to fill an empty array —
+ * an empty answer is a valid one.
+ */
+function parseResearchOutput(
+  content: string,
+  fallbackSubject: string,
+): { subject: string; facts: ResearchFact[]; summary: string; structured: boolean } {
+  const candidate = extractJsonObject(content);
+  if (candidate) {
+    try {
+      const decoded = JSON.parse(candidate) as unknown;
+      const record: Record<string, unknown> | null = Array.isArray(decoded)
+        ? { facts: decoded }
+        : decoded && typeof decoded === "object"
+          ? (decoded as Record<string, unknown>)
+          : null;
+      if (record) {
+        const rows = Array.isArray(record["facts"]) ? (record["facts"] as unknown[]) : [];
+        const facts: ResearchFact[] = [];
+        const seen = new Set<string>();
+        for (const row of rows) {
+          const fact = normaliseResearchFact(row, null);
+          if (!fact) continue;
+          const key = fact.fact.toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          facts.push(fact);
+          if (facts.length >= MAX_RESEARCH_FACTS) break;
+        }
+        return {
+          subject: firstString(record, ["subject", "entity", "name", "title"]) ?? fallbackSubject,
+          facts,
+          summary: (firstString(record, ["description", "summary", "prose", "answer"]) ?? "").slice(
+            0,
+            MAX_RESEARCH_SUMMARY_CHARS,
+          ),
+          structured: true,
+        };
+      }
+    } catch {
+      // The reply was not JSON. The prose reading below is the honest one.
+    }
+  }
+  return {
+    subject: fallbackSubject,
+    facts: [],
+    summary: content.trim().slice(0, MAX_RESEARCH_SUMMARY_CHARS),
+    structured: false,
+  };
+}
+
+/**
+ * THE RESEARCH PROMPT — the Mothership's brief when it sent one, plus the material
+ * the node actually has.
+ *
+ * The instruction is used VERBATIM when present: it carries the caller's rules
+ * (the scrub's metric-and-travel-time contract, the member chat's
+ * atomic-facts-only rule), and paraphrasing it here would silently drop whichever
+ * rule the node's author did not know about. With no instruction the fallback
+ * restates the dispatch contract rather than leaving the model to guess what
+ * "deep research" means.
+ *
+ * The NO SOURCE branch is the important one: a task with no fetched page is told
+ * plainly that it has nothing to ground a fact in, because the alternative — an
+ * empty source block the model fills from memory — is exactly how an invented
+ * location reaches the corpus.
+ */
+function buildResearchPrompt(input: {
+  subject: string;
+  instruction: string | null;
+  knownContext: string;
+  sources: string;
+}): string {
+  const brief =
+    input.instruction ??
+    `Research the Australian outdoor location "${input.subject}" (official park and water-authority ` +
+      `pages, trail and 4WD forums, mapping sites) and return atomic, source-grounded facts. ` +
+      `Coordinates, elevation, access notes and hazards must be stated in a source you actually read — ` +
+      `never invented. If the location cannot be verified, return an empty facts list rather than guessing.`;
+  const parts = [brief, "", `SUBJECT: ${input.subject}`];
+  if (input.knownContext.trim()) parts.push("", input.knownContext.trim());
+  if (input.sources.trim()) {
+    parts.push(
+      "",
+      "SOURCE PAGES FETCHED FOR THIS TASK (every fact must be stated in one of these):",
+      input.sources.trim(),
+    );
+  } else {
+    parts.push(
+      "",
+      "NO SOURCE PAGE WAS FETCHED FOR THIS TASK. You have nothing to ground a fact in: return an empty facts list.",
+    );
+  }
+  return parts.join("\n");
+}
+
+/** The first line of an error — a stack trace is not something to file upstream. */
+function firstLineOf(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.split("\n")[0] ?? "";
 }
 
 /** Reads a finite number from an untrusted task payload, else uses `fallback`. */

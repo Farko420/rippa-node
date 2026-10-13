@@ -2621,6 +2621,46 @@ check(
   !/case "scrape":\s*→/.test(orchestratorSource),
 );
 
+// --- THE THIRD MISSING TASK HANDLER: `deep_research` --------------------------
+/*
+ * The reported `Unhandled task type "deep_research"` skip. `deep_research` is in
+ * the Mothership's `SWARM_TASK_KINDS` and is queued by four dispatchers (the
+ * member chat, the Co-Pilot's shadow dispatch, the mass place scrub and the RI
+ * ripple sweeper), and it is the one reported type that is genuinely NEW work:
+ * the node had no branch for it, so every research task fell to `default:` and
+ * was answered `skipped` — leaving the row claimed-but-undone in the cloud.
+ *
+ * The handler is private and needs a live scraper AND a live model, so — exactly
+ * like the `scrape`/`llm_query` block above — the mapping is asserted at the
+ * source: the route, both halves of the RAG composition, and the result kind the
+ * Mothership reads.
+ */
+check(
+  "the orchestrator maps the `deep_research` task type to the RAG handler",
+  orchestratorSource.includes('const DEEP_RESEARCH = "DEEP_RESEARCH"') &&
+    /case DEEP_RESEARCH:\s*\r?\n\s*case "DEEP_RESEARCH_TASK":\s*\r?\n\s*return this\.handleDeepResearch\(task\);/.test(
+      orchestratorSource,
+    ),
+);
+check(
+  "the deep-research handler composes the Playwright scraper with the local model",
+  orchestratorSource.includes("private async handleDeepResearch(") &&
+    orchestratorSource.includes("await this.scraper.scrape(url)") &&
+    orchestratorSource.includes("await runLocalInference("),
+);
+check(
+  "the deep-research handler files a `research_result` in the Mothership's fact shape",
+  orchestratorSource.includes('kind: "research_result"') &&
+    /export interface ResearchFact \{[\s\S]{0,200}?sourceUrl: string \| null;/.test(orchestratorSource) &&
+    orchestratorSource.includes("subject: parsed.subject"),
+);
+check(
+  "an ungroundable research answer is allowed to be EMPTY rather than invented",
+  orchestratorSource.includes("return an empty facts list rather than guessing") &&
+    orchestratorSource.includes("facts: [],") &&
+    orchestratorSource.includes("NO SOURCE PAGE WAS FETCHED FOR THIS TASK"),
+);
+
 // THE FRESHNESS RULE. Run IDs decide when both sides have one — this is the
 // whole point, because two CI builds routinely share a package.json version.
 const dep = (runId, version) => ({ tag: "t", version, downloadUrl: "https://x/y.zip", runId });
