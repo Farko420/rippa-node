@@ -1473,13 +1473,158 @@ document.addEventListener("keydown", (event) => {
   closeSatellite();
 });
 
+// --- LOCAL STORAGE PANEL ------------------------------------------------------
+//
+// WHERE THIS NODE KEEPS ITS DATA, AND HOW TO MOVE IT.
+//
+// Storage is a property of THIS machine: the folder is chosen here, on the node,
+// and merely REPORTED to the Mothership (see the boot profile and the heartbeat).
+// The panel therefore reads and writes only local configuration — GET /api/config
+// for what is in force, POST /api/system/storage to change it — and it never asks
+// the cloud for permission or confirmation.
+//
+// THE FORM IS SEEDED FROM THE SERVER, NOT FROM THE DOM. A failed save must leave
+// the operator looking at the truth (what is actually configured) rather than at
+// what they typed, which is the same rule the AI endpoint modal follows.
+
+/** Fills a field only when the element exists (the view is optional). */
+function setValue(id, value) {
+  const el = $(id);
+  if (el) el.value = value === undefined || value === null ? "" : String(value);
+}
+
+function showStorageMessage(text, isError) {
+  const message = $("storageMessage");
+  if (!message) return;
+  message.hidden = false;
+  message.textContent = text;
+  message.style.color = isError ? "var(--bad)" : "var(--ok)";
+}
+
+/**
+ * Renders the storage block of a /api/config payload.
+ *
+ * `storage.source` is the field that matters to an operator: "config" means they
+ * chose this folder, "default" means the node is using the folder beside the
+ * executable. Both are correct states, but only one of them is worth changing.
+ */
+function renderStorage(data) {
+  const storage = (data && data.storage) || {};
+  const dir = storage.dataDirectory || data.dataDirectory || "—";
+  setText("storageDataDir", dir);
+  setText("storageConfigPath", storage.configPath || data.configPath || "—");
+  setText(
+    "storageScratch",
+    typeof storage.scratchCapacityGb === "number" ? storage.scratchCapacityGb + " GB" : "not set",
+  );
+  setText(
+    "storageVault",
+    typeof storage.vaultCapacityGb === "number" ? storage.vaultCapacityGb + " GB" : "not set",
+  );
+  setText("storageDefaultHint", "Default folder: " + (storage.defaultDirectory || "—"));
+
+  const badge = $("storageSourceBadge");
+  if (badge) {
+    badge.textContent = storage.source === "config" ? "Configured locally" : "Local default";
+    badge.className =
+      "status-badge " + (storage.source === "config" ? "status-active" : "status-idle");
+  }
+
+  // Seed the input with the CONFIGURED value (empty when the default is in
+  // force) so the field shows what the node would persist, while the tiles above
+  // show what is actually in use.
+  setValue("storageDirInput", storage.configuredDirectory || "");
+  if (typeof storage.scratchCapacityGb === "number") {
+    setValue("storageScratchInput", storage.scratchCapacityGb);
+  }
+  if (typeof storage.vaultCapacityGb === "number") {
+    setValue("storageVaultInput", storage.vaultCapacityGb);
+  }
+}
+
+/** Reads the current storage state and paints the panel. */
+async function refreshStorage() {
+  try {
+    const { response, data } = await api("/api/config");
+    if (!response.ok || !data.success) return;
+    renderStorage(data);
+  } catch (err) {
+    /* the panel keeps its last known state */
+  }
+}
+
+
+
+/**
+ * Saves the storage settings.
+ *
+ * A FOLDER CHANGE RESTARTS THE NODE, and the panel's own hint text says so before
+ * the button is pressed. The server restarts ~250ms after this response is
+ * flushed, so on that path the button stays DISABLED and the message is left on
+ * screen: re-enabling it would invite a second click into a process already on
+ * its way down, and a second migration.
+ *
+ * AN EMPTY SUBMISSION IS NOT AN ERROR: the server answers `noop: true` and this
+ * renders it as information, not a failure. Clearing a field is not a mistake an
+ * operator should be scolded for.
+ */
+async function saveStorageSettings() {
+  const save = $("storageSave");
+  const dirInput = $("storageDirInput");
+  const scratchInput = $("storageScratchInput");
+  const vaultInput = $("storageVaultInput");
+
+  const body = { dataDirectory: dirInput ? dirInput.value.trim() : "" };
+  if (scratchInput && scratchInput.value.trim()) body.scratchCapacityGb = scratchInput.value.trim();
+  if (vaultInput && vaultInput.value.trim()) body.safeVaultCapacityGb = vaultInput.value.trim();
+
+  if (save) save.disabled = true;
+  showStorageMessage("Saving storage settings…", false);
+
+  try {
+    const { response, data } = await api("/api/system/storage", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (response.ok && data.success) {
+      renderStorage(data);
+      showStorageMessage(
+        data.message || (data.noop ? "Nothing to change." : "Storage settings saved."),
+        false,
+      );
+      // The node is restarting onto the new folder — leave the button disabled.
+      if (data.restartRequired) return;
+    } else {
+      showStorageMessage(data.message || "Could not save those storage settings.");
+    }
+  } catch (err) {
+    showStorageMessage("Could not save: " + (err && err.message ? err.message : err));
+  }
+  if (save) save.disabled = false;
+}
+
+const storageSaveBtn = $("storageSave");
+if (storageSaveBtn) storageSaveBtn.addEventListener("click", () => void saveStorageSettings());
+
+// "Use Default Folder" only fills the input — it changes nothing until Save is
+// pressed, so a mis-click cannot move a node's database.
+const storageDefaultBtn = $("storageUseDefault");
+if (storageDefaultBtn) {
+  storageDefaultBtn.addEventListener("click", () => {
+    const hint = $("storageDefaultHint");
+    const path = hint ? String(hint.textContent || "").replace(/^Default folder:\s*/, "") : "";
+    setValue("storageDirInput", path);
+    showStorageMessage("Default folder filled in. Press Save to move this node's data there.", false);
+  });
+}
+
 function setText(id, value) {
   const el = $(id);
   if (el) el.textContent = value;
 }
 
 function showView(viewId) {
-  ["viewFleet", "viewOllama", "viewScraper", "viewMesh", "viewRemote"].forEach((id) => {
+  ["viewFleet", "viewOllama", "viewScraper", "viewMesh", "viewStorage", "viewRemote"].forEach((id) => {
     const el = $(id);
     if (el) el.hidden = id !== viewId;
   });
@@ -1489,6 +1634,7 @@ function showView(viewId) {
   if (viewId === "viewOllama") void refreshOllama();
   if (viewId === "viewScraper") void refreshScraper();
   if (viewId === "viewMesh") void refreshMesh();
+  if (viewId === "viewStorage") void refreshStorage();
   // Starts the 5s readiness ping when the Embedded AI tab is opened, and stops it
   // when the operator navigates away. See syncHealthPolling for why it is scoped.
   syncHealthPolling();

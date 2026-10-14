@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CONFIG_BACKUP_SUFFIX, CONFIG_TEMP_SUFFIX, LEGACY_BACKUP_SUFFIX, migrateLegacyData, resolveDataDir } from "../src/utils/paths";
+import { CONFIG_BACKUP_SUFFIX, CONFIG_TEMP_SUFFIX, LEGACY_BACKUP_SUFFIX, defaultDataDir, legacyDataDir, migrateLegacyData, resolveDataDir } from "../src/utils/paths";
 import {
   readConfig,
   readConfigLenient,
+  validateConfigInput,
   writeConfig,
 } from "../src/config/configManager";
 
@@ -183,5 +184,91 @@ fs.rmSync(broken, { recursive: true, force: true, maxRetries: 5 });
 process.env.RIPPA_DATA_DIR = fresh;
 migrateLegacyData(path.join(base, "does-not-exist"));
 check("persistent dir created recursively on first boot", fs.existsSync(fresh), fresh);
+
+// ---------------------------------------------------------------------------
+// THE HARDCODED LOCAL DEFAULT.
+//
+// Storage is the node's own business: with no explicit setting it uses `data/`
+// beside the executable (the project root when running from source). The OS
+// app-data folder older builds used must NOT be the default any more — it is
+// only a migration SOURCE — or an operator would keep landing back in a folder
+// they never chose.
+// ---------------------------------------------------------------------------
+const savedDataDir = process.env.RIPPA_DATA_DIR;
+delete process.env.RIPPA_DATA_DIR;
+check(
+  "with no override the data dir is <install dir>/data",
+  resolveDataDir() === defaultDataDir() && defaultDataDir() === path.resolve(process.cwd(), "data"),
+  `resolveDataDir()=${resolveDataDir()} defaultDataDir()=${defaultDataDir()}`,
+);
+check(
+  "the OS app-data folder is a migration source, not the default",
+  legacyDataDir() === null || path.resolve(legacyDataDir()) !== path.resolve(resolveDataDir()),
+  `legacyDataDir()=${legacyDataDir()}`,
+);
+// resolveDataDir() must never throw: a missing LOCALAPPDATA used to break boot.
+check(
+  "resolving the data dir does not depend on LOCALAPPDATA",
+  (() => {
+    const saved = process.env.LOCALAPPDATA;
+    delete process.env.LOCALAPPDATA;
+    let dir = "";
+    try {
+      dir = resolveDataDir();
+    } catch (error) {
+      dir = `THREW: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    if (saved === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = saved;
+    return dir === defaultDataDir();
+  })(),
+);
+if (savedDataDir === undefined) delete process.env.RIPPA_DATA_DIR;
+else process.env.RIPPA_DATA_DIR = savedDataDir;
+
+// An explicit source migrates only from that source, so a hermetic test never
+// depends on whatever app-data folder happens to exist on the machine.
+const explicitOnly = migrateLegacyData(legacy);
+check(
+  "an explicit migration source is the only one searched",
+  explicitOnly.sources.length === 1 && explicitOnly.sources[0] === path.resolve(legacy),
+  explicitOnly.sources.join(","),
+);
+
+// ---------------------------------------------------------------------------
+// A SETTINGS SAVE MUST NOT RELOCATE THE DATABASE.
+//
+// The Setup form has no storage field, and `writeConfig` REPLACES rather than
+// merges — so without the storage carry-forward, an operator who changed their
+// node name would silently delete `dataDirectory`, and the node would come back
+// on the DEFAULT folder with its database apparently gone.
+// ---------------------------------------------------------------------------
+const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rippa-storage-save-"));
+process.env.RIPPA_DATA_DIR = storageRoot;
+writeConfig(storageRoot, { ...operatorConfig, dataDirectory: "D:/RippaData" });
+const savedByForm = validateConfigInput({
+  node_role: "master",
+  node_name: "Renamed Node",
+  node_api_key: operatorConfig.NODE_API_KEY,
+  mothership_url: "https://mothership.example.com",
+  // A caller that knows nothing about storage may post a blank explicitly.
+  dataDirectory: "",
+});
+check(
+  "a Setup save keeps the operator's data folder (and survives a blank field)",
+  savedByForm.ok && savedByForm.config.dataDirectory === "D:/RippaData",
+  savedByForm.ok ? String(savedByForm.config.dataDirectory) : JSON.stringify(savedByForm.errors),
+);
+const afterFormSave = (() => {
+  if (!savedByForm.ok) return null;
+  writeConfig(storageRoot, savedByForm.config);
+  return readConfig(storageRoot);
+})();
+check(
+  "the data folder survives the write to disk",
+  afterFormSave?.dataDirectory === "D:/RippaData" && afterFormSave?.NODE_NAME === "Renamed Node",
+  `dataDirectory=${afterFormSave?.dataDirectory} name=${afterFormSave?.NODE_NAME}`,
+);
+fs.rmSync(storageRoot, { recursive: true, force: true, maxRetries: 5 });
 
 fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });

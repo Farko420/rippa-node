@@ -6,6 +6,12 @@ dist/
 # First-run setup output (contains the Node API key — never commit it)
 config.json
 
+# THE NODE'S LOCAL DATA DIRECTORY (default: ./data beside the executable, i.e.
+# this folder when running from source). It holds config.json, the Deep Brain
+# SQLite database, downloaded models and the Playwright browser cache — all of it
+# machine-local and some of it secret, so none of it belongs in git.
+data/
+
 # Deep Brain (SQLite) + WAL sidecars
 *.db
 *.db-shm

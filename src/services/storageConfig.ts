@@ -12,17 +12,27 @@ import {
  * UI-DRIVEN STORAGE CONFIGURATION — the node half of "Storage & Capacity".
  *
  * WHY THIS EXISTS. Configuring the node's storage drive used to mean
- * hand-editing `.env` and moving Windows folders by hand. The Mothership now
- * queues a `system_update_storage` command, delivered on the next heartbeat,
- * and this module carries it out:
+ * hand-editing `.env` and moving Windows folders by hand. The Mothership can now
+ * queue a `system_update_storage` command, delivered on the next heartbeat, and
+ * this module carries it out:
  *
- *   1. WRITE: persist `RIPPA_DATA_DIR`, `SCRATCH_DRIVE_CAPACITY_GB`, and
- *      `SAFE_VAULT_CAPACITY_GB` in both `config.json` and the `.env` beside
- *      the executable.
+ *   1. WRITE: persist `dataDirectory`/`RIPPA_DATA_DIR`,
+ *      `SCRATCH_DRIVE_CAPACITY_GB` and `SAFE_VAULT_CAPACITY_GB` in both
+ *      `config.json` and the `.env` beside the executable.
  *   2. MIGRATE: copy persistent data from the old directory to the new one.
  *   3. VERIFY: compare every destination file against its source before the
  *      caller restarts.
  *   4. TELEMETRY: broadcast capacity and measured usage to the Mothership.
+ *
+ * THE NODE'S OWN CONFIGURATION ALWAYS WINS. The default data folder is hardcoded
+ * locally (`utils/paths.defaultDataDir` → `<install dir>/data`), and the local
+ * dashboard can change it at any time. A Mothership request that carries no
+ * usable directory and no capacity is therefore NOT an error and NOT a failure:
+ * it is a no-op that the node acknowledges as completed (see
+ * {@link isEmptyStorageRequest} and the UPDATE_STORAGE handler in
+ * `services/heartbeat.ts`). A cloud bug must never be able to report the node as
+ * broken, and a node whose storage is already configured must never be told it
+ * is not.
  *
  * Existing destination files are never overwritten, and a verification
  * failure throws instead of triggering a reboot into a partial copy.
@@ -59,8 +69,19 @@ export interface StorageConfigRequest {
 
 /** What one applyStorageConfig run did. */
 export interface StorageConfigReport {
-  /** True when the config was persisted. */
+  /**
+   * True when the request was actionable and its configuration was persisted.
+   * FALSE for a no-op ({@link StorageConfigReport.noop}), which is a successful
+   * outcome, not a failure: nothing needed doing.
+   */
   applied: boolean;
+  /**
+   * True when the request carried nothing actionable — no directory and no
+   * capacity — so the node's existing (local) configuration stands. Callers must
+   * treat this as SUCCESS: acknowledge it as completed, log that the local
+   * configuration takes precedence, and carry on.
+   */
+  noop: boolean;
   /** True when the data directory MOVED, meaning the caller must restart. */
   changed: boolean;
   /** Directory the data lived in before this run. */
@@ -100,7 +121,9 @@ export function readStorageSettings(
   try {
     dataDir = resolveDataDir();
   } catch {
-    // LOCALAPPDATA missing and no override; the boot path reports that.
+    // Unreachable in practice (resolveDataDir no longer throws), but the env
+    // spelling is still the right degradation: report what was configured rather
+    // than nothing at all.
     dataDir = (env["RIPPA_DATA_DIR"] ?? "").trim() || null;
   }
   return {
@@ -116,6 +139,67 @@ function pickString(args: Record<string, unknown>, ...keys: string[]): string | 
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return undefined;
+}
+
+/**
+ * TRUE WHEN A STORAGE REQUEST CARRIES NOTHING THE NODE CAN ACT ON.
+ *
+ * This is the defusing rule for the whole feature, so it is deliberately
+ * generous about what counts as "empty". A Mothership may express "no change"
+ * as a missing payload, `{}`, `{data_dir: ""}`, `{data_dir: null,
+ * scratch_capacity_gb: null}`, whitespace, or a zero. Every one of those is a
+ * request the node cannot use, and every one of them must be a NO-OP:
+ *
+ *   - it must NOT throw (a thrown handler is reported to `/api/node/ack` as
+ *     `failed`, which marks a healthy node broken in the fleet view);
+ *   - it must NOT touch the node's storage configuration (the local
+ *     configuration — `config.json` / the dashboard — takes precedence);
+ *   - it must be acknowledged as completed so the queue entry retires instead of
+ *     being re-delivered on every heartbeat forever.
+ *
+ * A blank `data_dir` counts as absent rather than as "move to the empty path",
+ * and a non-positive capacity counts as unspecified, because the Mothership's own
+ * `normaliseGb` drops those too — so the two ends agree on what "not set" means.
+ *
+ * NEVER THROWS. A value that is present but OUT OF RANGE (0.05 GB) is still
+ * actionable, so this returns false and {@link parseStorageConfigRequest} refuses
+ * it loudly: a real, wrong quota deserves an honest rejection, whereas a missing
+ * one deserves silence.
+ */
+export function isEmptyStorageRequest(args: unknown): boolean {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return true;
+  const record = args as Record<string, unknown>;
+  const hasText = (...keys: string[]): boolean =>
+    keys.some((key) => typeof record[key] === "string" && (record[key] as string).trim().length > 0);
+  /*
+    Capacities arrive as numbers OR as numeric strings — the same tolerance
+    `pickCapacity` applies, and the reason this is not a `typeof === "number"`
+    test: treating "128" as "not specified" would silently drop a real quota.
+  */
+  const hasPositiveNumber = (...keys: string[]): boolean =>
+    keys.some((key) => {
+      const value = record[key];
+      if (typeof value === "number") return Number.isFinite(value) && value > 0;
+      if (typeof value === "string" && value.trim()) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) && parsed > 0;
+      }
+      return false;
+    });
+
+  if (hasText("data_dir", "dataDir", "data_directory", "ripa_data_dir")) return false;
+  if (hasPositiveNumber("scratch_capacity_gb", "scratchCapacityGb")) return false;
+  if (
+    hasPositiveNumber(
+      "safe_vault_capacity_gb",
+      "vault_capacity_gb",
+      "vaultCapacityGb",
+      "safeVaultCapacityGb",
+    )
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function pickCapacity(args: Record<string, unknown>, ...keys: string[]): number | undefined {
@@ -147,14 +231,26 @@ function hasControlChars(value: string): boolean {
  * anything unsafe, because that message reaches the admin screen through the
  * command failure note. The path must be absolute and must not be a
  * filesystem root.
+ *
+ * AN EMPTY PAYLOAD IS NOT AN ERROR. It used to throw ("The storage update
+ * carried no payload."), which the heartbeat executor reported back to
+ * `/api/node/ack` as `failed` — marking a perfectly healthy node broken because
+ * the cloud sent nothing to do. It now parses to an empty request, and
+ * {@link applyStorageConfig} turns that into an explicit no-op that the caller
+ * acknowledges as completed. See {@link isEmptyStorageRequest}.
+ *
+ * INVALID VALUES ARE STILL REFUSED. Only the absence of a payload is tolerated;
+ * a relative path, a control character, an over-long path, a filesystem root or
+ * an out-of-range quota still throws, so a genuinely broken request is reported
+ * honestly instead of being silently swallowed.
  */
 export function parseStorageConfigRequest(args: Record<string, unknown>): StorageConfigRequest {
-  if (!args || typeof args !== "object") {
-    throw new Error("The storage update carried no payload.");
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return {};
   }
   const request: StorageConfigRequest = {};
 
-  const rawDir = pickString(args, "data_dir", "dataDir", "ripa_data_dir");
+  const rawDir = pickString(args, "data_dir", "dataDir", "data_directory", "ripa_data_dir");
   if (rawDir !== undefined) {
     if (rawDir.length > MAX_DATA_DIR_LENGTH) {
       throw new Error(`The target directory path is longer than ${MAX_DATA_DIR_LENGTH} characters.`);
@@ -183,13 +279,17 @@ export function parseStorageConfigRequest(args: Record<string, unknown>): Storag
   );
   if (vault !== undefined) request.safeVaultCapacityGb = vault;
 
-  if (
-    request.dataDir === undefined &&
-    request.scratchCapacityGb === undefined &&
-    request.safeVaultCapacityGb === undefined
-  ) {
-    throw new Error("The storage update carried no directory and no capacities.");
-  }
+  /*
+    A REQUEST WITH NOTHING IN IT IS RETURNED AS AN EMPTY REQUEST, NOT THROWN.
+
+    This used to `throw new Error("The storage update carried no directory and no
+    capacities.")`, and that single line is what marked healthy nodes broken: the
+    heartbeat executor catches a throw and reports the command to `/api/node/ack`
+    as `failed`. Storage belongs to the node — the folder is hardcoded locally and
+    editable from the node's own dashboard — so "the cloud asked for nothing" must
+    be a no-op. `applyStorageConfig` turns this empty request into an explicit
+    no-op report, and `isEmptyStorageRequest` is what the dispatcher checks first.
+  */
   return request;
 }
 /**
@@ -305,10 +405,35 @@ function upsertEnvFile(file: string, entries: Record<string, string>): void {
 /**
  * Applies a validated storage request: persist, migrate, verify.
  * Throws on anything that would leave the node worse than it found it.
+ *
+ * AN EMPTY REQUEST IS A SUCCESSFUL NO-OP. Nothing is written, nothing is copied
+ * and nothing is restarted: the node's local storage configuration stands, which
+ * is the whole point of the feature. The report says so explicitly via `noop`, so
+ * every caller can acknowledge the command as completed rather than failed.
  */
 export function applyStorageConfig(args: Record<string, unknown>): StorageConfigReport {
-  const request = parseStorageConfigRequest(args);
   const from = resolveDataDir();
+  const settings = readStorageSettings();
+
+  if (isEmptyStorageRequest(args)) {
+    console.log(
+      "[Storage] The storage request carried no usable directory or capacity — " +
+        "keeping this node's local storage configuration " +
+        `(${from}). Nothing to do.`,
+    );
+    return {
+      applied: false,
+      noop: true,
+      changed: false,
+      from,
+      to: from,
+      migrated: [],
+      scratchCapacityGb: settings.scratchCapacityGb,
+      safeVaultCapacityGb: settings.safeVaultCapacityGb,
+    };
+  }
+
+  const request = parseStorageConfigRequest(args);
   const to = request.dataDir ?? from;
   const dirChanging = path.resolve(from) !== path.resolve(to);
 
@@ -325,9 +450,26 @@ export function applyStorageConfig(args: Record<string, unknown>): StorageConfig
   // the new values, then the boot-level .env, then the live process env.
   const configRoot = resolveAppRoot();
   const current = readConfigLenient(configRoot) ?? ({} as Record<string, unknown>);
+  /*
+    BOTH SPELLINGS ARE WRITTEN, AND THAT IS LOAD-BEARING.
+
+    `current` is a normalised config, so it already holds `dataDirectory` (the
+    readable property) alongside `RIPPA_DATA_DIR` (the environment spelling).
+    Setting only the env key would leave the stale `dataDirectory` to win inside
+    `normalizeConfig`, and the migration self-check below would then find a
+    config.json that names the OLD folder — aborting a migration that had already
+    copied the data. Writing both keeps the file self-describing and the two
+    spellings in agreement.
+  */
   const merged: Record<string, unknown> = {
     ...(current as Record<string, unknown>),
-    ...(request.dataDir ? { RIPPA_DATA_DIR: request.dataDir } : {}),
+    ...(request.dataDir
+      ? {
+          dataDirectory: request.dataDir,
+          storageDirectory: request.dataDir,
+          RIPPA_DATA_DIR: request.dataDir,
+        }
+      : {}),
     ...(request.scratchCapacityGb !== undefined
       ? { SCRATCH_DRIVE_CAPACITY_GB: request.scratchCapacityGb }
       : {}),
@@ -361,7 +503,7 @@ export function applyStorageConfig(args: Record<string, unknown>): StorageConfig
   if (dirChanging) {
     console.log(`[Storage] Migrating persistent data ${from} to ${to}.`);
     migrated = migrateDataDir(from, to);
-    const check = readConfigLenient(to);
+    const check = readMigratedConfig(to);
     if (!check) {
       throw new Error(`The migrated config.json in ${to} could not be read, aborting.`);
     }
@@ -375,6 +517,7 @@ export function applyStorageConfig(args: Record<string, unknown>): StorageConfig
 
   return {
     applied: true,
+    noop: false,
     changed: dirChanging,
     from,
     to,
@@ -382,6 +525,47 @@ export function applyStorageConfig(args: Record<string, unknown>): StorageConfig
     scratchCapacityGb,
     safeVaultCapacityGb,
   };
+}
+
+/**
+ * Reads the freshly-migrated `config.json`, retrying briefly before giving up.
+ *
+ * WHY THE RETRY. The file was written moments ago by `fs.cpSync`, and on Windows
+ * a just-copied file can be momentarily unreadable — the copy's handles are
+ * closed, but a virus scanner or the search indexer can still hold it open, which
+ * surfaces as EPERM/EBUSY for a few milliseconds. `readConfigLenient` reports
+ * that as "no usable config", and without this retry the migration self-check
+ * would ABORT a migration that had in fact succeeded perfectly — the node would
+ * stay on its old drive and the command would be reported upstream as failed.
+ *
+ * Bounded (5 attempts, ~0.6s worst case) and synchronous, because
+ * `applyStorageConfig` is synchronous and this runs during a deliberate,
+ * operator-initiated migration where a fraction of a second is irrelevant.
+ */
+function readMigratedConfig(root: string): ReturnType<typeof readConfigLenient> {
+  const attempts = 5;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const config = readConfigLenient(root);
+    if (config) return config;
+    if (attempt < attempts - 1) sleepSync(120);
+  }
+  return null;
+}
+
+/**
+ * A bounded synchronous pause, without spinning the CPU.
+ *
+ * `Atomics.wait` on a throwaway buffer is the one portable way to block a thread
+ * in JavaScript without a busy loop, and it is available in every Node build this
+ * project targets. If a runtime ever refuses it, the loop simply returns early —
+ * the retry then costs one extra read attempt, never a hang.
+ */
+function sleepSync(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    /* unsupported: fall through immediately */
+  }
 }
 
 interface UsageSample {
@@ -487,5 +671,61 @@ export function buildStorageTelemetry(): {
     scratch_capacity_gb: settings.scratchCapacityGb,
     vault_used_gb: usageSample.vaultUsedGb,
     vault_capacity_gb: settings.safeVaultCapacityGb,
+  };
+}
+
+/**
+ * THE STATIC STORAGE HALF OF THE NODE'S HARDWARE PROFILE.
+ *
+ * Sent once at boot, inside the `POST /api/swarm/submit` node profile, so the
+ * Mothership knows this node's storage is ALREADY RESOLVED and never has a
+ * reason to queue a `system_update_storage` for it. The heartbeat's
+ * {@link buildStorageTelemetry} block keeps the live numbers fresh afterwards;
+ * this one is the declaration of intent, and it is deliberately explicit:
+ *
+ *   - `storage_configured` / `storage_resolved` are `true` as constants, because
+ *     the node ALWAYS has a data directory — either the folder the operator
+ *     chose or the hardcoded local default. There is no "unconfigured" state to
+ *     report, and saying so is what stops the cloud from treating a perfectly
+ *     good node as one that needs provisioning.
+ *   - the directory travels under several names (`storage_data_dir`,
+ *     `storage_directory`, `data_dir`, `data_directory`) because the fleet board
+ *     reads whichever spelling its deployment was built against, and a node that
+ *     reports the truth in only one of them looks silent in the others.
+ *
+ * `resolved` is stated as an absolute path so the cloud never has to guess
+ * whether a relative value was resolved against the exe's folder or the CWD.
+ */
+export function buildStorageProfile(): {
+  storage_configured: true;
+  storage_resolved: true;
+  storage_data_dir: string;
+  storage_directory: string;
+  data_directory: string;
+  data_dir: string;
+  scratch_capacity_gb: number | null;
+  vault_capacity_gb: number | null;
+  safe_vault_capacity_gb: number | null;
+  storage_capacities_resolved: boolean;
+} {
+  const settings = readStorageSettings();
+  // resolveDataDir() cannot throw any more, but a null still degrades to "" so
+  // the profile is always sendable — a telemetry failure must never cost the
+  // node its boot.
+  const dir = settings.dataDir ?? "";
+  return {
+    storage_configured: true,
+    storage_resolved: true,
+    storage_data_dir: dir,
+    storage_directory: dir,
+    data_directory: dir,
+    data_dir: dir,
+    scratch_capacity_gb: settings.scratchCapacityGb,
+    vault_capacity_gb: settings.safeVaultCapacityGb,
+    safe_vault_capacity_gb: settings.safeVaultCapacityGb,
+    // Capacities are optional on the node (a quota nobody set is reported as
+    // null), so this says whether the two figures above are real.
+    storage_capacities_resolved:
+      settings.scratchCapacityGb !== null || settings.safeVaultCapacityGb !== null,
   };
 }

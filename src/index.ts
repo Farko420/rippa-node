@@ -417,7 +417,28 @@ async function main(): Promise<void> {
         running from its old directory.
       */
       updateStorage: async (args: Record<string, unknown>) => {
-        const { applyStorageConfig } = require("./services/storageConfig") as typeof import("./services/storageConfig");
+        const { applyStorageConfig, isEmptyStorageRequest } = require(
+          "./services/storageConfig",
+        ) as typeof import("./services/storageConfig");
+        /*
+          AN EMPTY REQUEST IS A NO-OP — reported as SUCCESS.
+
+          The heartbeat executor already short-circuits this case before the
+          handler runs, but this guard is deliberate duplication at the last line
+          of defence: the same handler is reachable directly (the Orchestrator's
+          queue-task channel, and any future caller), and no path may ever report
+          a healthy node as failed because the cloud sent nothing to do. Storage
+          is configured LOCALLY — `./data` beside the exe by default, or whatever
+          the operator chose in the dashboard — so there is nothing for the
+          Mothership to fix here.
+        */
+        if (isEmptyStorageRequest(args)) {
+          console.log(
+            "[Boot] Storage update carried no usable directory or capacity — " +
+              "keeping this node's local storage configuration.",
+          );
+          return true;
+        }
         const report = applyStorageConfig(args);
         if (!report.changed) {
           console.log(
@@ -529,6 +550,61 @@ async function main(): Promise<void> {
     });
 
     swarm.startHeartbeat();
+
+    /*
+      THE BOOT PROFILE — `POST /api/swarm/submit`, ONCE, ON EVERY BOOT.
+
+      WHY THIS IS HERE AND NOT ONLY ON THE HEARTBEAT. The heartbeat reports what
+      the node is DOING (CPU, RAM, current task, live storage usage). It never
+      says what the node IS, and in particular it never says that the node's
+      storage question is already settled — so a Mothership looking at a healthy
+      node had no way to distinguish it from one whose drive had never been
+      chosen, and its remedy was to queue a `system_update_storage`. That command
+      is a no-op on this build (see the UPDATE_STORAGE handler), but the cleanest
+      fix is not to provoke it at all: this record declares the machine's static
+      hardware, its capabilities and its STORAGE — the configured local folder and
+      its capacities — up front, with `storage_configured` and `storage_resolved`
+      set, so the cloud has no reason to ask.
+
+      Sent AFTER `startHeartbeat()` so the node is already visible on the fleet
+      board even if this single request fails, and FIRE-AND-FORGET for the same
+      reason: `submitProfile` resolves false rather than throwing on any transport
+      error, and an unreachable Mothership must never hold up the boot. The
+      profile is re-sent on the next boot, and the live storage numbers keep
+      riding every heartbeat in the meantime.
+    */
+    try {
+      const { buildNodeProfile } = require("./services/nodeProfile") as typeof import("./services/nodeProfile");
+      const profile = buildNodeProfile();
+      console.log(
+        `[Boot] Reporting node profile to the Mothership — data directory ${profile.storage_data_dir} ` +
+          `(scratch ${profile.scratch_capacity_gb ?? "unset"} GB, vault ${profile.vault_capacity_gb ?? "unset"} GB).`,
+      );
+      void client
+        .submitProfile(profile as unknown as Record<string, unknown>)
+        .then((accepted) => {
+          if (!accepted) {
+            console.warn(
+              "[Boot] The node profile was not accepted — storage telemetry still rides every heartbeat, " +
+                "and the profile is re-sent on the next boot.",
+            );
+          }
+        })
+        .catch((error: unknown) => {
+          console.warn(
+            `[Boot] Node profile submission failed — continuing: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+    } catch (error) {
+      console.warn(
+        `[Boot] Could not assemble the node profile — continuing: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
     syncManager = new SyncManager(swarm);
     syncManager.start();
     // Pull half of brain parity: keeps this node's mirror of the cloud's

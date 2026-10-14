@@ -50,6 +50,7 @@
     <button type="button" class="cc-nav-item" data-view="viewOllama">⚙ Embedded AI</button>
     <button type="button" class="cc-nav-item" data-view="viewScraper">🕷 Playwright Scraper</button>
     <button type="button" class="cc-nav-item" data-view="viewMesh">🛰 Mesh Network</button>
+    <button type="button" class="cc-nav-item" data-view="viewStorage">💾 Local Storage</button>
     <button type="button" class="cc-nav-item" data-view="viewRemote" id="navRemote" hidden>🎛 Remote Command</button>
     <hr style="margin: 12px 0; border: none; border-top: 1px solid var(--line);">
     <a href="/admin/node-fleet-command" style="display: block; padding: 10px 16px; color: var(--txt); text-decoration: none; font-size: 13px; border-radius: 6px; margin: 4px 0; transition: all 0.2s ease;">
@@ -353,6 +354,74 @@
         <div class="tile"><span class="tile-label">Online</span><strong id="meshOnline">—</strong></div>
       </div>
       <p id="meshMessage" class="hint" hidden></p>
+    </section>
+  </div>
+
+  <!--
+    LOCAL STORAGE — THIS NODE'S OWN DATA FOLDER.
+
+    THE POINT OF THIS PANEL: storage belongs to the machine the node is installed
+    on, so the operator must be able to see and change it from here, without the
+    Mothership and without hand-editing `.env`. The folder shown is the one in
+    force right now — the operator's choice if they made one, otherwise the
+    hardcoded local default (`data/` beside the executable).
+
+    The save path POSTs to /api/system/storage, which writes config.json AND the
+    boot-level `.env` beside the exe, copies the persistent tree to the new
+    folder, verifies it, and restarts the node onto it. The restart is not
+    cosmetic: until it happens the running process still holds the OLD database
+    open, and writes made in that window would be lost.
+
+    Every field is labelled with the file it ends up in, because "where did that
+    setting go?" is the first question an operator asks when a path is wrong.
+  -->
+  <div id="viewStorage" class="cc-view" hidden>
+    <section class="cc-panel">
+      <div class="ollama-head">
+        <h2>💾 Local Storage</h2>
+        <span id="storageSourceBadge" class="status-badge status-idle">—</span>
+      </div>
+      <p class="hint">
+        This node owns its storage. The data folder is configured here, on this
+        machine — the Mothership is only ever told where it is. The default is a
+        <code>data</code> folder beside the executable.
+      </p>
+      <div class="cc-stats ollama-stats">
+        <div class="tile"><span class="tile-label">Data Folder</span><strong id="storageDataDir">—</strong></div>
+        <div class="tile"><span class="tile-label">Config File</span><strong id="storageConfigPath">—</strong></div>
+        <div class="tile"><span class="tile-label">Scratch Drive</span><strong id="storageScratch">—</strong></div>
+        <div class="tile"><span class="tile-label">Safe Vault</span><strong id="storageVault">—</strong></div>
+      </div>
+      <p id="storageDefaultHint" class="hint">Default folder: —</p>
+
+      <div class="field">
+        <label for="storageDirInput">Data folder (database, models and scratch)</label>
+        <input id="storageDirInput" type="text" spellcheck="false" autocomplete="off"
+               placeholder="D:\RippaNode\data" />
+      </div>
+      <div class="row2">
+        <div class="field" style="flex:1;">
+          <label for="storageScratchInput">Scratch Drive quota (GB, optional)</label>
+          <input id="storageScratchInput" type="number" min="0.1" step="0.1" placeholder="e.g. 128" />
+        </div>
+        <div class="field" style="flex:1;">
+          <label for="storageVaultInput">Safe Vault quota (GB, optional)</label>
+          <input id="storageVaultInput" type="number" min="0.1" step="0.1" placeholder="e.g. 2048" />
+        </div>
+      </div>
+      <p class="hint">
+        Changing the folder copies the existing database, configuration and models
+        to the new location, then restarts this node so it opens them there. The
+        old folder is left untouched as a backup. Quotas are only reported to the
+        fleet — they do not delete anything.
+      </p>
+      <div class="row2">
+        <button id="storageSave" type="button" class="save" style="width:auto;padding:11px 20px;">
+          Save Storage Settings
+        </button>
+        <button id="storageUseDefault" type="button" class="ghost">Use Default Folder</button>
+      </div>
+      <p id="storageMessage" class="hint" hidden></p>
     </section>
   </div>
 

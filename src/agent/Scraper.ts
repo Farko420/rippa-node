@@ -121,10 +121,11 @@ function reportBootstrapFailure(reason: string): void {
  * unwritable and the download fails — exactly the reported "Playwright fails to
  * install Chromium on boot" symptom.
  *
- * `%LOCALAPPDATA%\RippaNode\browsers` is chosen deliberately: it is the same
- * per-user app-data root this app already uses for config.json and the Deep
- * Brain database (see `utils/paths.ts`), so it is guaranteed writable, survives
- * OTA swaps of the executable, and needs no admin rights.
+ * The browser cache lives in the node's local data directory
+ * (`data\browsers` beside the executable — see `utils/paths.ts`). That is
+ * deliberately the same root this app already uses for config.json and the Deep
+ * Brain database, so it is writable without admin rights and survives an OTA
+ * swap of the executable.
  *
  * Returns "" on any failure, and for non-packaged runs, so the caller can simply
  * skip setting the variable rather than reason about which case it is in.
@@ -136,9 +137,9 @@ function resolveBrowserInstallDir(): string {
     if (typeof (process as NodeJS.Process & { pkg?: unknown }).pkg === "undefined") {
       return "";
     }
-    // Resolved through the app's own path helper rather than re-deriving
-    // LOCALAPPDATA here, so the browser cache can never drift away from the
-    // directory the rest of the app persists to. Lazily required for the same
+    // Resolved through the app's own path helper rather than re-deriving a root
+    // here, so the browser cache can never drift away from the directory the rest
+    // of the app persists to. Lazily required for the same
     // reason `node:fs` is below — this file is evaluated inside a WebView too.
     const path = require("node:path") as typeof import("node:path");
     const { resolveDataDir } = require("../utils/paths") as typeof import("../utils/paths");

@@ -1,5 +1,5 @@
 import { getSystemVitals, type SystemVitals } from "./telemetry";
-import { buildStorageTelemetry } from "./storageConfig";
+import { buildStorageTelemetry, isEmptyStorageRequest } from "./storageConfig";
 import { publishNodeEvent } from "./nodeEvents";
 import { ollamaManager } from "./ollamaManager";
 import { getCurrentVersion, getLastUpdatedAt } from "../update/updateStamp";
@@ -107,6 +107,14 @@ const ADMIN_TASK_TYPES: Readonly<Record<string, RemoteCommandName>> = {
     `data_dir`, `scratch_capacity_gb` and `safe_vault_capacity_gb`, and the
     handler (storageConfig) ends in exit 42 on a real directory change so the
     Watchdog reboots the node onto its new drive.
+
+    THE NODE'S OWN STORAGE CONFIGURATION ALWAYS WINS. Storage is a property of
+    THIS machine — it is hardcoded locally (`./data` beside the exe) and editable
+    from the local dashboard — so a request that carries no usable directory and
+    no capacity is treated as a NO-OP: acknowledged as completed, logged, and
+    otherwise ignored. It is never reported as a failure and never throws, because
+    a cloud bug must not be able to mark a healthy node broken or leave the
+    operator with a node that appears to need repair.
   */
   SYSTEM_UPDATE_STORAGE: "UPDATE_STORAGE",
   UPDATE_STORAGE: "UPDATE_STORAGE",
@@ -818,6 +826,51 @@ export async function executePendingCommands(
           break;
         }
         case "UPDATE_STORAGE": {
+          /*
+            AN EMPTY STORAGE REQUEST IS A NO-OP, NOT A FAILURE.
+
+            WHY THIS BRANCH EXISTS. `UPDATE_STORAGE` used to run unconditionally:
+            the payload was parsed, and a missing or blank directory/capacity
+            threw, was reported to `/api/node/ack` as `failed`, and painted a
+            "Storage update cancelled" banner on the dashboard — on a node whose
+            storage was in fact perfectly fine and which the operator had never
+            asked to change. The fleet board then showed a broken node, and
+            nothing about the node was broken at all.
+
+            Storage is the node's OWN business (a hardcoded local `./data`
+            default, editable from the local dashboard). So when the cloud sends
+            a request with nothing in it, the local configuration takes
+            precedence: nothing is written, nothing is migrated, no handler runs,
+            no restart is triggered, and the command is retired upstream as
+            `completed`. The queue entry clears, the node keeps running, and the
+            log says exactly what happened.
+
+            Note the acknowledgement happens HERE and only here for this path —
+            `acknowledgedUpFront` suppresses the generic completion ack below, so
+            the Mothership sees exactly one terminal status.
+          */
+          if (isEmptyStorageRequest(entry.args)) {
+            console.log(
+              "[Heartbeat] UPDATE_STORAGE carried no usable directory or capacity — " +
+                "ignoring it. This node's LOCAL storage configuration takes precedence.",
+            );
+            publishNodeEvent({
+              kind: "admin_command",
+              command: "UPDATE_STORAGE_NOOP",
+              title: "Storage update ignored",
+              detail:
+                "The Mothership sent a storage update with no directory or capacity. This node keeps its own local storage configuration; nothing was changed.",
+              blocking: false,
+            });
+            await acknowledge(
+              handlers,
+              "UPDATE_STORAGE",
+              "noop — the request carried no directory or capacity; the node's local storage configuration takes precedence",
+              { ...ackContext, status: "completed" },
+            );
+            acknowledgedUpFront = true;
+            break;
+          }
           /*
             STORAGE & CAPACITY — write, migrate, verify, REBOOT.
 

@@ -268,6 +268,107 @@ try {
   });
   check("regenerate is passkey-gated (an unauthenticated LAN client cannot)", unauth.status === 401, `HTTP ${unauth.status}`);
 
+  /* ---------------------------------------------------------------------------
+     LOCAL STORAGE — the node's own data folder, over the real HTTP API.
+
+     THE CONTRACT UNDER TEST. The node owns its storage: the dashboard reads the
+     folder from /api/config and changes it through POST /api/system/storage. What
+     matters here is that neither the payload nor the endpoint can make a healthy
+     node look broken:
+
+       - the folder, its default and its quotas are visible in the config payload;
+       - an EMPTY submission is a NO-OP reported as SUCCESS, not a 4xx/5xx — a
+         clear field is not an error, and nothing restarts;
+       - a genuinely invalid path is refused with the reason (a typo the operator
+         can fix) and still changes nothing;
+       - the route is passkey-gated, because it MOVES a database and restarts the
+         node: a LAN client must not be able to do that.
+
+     A REAL directory change is deliberately NOT exercised here — it migrates the
+     tree and then restarts the node, which would take this harness's server away
+     mid-run. `scripts/verify-storage.mjs` drives that chain directly.
+  --------------------------------------------------------------------------- */
+  const storageCfg = await (
+    await fetch(`http://127.0.0.1:${PORT}/api/config`, { headers: { Cookie: cookie } })
+  ).json();
+  check(
+    "the config payload exposes this node's local storage folder",
+    typeof storageCfg?.storage?.dataDirectory === "string" &&
+      storageCfg.storage.dataDirectory.length > 0,
+    JSON.stringify(storageCfg?.storage),
+  );
+  check(
+    "the config payload names the hardcoded local default and where the setting came from",
+    typeof storageCfg?.storage?.defaultDirectory === "string" &&
+      ["config", "default"].includes(storageCfg?.storage?.source),
+    `source=${storageCfg?.storage?.source} default=${storageCfg?.storage?.defaultDirectory}`,
+  );
+  check(
+    "the storage block carries both quotas as numbers or nulls",
+    (storageCfg?.storage?.scratchCapacityGb === null ||
+      typeof storageCfg?.storage?.scratchCapacityGb === "number") &&
+      (storageCfg?.storage?.vaultCapacityGb === null ||
+        typeof storageCfg?.storage?.vaultCapacityGb === "number"),
+    JSON.stringify(storageCfg?.storage),
+  );
+
+  // An empty submission: nothing to do, reported as success. This is the exact
+  // shape the Mothership's empty UPDATE_STORAGE payload takes.
+  const storageNoop = await fetch(`http://127.0.0.1:${PORT}/api/system/storage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ dataDirectory: "" }),
+  });
+  const noopBody = await storageNoop.json();
+  check(
+    "an empty storage submission is a no-op success, not an error",
+    storageNoop.ok && noopBody.success === true && noopBody.noop === true && noopBody.changed === false,
+    `HTTP ${storageNoop.status} ${JSON.stringify({ noop: noopBody.noop, changed: noopBody.changed })}`,
+  );
+  check(
+    "the no-op reports no restart, so the node keeps running",
+    noopBody.restartRequired === false,
+    String(noopBody.restartRequired),
+  );
+
+  // A relative path is a typo, not a migration: refused with the reason.
+  const storageBad = await fetch(`http://127.0.0.1:${PORT}/api/system/storage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ dataDirectory: "RippaNode" }),
+  });
+  const badBody = await storageBad.json();
+  check(
+    "a relative storage path is refused with an actionable message",
+    storageBad.status === 400 && typeof badBody.message === "string" && badBody.message.length > 0,
+    `HTTP ${storageBad.status} ${badBody.message}`,
+  );
+  check(
+    "the refused request leaves the node's data folder untouched",
+    (await (
+      await fetch(`http://127.0.0.1:${PORT}/api/config`, { headers: { Cookie: cookie } })
+    ).json())?.storage?.dataDirectory === storageCfg?.storage?.dataDirectory,
+  );
+
+  const storageUnauth = await fetch(`http://127.0.0.1:${PORT}/api/system/storage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dataDirectory: "D:\\ShouldNotHappen" }),
+  });
+  check(
+    "the storage route is passkey-gated (a LAN client cannot move this node's database)",
+    storageUnauth.status === 401,
+    `HTTP ${storageUnauth.status}`,
+  );
+
+  // The `/api/config` alias exists too, so a UI that hard-codes either prefix works.
+  const storageAlias = await fetch(`http://127.0.0.1:${PORT}/api/config/storage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ dataDirectory: "" }),
+  });
+  check("the /api/config/storage alias also works", storageAlias.ok, `HTTP ${storageAlias.status}`);
+
   // --- 3. Brain sync progress over SSE --------------------------------------
   const events = [];
   const controller = new AbortController();

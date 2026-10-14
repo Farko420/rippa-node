@@ -29,11 +29,12 @@ import { EXIT_APPLY_UPDATE, isUnderWatchdog } from "./exitCodes";
  *   4. Remove the staged download and the script itself, so a node that updates
  *      repeatedly does not accumulate a 126 MB file per release.
  *
- * STAGING LOCATION. The download is staged in the persistent data directory
- * (`%LOCALAPPDATA%\RippaNode` on Windows), not beside the executable. Beside the
- * exe is wrong twice over: an install under Program Files is read-only for a
- * standard user, and `utils/paths.ts` already exists precisely because files
- * written next to the executable are not a safe place to keep anything.
+ * STAGING LOCATION. The download is staged in the node's local data directory
+ * (`data\` beside the executable — see `utils/paths.ts`), never beside the exe
+ * itself. That is the one location the node already guarantees is writable, and
+ * it survives an OTA swap because the swap rewrites the .exe FILE in place
+ * rather than the folder around it. An install under Program Files, by contrast,
+ * is read-only for a standard user.
  */
 
 /** Staged download, awaiting the swap. */

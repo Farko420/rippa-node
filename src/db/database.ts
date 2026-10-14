@@ -11,10 +11,9 @@ import { migrateSwarmTriageColumns } from "./swarmTriageMigrations";
  * THE DEEP BRAIN — local SQLite knowledge store.
  *
  * Master-only: satellites are stateless and never touch this file.
- * The database lives in the OS PERSISTENT data directory (`%LOCALAPPDATA%\
- * RippaNode` on Windows, `~/.rippa-node` elsewhere) — never next to the
- * executable, because the OTA updater replaces the .exe in place and anything
- * written there is destroyed by every update.
+ * The database lives in the node's LOCAL data directory — `data\\` beside the
+ * executable (see `utils/paths.ts`) — which the OTA updater never touches: it
+ * replaces the .exe file in place and leaves the folder around it alone.
  */
 
 const DB_FILENAME = "local_knowledge.db";

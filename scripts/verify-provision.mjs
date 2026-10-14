@@ -359,7 +359,12 @@ async function unpack(bundle, tag) {
     );
 
     const notes = fs.readFileSync(path.join(dir, "PROVISION.txt"), "utf8");
-    check("the windows notes name the config location", notes.includes("%LOCALAPPDATA%\\RippaNode"));
+    // The data folder moved from the OS app-data location to `data/` beside the
+    // exe, so the operator notes have to name the place the node actually uses.
+    check(
+      "the windows notes name the local data folder beside the exe",
+      notes.includes("data") && notes.includes("BESIDE THE EXE") && !notes.includes("%LOCALAPPDATA%"),
+    );
   } finally {
     stub.restore();
   }

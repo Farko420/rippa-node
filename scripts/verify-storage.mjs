@@ -27,8 +27,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { ROOT, check, results } from "./verify-harness.mjs";
 
 const { parseStorageConfigRequest, applyStorageConfig, capacityFromEnv,
-  readStorageSettings, buildStorageTelemetry } =
+  readStorageSettings, buildStorageTelemetry, buildStorageProfile,
+  isEmptyStorageRequest } =
   await import(pathToFileURL(path.join(ROOT, "dist", "services", "storageConfig.js")).href);
+const { defaultDataDir, legacyDataDir, resolveDataDir, ensureDataDir } =
+  await import(pathToFileURL(path.join(ROOT, "dist", "utils", "paths.js")).href);
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rippa-storage-"));
 const dataDirA = path.resolve(tmpRoot, "data-A");
@@ -171,12 +174,80 @@ check(
   JSON.stringify(parseStorageConfigRequest({ scratch_capacity_gb: "12.345" })),
 );
 
+/*
+  THE EMPTY PAYLOAD — "STORAGE IS THE NODE'S OWN BUSINESS".
+
+  WHAT THIS REPLACES. This check used to REQUIRE a throw for `{}` ("an empty
+  payload is a broken command, not a no-op"). That rule is exactly what produced
+  the reported failure: the Mothership sent UPDATE_STORAGE with nothing in it, the
+  handler threw, the executor reported `failed` to /api/node/ack, and a healthy
+  node appeared broken on the fleet board.
+
+  The contract now: a request with no usable directory and no capacity is a NO-OP.
+  It parses to an empty request, applies to a report that says `noop: true`, and
+  changes nothing on disk — the node's local storage configuration stands.
+*/
 check(
-  "parseStorageConfigRequest requires a directory or a capacity",
+  "an empty payload parses to an empty request instead of throwing",
   (() => {
-    try { parseStorageConfigRequest({}); return false; } catch { return true; }
+    const parsed = parseStorageConfigRequest({});
+    return parsed && typeof parsed === "object" && Object.keys(parsed).length === 0;
   })(),
-  "an empty payload is a broken command, not a no-op",
+  JSON.stringify(parseStorageConfigRequest({})),
+);
+
+check(
+  "isEmptyStorageRequest covers every empty spelling the Mothership uses",
+  (() => {
+    const empties = [
+      undefined,
+      null,
+      {},
+      [],
+      { data_dir: "" },
+      { data_dir: "   " },
+      { dataDir: null },
+      { data_dir: null, scratch_capacity_gb: null, safe_vault_capacity_gb: null },
+      { scratch_capacity_gb: 0, safe_vault_capacity_gb: 0 },
+    ];
+    const actionable = [
+      { data_dir: dataDirB },
+      { dataDir: dataDirB },
+      { scratch_capacity_gb: 128 },
+      { scratch_capacity_gb: "128" },
+      { safe_vault_capacity_gb: 2048 },
+      { vault_capacity_gb: "2048" },
+    ];
+    return (
+      empties.every((args) => isEmptyStorageRequest(args) === true) &&
+      actionable.every((args) => isEmptyStorageRequest(args) === false)
+    );
+  })(),
+  JSON.stringify({
+    empty: isEmptyStorageRequest({}),
+    dir: isEmptyStorageRequest({ data_dir: dataDirB }),
+    quota: isEmptyStorageRequest({ scratch_capacity_gb: "128" }),
+  }),
+);
+
+check(
+  "applyStorageConfig treats an empty request as a no-op that writes nothing",
+  (() => {
+    const configFile = path.join(dataDirA, "config.json");
+    const before = fs.readFileSync(configFile, "utf8");
+    const report = applyStorageConfig({});
+    const after = fs.readFileSync(configFile, "utf8");
+    return (
+      report.applied === false &&
+      report.noop === true &&
+      report.changed === false &&
+      report.migrated.length === 0 &&
+      report.from === dataDirA &&
+      report.to === dataDirA &&
+      after === before
+    );
+  })(),
+  JSON.stringify(applyStorageConfig({})),
 );
 
 // Telemetry sanity checks: buildStorageTelemetry must expose the exact wire keys
@@ -351,6 +422,121 @@ check(
     capacityFromEnv('X', { X: String(2 ** 21) }) === null,
   JSON.stringify([capacityFromEnv('X', { X: '0.05' }), capacityFromEnv('X', { X: '12.345' }), capacityFromEnv('X', { X: String(2 ** 21) })]),
 );
+
+// =================== the hardcoded, node-owned local default ===================
+//
+// THE DEFAULT IS LOCAL, AND THE NODE OWNS IT. `data/` beside the executable — the
+// project root when running from source — never a path the Mothership supplies.
+// The OS app-data folder older builds used is kept ONLY as a migration source
+// (see `migrateLegacyData`), so an upgrading node keeps its config, node code,
+// mesh key and Deep Brain instead of looking factory-reset.
+
+const savedDataDirEnv = process.env.RIPPA_DATA_DIR;
+delete process.env.RIPPA_DATA_DIR;
+
+check(
+  'with no override, the data directory is <install dir>/data (the hardcoded default)',
+  resolveDataDir() === defaultDataDir() &&
+    defaultDataDir() === path.resolve(process.cwd(), 'data'),
+  `resolveDataDir()=${resolveDataDir()} defaultDataDir()=${defaultDataDir()}`,
+);
+
+check(
+  'the OS app-data folder is a migration source, never the default',
+  legacyDataDir() === null || path.resolve(legacyDataDir()) !== path.resolve(resolveDataDir()),
+  `legacyDataDir()=${legacyDataDir()} resolveDataDir()=${resolveDataDir()}`,
+);
+
+check(
+  'the data directory is created recursively on demand',
+  (() => {
+    const dir = ensureDataDir();
+    return fs.existsSync(dir) && path.resolve(dir) === path.resolve(process.cwd(), 'data');
+  })(),
+  ensureDataDir(),
+);
+
+// An explicit override always wins — that is what makes a dashboard change (which
+// writes RIPPA_DATA_DIR into config.json and the boot-level .env) take effect.
+process.env.RIPPA_DATA_DIR = dataDirA;
+check(
+  'an explicit RIPPA_DATA_DIR overrides the hardcoded default',
+  resolveDataDir() === dataDirA,
+  resolveDataDir(),
+);
+if (savedDataDirEnv === undefined) delete process.env.RIPPA_DATA_DIR;
+else process.env.RIPPA_DATA_DIR = savedDataDirEnv;
+
+// ==================== the boot profile's storage declaration ====================
+//
+// Reported once per boot to POST /api/swarm/submit, so the Mothership knows this
+// node's storage is already resolved and has no reason to queue an update for it.
+check(
+  'buildStorageProfile declares storage configured and resolved with the live folder',
+  (() => {
+    process.env.RIPPA_DATA_DIR = dataDirB;
+    const profile = buildStorageProfile();
+    return profile.storage_configured === true &&
+      profile.storage_resolved === true &&
+      profile.storage_data_dir === dataDirB &&
+      profile.storage_directory === dataDirB &&
+      profile.data_directory === dataDirB &&
+      profile.data_dir === dataDirB &&
+      profile.scratch_capacity_gb === 128 &&
+      profile.vault_capacity_gb === 2048 &&
+      profile.safe_vault_capacity_gb === 2048 &&
+      profile.storage_capacities_resolved === true;
+  })(),
+  JSON.stringify(buildStorageProfile()),
+);
+
+// The capacities are optional on the node, so the profile says whether the two
+// figures it carries are real rather than leaving the cloud to guess from nulls.
+check(
+  'buildStorageProfile reports unresolvable capacities honestly',
+  (() => {
+    const savedScratch = process.env.SCRATCH_DRIVE_CAPACITY_GB;
+    const savedVault = process.env.SAFE_VAULT_CAPACITY_GB;
+    delete process.env.SCRATCH_DRIVE_CAPACITY_GB;
+    delete process.env.SAFE_VAULT_CAPACITY_GB;
+    const profile = buildStorageProfile();
+    if (savedScratch === undefined) delete process.env.SCRATCH_DRIVE_CAPACITY_GB;
+    else process.env.SCRATCH_DRIVE_CAPACITY_GB = savedScratch;
+    if (savedVault === undefined) delete process.env.SAFE_VAULT_CAPACITY_GB;
+    else process.env.SAFE_VAULT_CAPACITY_GB = savedVault;
+    return (
+      profile.scratch_capacity_gb === null &&
+      profile.vault_capacity_gb === null &&
+      profile.storage_capacities_resolved === false
+    );
+  })(),
+  'unset quotas are null and flagged as unresolved',
+);
+
+// ======================= source-level contract pins =======================
+//
+// The UPDATE_STORAGE no-op and the boot profile live in modules that cannot be
+// imported by this harness (`src/index.ts` boots at import; `heartbeat.ts` pulls
+// the live config), so the wiring is pinned on the source text — the same
+// technique used above for the exit-42 contract.
+const srcHeartbeat = fs.readFileSync(path.join(ROOT, 'src', 'services', 'heartbeat.ts'), 'utf8');
+const srcIndexStorage = fs.readFileSync(path.join(ROOT, 'src', 'index.ts'), 'utf8');
+check(
+  'the heartbeat short-circuits an empty UPDATE_STORAGE as a completed no-op',
+  srcHeartbeat.includes('isEmptyStorageRequest') &&
+    srcHeartbeat.includes('status: "completed"') &&
+    srcHeartbeat.includes('LOCAL storage configuration takes precedence'),
+);
+check(
+  'the UPDATE_STORAGE handler itself also refuses to fail on an empty request',
+  srcIndexStorage.includes('isEmptyStorageRequest') &&
+    srcIndexStorage.includes("keeping this node's local storage configuration"),
+);
+check(
+  'the boot sequence submits the node profile (POST /api/swarm/submit)',
+  srcIndexStorage.includes('buildNodeProfile') && srcIndexStorage.includes('submitProfile'),
+);
+
 
 // ============================ teardown & summary ============================
 

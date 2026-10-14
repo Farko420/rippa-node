@@ -96,7 +96,12 @@ import {
   updateRemoteTask,
 } from "./services/remoteTasks";
 import { sanitizeFilename, parseMultipart } from "./services/multipartParser";
-import { dataFilePath } from "./utils/paths";
+import { dataFilePath, defaultDataDir, resolveDataDir } from "./utils/paths";
+import {
+  applyStorageConfig,
+  isEmptyStorageRequest,
+  readStorageSettings,
+} from "./services/storageConfig";
 
 /**
  * THE INTERROGATION ENDPOINT — where the cloud-based Rippa AI pings the
@@ -381,6 +386,16 @@ function isSatelliteRemoteProxy(req: Request, proxyablePath: string): boolean {
     clean.startsWith("/api/system/config/") ||
     clean === "/api/config" ||
     clean.startsWith("/api/config/") ||
+    /*
+      STORAGE IS THE LOCAL MACHINE'S, so a Satellite must never be able to reach
+      it through the mesh. This route MOVES a node's database and restarts it onto
+      the new folder; a remote caller with a valid mesh key would otherwise be
+      able to relocate the Master's storage without ever holding its dashboard
+      PIN. It is the same class of local-only action as `/api/node/restart` and
+      `/api/node/shutdown` below, which is why it sits in the same list.
+    */
+    clean === "/api/system/storage" ||
+    clean.startsWith("/api/system/storage/") ||
     clean === "/api/mesh/pair-with-master" ||
     clean === "/api/mesh/identity" ||
     clean === "/api/mesh/self-heal" ||
@@ -499,6 +514,32 @@ function buildConfigPayload(authenticated: boolean): Record<string, unknown> {
   const complete = isConfigComplete(readConfig());
   const apiKey = (stored.NODE_API_KEY ?? "").trim();
   const pin = (stored.DASHBOARD_PIN ?? "").trim();
+  /*
+    THE STORAGE BLOCK — the LOCAL storage configuration, in the one payload the
+    dashboard already reads.
+
+    WHY IT IS IN HERE. "Where is this node's database?" and "how do I move it?"
+    are questions the operator must be able to answer from the node's own UI,
+    without waiting for the Mothership to say anything. So the resolved directory
+    (the hardcoded local default when nothing was chosen), the folder the node
+    would fall back to, the configured quotas and whether the folder currently
+    exists are all reported here, freshly from disk on every call.
+
+    `source` says WHY that directory is in force, which is the difference between
+    "the operator moved it to D:\RippaNode" and "this is the default beside the
+    exe" — the two look identical if only the path is shown, and the operator's
+    next move depends on which one it is.
+  */
+  const configuredDir = (stored.dataDirectory ?? stored.RIPPA_DATA_DIR ?? "").trim();
+  let resolvedDir = configuredDir;
+  let resolvedExists = false;
+  try {
+    resolvedDir = resolveDataDir();
+    resolvedExists = fs.existsSync(resolvedDir);
+  } catch {
+    /* resolveDataDir cannot throw any more, but the payload must never fail */
+  }
+  const settings = readStorageSettings();
   return {
     success: true,
     configured: complete,
@@ -508,6 +549,32 @@ function buildConfigPayload(authenticated: boolean): Record<string, unknown> {
     configPresent: configFileExists(),
     configPath: configFilePath(),
     missing: complete ? [] : describeConfigGaps(readConfig()),
+    /*
+      THE LOCAL DATA DIRECTORY, AT THE TOP LEVEL OF THE PAYLOAD.
+
+      Both spellings are present deliberately: `dataDirectory` is the config.json
+      name this node writes, and `storageDirectory` is the alias an operator may
+      have hand-edited. `storage` below carries the resolved path and the
+      diagnostics, which is what the dashboard's Storage panel renders.
+    */
+    dataDirectory: configuredDir,
+    storageDirectory: configuredDir,
+    storage: {
+      /** The directory in force right now, absolute. */
+      dataDirectory: resolvedDir,
+      /** The explicit configuration, or "" when the local default is in force. */
+      configuredDirectory: configuredDir,
+      /** The hardcoded local default (`./data` beside the executable). */
+      defaultDirectory: defaultDataDir(),
+      /** True when the resolved directory exists on disk. */
+      exists: resolvedExists,
+      /** `config` when the operator chose it, `default` when it is the fallback. */
+      source: configuredDir ? "config" : "default",
+      /** `config.json` inside the resolved directory. */
+      configPath: configFilePath(resolvedDir),
+      scratchCapacityGb: settings.scratchCapacityGb,
+      vaultCapacityGb: settings.safeVaultCapacityGb,
+    },
     /*
       THE NODE CODE, AT THE TOP LEVEL OF THE PAYLOAD.
 
@@ -939,6 +1006,122 @@ export function createApp(): Express {
   });
 
   /*
+    POST /api/system/storage — CHANGE THIS NODE'S DATA FOLDER, LOCALLY.
+
+    WHY THIS EXISTS. Storage is a property of the machine the node is installed
+    on, so the operator standing in front of it must be able to inspect and change
+    it without asking the Mothership to queue a command and without hand-editing
+    `.env`. This is that path. It calls the SAME `applyStorageConfig` the remote
+    UPDATE_STORAGE command uses (write → migrate → verify), so the two channels can
+    never drift apart.
+
+    Registered under both prefixes (`/api/system/storage` and the `/api/config`
+    alias) to match this file's existing convention: a UI that hard-codes the
+    other one would fail with a confusing 404.
+
+    BEHAVIOUR:
+      - An EMPTY body is a no-op reported as SUCCESS (`noop: true`), never an
+        error: "leave my storage alone" is a perfectly good answer.
+      - A real directory change copies and verifies the persistent tree, then
+        RESTARTS the node onto the new drive (`restartRequired: true`). The
+        restart is not optional politeness: between the copy and the reboot the
+        running process still holds the OLD database open, so anything written in
+        that window would be lost the moment the node came up on the new folder.
+        The remote command has always behaved this way (exit 42 → the Watchdog
+        relaunches the node), and a local change must not be the sloppier of the
+        two.
+      - Anything invalid (a relative path, control characters, a filesystem root,
+        an out-of-range quota) is a 400 carrying the reason, because those are
+        typos the operator can fix.
+  */
+  const storageHandler = (req: Request, res: Response): void => {
+    const body =
+      req.body && typeof req.body === "object" && !Array.isArray(req.body)
+        ? (req.body as Record<string, unknown>)
+        : {};
+    /*
+      ONE ROUTE, TWO VOCABULARIES. The dashboard speaks config.json's names
+      (`dataDirectory`, `scratchCapacityGb`); the Mothership's payload speaks
+      snake_case (`data_dir`, `scratch_capacity_gb`). Both are accepted and
+      normalised into the one shape `applyStorageConfig` validates, so neither
+      caller has to know how the other spells things.
+    */
+    const args: Record<string, unknown> = { ...body };
+    const dirFromBody = [body["dataDirectory"], body["storageDirectory"]].find(
+      (value) => typeof value === "string",
+    );
+    if (typeof dirFromBody === "string") args["data_dir"] = dirFromBody;
+    if (typeof body["scratchCapacityGb"] === "string" || typeof body["scratchCapacityGb"] === "number") {
+      args["scratch_capacity_gb"] = body["scratchCapacityGb"];
+    }
+    const vaultFromBody = [body["safeVaultCapacityGb"], body["vaultCapacityGb"]].find(
+      (value) => typeof value === "string" || typeof value === "number",
+    );
+    if (vaultFromBody !== undefined) args["safe_vault_capacity_gb"] = vaultFromBody;
+
+    try {
+      if (isEmptyStorageRequest(args)) {
+        console.log("[API] Storage request carried nothing to change — the node's local storage stands.");
+        res.json({
+          success: true,
+          noop: true,
+          changed: false,
+          restartRequired: false,
+          message: "Nothing to change — this node keeps its current data folder.",
+          ...buildConfigPayload(true),
+        });
+        return;
+      }
+
+      const report = applyStorageConfig(args);
+      console.log(
+        `[API] Storage configuration ${report.changed ? `migrated ${report.from} → ${report.to}` : "updated in place"}.`,
+      );
+      publishNodeEvent({
+        kind: "info",
+        title: report.changed ? "Data Folder Moved" : "Storage Settings Saved",
+        detail: report.changed
+          ? `Persistent data copied from ${report.from} to ${report.to}. The node is restarting onto the new folder.`
+          : "Storage quotas updated. The data folder is unchanged.",
+      });
+
+      res.json({
+        success: true,
+        noop: report.noop,
+        changed: report.changed,
+        from: report.from,
+        to: report.to,
+        migrated: report.migrated,
+        restartRequired: report.changed,
+        message: report.changed
+          ? `Data folder moved to ${report.to}. Restarting this node so it opens the database there.`
+          : "Storage settings saved. The data folder is unchanged.",
+        // Spread LAST so the storage block reflects the just-applied values
+        // rather than the state before the write.
+        ...buildConfigPayload(true),
+      });
+
+      /*
+        RESTART AFTER THE RESPONSE IS FLUSHED. Same 250ms delay the dashboard's
+        own Restart button uses, for the same reason: the browser must receive
+        the JSON (and the SSE overlay) before the process goes away, or the
+        operator sees a dead page instead of an explanation.
+      */
+      if (report.changed) {
+        setTimeout(() => void lifecycle?.restart(), 250);
+      }
+    } catch (error) {
+      // A validation refusal, not a crash: nothing was written and nothing was
+      // migrated, so the node is exactly as it was. 400 with the reason.
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[API] Storage configuration refused — ${message}`);
+      res.status(400).json({ success: false, message });
+    }
+  };
+  app.post("/api/system/storage", requireDashboardAuth, storageHandler);
+  app.post("/api/config/storage", requireDashboardAuth, storageHandler);
+
+  /*
     POST /api/config/regenerate-code — MINT A NEW NODE IDENTITY.
 
     WHY THIS EXISTS. The node code was documented as permanent with no recovery
@@ -955,8 +1138,9 @@ export function createApp(): Express {
 
     BEHAVIOUR:
       - Mints a fresh cryptographically random RIPPA-XXXX-XXXX code.
-      - Writes it straight to config.json in the persistent data directory
-        (%LOCALAPPDATA%\RippaNode), so it survives restarts and OTA updates.
+      - Writes it straight to config.json in this node's LOCAL data directory
+        (`data\` beside the executable — see `utils/paths.ts`), so it survives
+        restarts and OTA updates.
       - Clears every mesh/satellite association made under the old code and
         resets the live dispatcher, so the node genuinely re-pairs.
       - Returns the new code in the response body so the UI updates immediately

@@ -185,12 +185,21 @@ export interface RippaNodeConfig {
    power_config_updated_at?: string;
 
   /**
-   * STORAGE & CAPACITY — the node's persistent drive, as set by the Mothership's
-   * "Apply & Migrate" flow (SYSTEM_UPDATE_STORAGE) or hand-edited.
+   * STORAGE & CAPACITY — the node's LOCAL data folder and its quotas.
    *
-   * `RIPPA_DATA_DIR` relocates the whole persistent tree (see utils/paths).
-   * The two capacity quotas are GB figures the node broadcasts on every
-   * heartbeat so the fleet board can show Scratch Drive / Safe Vault headroom.
+   * THE NODE OWNS THIS. `dataDirectory` is the explicit, locally-editable name
+   * for the folder that holds the Deep Brain database, `config.json`, the
+   * models and the scratch area. It is the single source of truth for
+   * `RIPPA_DATA_DIR`, which is the environment spelling the rest of the node
+   * (and the boot path in `utils/paths`) reads. Absent means "use the hardcoded
+   * local default" — `<folder containing the exe>/data`, i.e. `./data` when
+   * running from source. See `utils/paths.defaultDataDir`.
+   *
+   * The Mothership does NOT dictate this. It may ASK for a change
+   * (SYSTEM_UPDATE_STORAGE), but a request that carries no usable directory or
+   * capacity is ignored and acknowledged as a no-op rather than failed, and the
+   * node's own configuration always wins. An empty payload must never cost the
+   * operator their running node.
    *
    * CARRIED THROUGH `normalizeConfig` FOR THE SAME REASON AS `GITHUB_OTA_TOKEN`:
    * `writeConfig` writes what that function returns and is NOT a merge, so
@@ -198,6 +207,10 @@ export interface RippaNodeConfig {
    * next unrelated GUI save — the node would then reboot onto its OLD default
    * directory, silently undoing a migration that had already copied the data.
    */
+  dataDirectory?: string;
+  /** Alias of {@link dataDirectory}; accepted from hand-edited config.json. */
+  storageDirectory?: string;
+  /** Environment spelling of {@link dataDirectory}. Mirrored on normalisation. */
   RIPPA_DATA_DIR?: string;
   SCRATCH_DRIVE_CAPACITY_GB?: number;
   SAFE_VAULT_CAPACITY_GB?: number;
@@ -236,17 +249,18 @@ function isPackaged(): boolean {
 /**
  * ROOT DIRECTORY THAT HOLDS `config.json`.
  *
- * This is the OS PERSISTENT data directory, NOT the executable's folder. It used
- * to be `path.dirname(process.execPath)`, which meant an OTA update — the node
- * replaces its own .exe in place — wiped the operator's config, node code, mesh
- * key, pairing record and dashboard passkey on every single deploy. The folder
- * beside the exe is now used only for read-only bundled assets (`public/`) and
- * as the migration source in `utils/paths.migrateLegacyData`.
+ * This is the node's LOCAL data directory (`utils/paths.resolveDataDir`), NOT a
+ * cloud-supplied path. It used to be `path.dirname(process.execPath)`, which
+ * meant an OTA update — the node replaces its own .exe in place — wiped the
+ * operator's config, node code, mesh key, pairing record and dashboard passkey on
+ * every single deploy. It then moved to the OS app-data folder; it is now the
+ * hardcoded `./data` beside the exe (see `defaultDataDir`), which the in-place
+ * swap does not touch.
  *
  * Resolution order:
- *   1. `RIPPA_CONFIG_ROOT` — explicit override (tests / custom deployments).
- *   2. `RIPPA_DATA_DIR`     — explicit persistent-dir override.
- *   3. `%LOCALAPPDATA%\RippaNode` on Windows, `~/.rippa-node` elsewhere.
+ *   1. `RIPPA_CONFIG_ROOT`  — explicit override (tests / custom deployments).
+ *   2. `RIPPA_DATA_DIR`     — the node's own configured data folder.
+ *   3. `<install dir>/data` — the hardcoded local default.
  *
  * The directory is created here (recursively) on every call, so a first boot
  * on a clean machine has somewhere to write before anything else runs.
@@ -327,6 +341,23 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
   const cloudLinkCode = normalizeCloudLinkCode(
     pickString(record, "cloud_link_code", "CLOUD_LINK_CODE", "cloudLinkCode"),
   );
+  /*
+    THE LOCAL DATA FOLDER, read under every spelling it can arrive as: the
+    explicit `dataDirectory` (the node's own config / dashboard), its
+    `storageDirectory` alias, and the environment spelling `RIPPA_DATA_DIR` that
+    `.env` beside the exe and every older build used. One value comes out, and it
+    is written back under BOTH names below, so config.json is self-describing
+    while the rest of the node keeps reading the env key it always has.
+  */
+  const dataDirectory =
+    pickString(
+      record,
+      "dataDirectory",
+      "storageDirectory",
+      "data_directory",
+      "RIPPA_DATA_DIR",
+      "ripa_data_dir",
+    ) || undefined;
   return {
     NODE_ROLE: role,
     NODE_NAME: pickString(record, "NODE_NAME", "node_name") || "Unnamed Rippa Node",
@@ -370,9 +401,14 @@ export function normalizeConfig(cfg: ConfigInput): RippaNodeConfig {
       STORAGE & CAPACITY — see the interface note. Present-optional like
       GITHUB_OTA_TOKEN: absent means "not configured", never a fabricated
       default, because a default capacity the operator never chose would be
-      broadcast to the fleet board as fact.
+      broadcast to the fleet board as fact. The directory itself is a different
+      matter: when it is absent the node uses its hardcoded local default
+      (`utils/paths.defaultDataDir`), which is why only the EXPLICIT value is
+      persisted here.
     */
-    RIPPA_DATA_DIR: pickString(record, "RIPPA_DATA_DIR", "ripa_data_dir") || undefined,
+    dataDirectory,
+    storageDirectory: dataDirectory,
+    RIPPA_DATA_DIR: dataDirectory,
     SCRATCH_DRIVE_CAPACITY_GB: normalizeCapacityGb(
       record["SCRATCH_DRIVE_CAPACITY_GB"] ?? record["scratch_drive_capacity_gb"],
     ),
@@ -691,9 +727,16 @@ export function applyConfigToEnv(cfg: ConfigInput | RippaNodeConfig | null, forc
     RIPPA_DATA_DIR as "no override" already, but writing blanks would shadow a
     legitimate `.env` value the moment anything stopped trimming, and would
     broadcast a capacity of "" as fact. Absent stays absent.
+
+    `dataDirectory` (config.json) and `RIPPA_DATA_DIR` (the environment) are the
+    same setting; the former is the readable local name, the latter is what
+    `utils/paths` reads. Pushing it here is what makes a directory chosen in the
+    local dashboard take effect on the NEXT boot without the operator touching
+    `.env` — `storageConfig.applyStorageConfig` additionally writes the boot-level
+    `.env` beside the exe, because dotenv loads BEFORE config.json is read.
   */
-  if (config.RIPPA_DATA_DIR) {
-    put("RIPPA_DATA_DIR", config.RIPPA_DATA_DIR);
+  if (config.dataDirectory) {
+    put("RIPPA_DATA_DIR", config.dataDirectory);
   }
   if (config.SCRATCH_DRIVE_CAPACITY_GB !== undefined) {
     put("SCRATCH_DRIVE_CAPACITY_GB", String(config.SCRATCH_DRIVE_CAPACITY_GB));
@@ -911,6 +954,29 @@ const MESH_OWNED_FIELDS = [
 ] as const;
 
 /**
+ * FIELDS THAT DESCRIBE THIS MACHINE'S OWN STORAGE.
+ *
+ * WHY THEY ARE CARRIED FORWARD TOO. They are not mesh state, but they are not on
+ * the Setup form either — the folder is chosen in the dashboard's Local Storage
+ * panel, which writes through `applyStorageConfig`. A settings save therefore
+ * posts a payload that mentions none of them, and since `writeConfig` replaces
+ * rather than merges, an operator who changed their node name would silently
+ * delete `dataDirectory` — and the node would come back on the DEFAULT folder,
+ * with its database apparently gone, on the next restart.
+ *
+ * Same rule as the mesh fields: an existing value is only applied to a key the
+ * incoming payload did not mention, so the storage panel (which does mention it)
+ * still wins.
+ */
+const LOCAL_STORAGE_FIELDS = [
+  "dataDirectory",
+  "storageDirectory",
+  "RIPPA_DATA_DIR",
+  "SCRATCH_DRIVE_CAPACITY_GB",
+  "SAFE_VAULT_CAPACITY_GB",
+] as const;
+
+/**
  * Validates GUI/API input for POST /api/system/config.
  * Accepts both UPPER_SNAKE and lowercase node_role / master_node_url keys.
  */
@@ -999,6 +1065,20 @@ export function validateConfigInput(
     const existing = stored as unknown as Record<string, unknown>;
     for (const field of MESH_OWNED_FIELDS) {
       if (record[field] === undefined && existing[field] !== undefined) {
+        merged[field] = existing[field];
+      }
+    }
+    // Storage is the node's own, and is never on the Setup form — see
+    // LOCAL_STORAGE_FIELDS. Carried forward here so a settings save cannot
+    // relocate the database by forgetting to mention the folder.
+    //
+    // A BLANK VALUE COUNTS AS ABSENT. There is always a data folder in force, so
+    // an explicit "" from a caller that does not know about storage must not be
+    // read as "unset" — that would silently drop the operator's choice and send
+    // the node back to the default folder on the next restart.
+    for (const field of LOCAL_STORAGE_FIELDS) {
+      const incoming = record[field];
+      if ((incoming === undefined || incoming === "") && existing[field] !== undefined) {
         merged[field] = existing[field];
       }
     }

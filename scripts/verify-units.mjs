@@ -467,14 +467,19 @@ check(
 );
 
 // A refusing handler is reported honestly, exactly like a refused update.
+// The payload must be ACTIONABLE for the handler to be reached at all — an empty
+// one is a no-op now (see below), so this test carries a real directory.
 resetExecutedCommands();
 const storageRefused = [];
-await executePendingCommands([{ id: "stor-3", command: "UPDATE_STORAGE" }], {
-  ...ackBase,
-  updateStorage: () => false,
-  acknowledgeCommand: (command, detail, context) =>
-    storageRefused.push({ command, detail, context }),
-});
+await executePendingCommands(
+  [{ id: "stor-3", command: "UPDATE_STORAGE", args: { data_dir: "D:\\RippaNode" } }],
+  {
+    ...ackBase,
+    updateStorage: () => false,
+    acknowledgeCommand: (command, detail, context) =>
+      storageRefused.push({ command, detail, context }),
+  },
+);
 check(
   "a refused storage apply is acknowledged twice (in_progress, then failed)",
   storageRefused.length === 2 &&
@@ -483,17 +488,74 @@ check(
   JSON.stringify(storageRefused.map((a) => a.context?.status)),
 );
 
+/*
+  THE DEFUSED EMPTY PAYLOAD — the reported "node marked broken" failure.
+
+  A Mothership that queues UPDATE_STORAGE with no directory and no capacity used
+  to make the handler throw, which the executor reported to /api/node/ack as
+  `failed` and painted as "Storage update cancelled" on the dashboard. The node's
+  storage was fine and the local configuration was never in question.
+
+  The contract now: the handler is NOT called at all, nothing is reported as a
+  failure, and the command is retired with a single `completed` acknowledgement so
+  it stops being re-delivered. Every "empty" spelling is covered.
+*/
+for (const [name, args] of [
+  ["no payload at all", undefined],
+  ["an empty object", {}],
+  ["a blank directory", { data_dir: "" }],
+  ["null fields", { data_dir: null, scratch_capacity_gb: null, safe_vault_capacity_gb: null }],
+  ["whitespace", { data_dir: "   " }],
+  ["zero capacities", { scratch_capacity_gb: 0, safe_vault_capacity_gb: 0 }],
+]) {
+  resetExecutedCommands();
+  const acks = [];
+  let handlerRan = false;
+  const executed = await executePendingCommands(
+    [
+      {
+        id: `noop-${name}`,
+        command: "UPDATE_STORAGE",
+        ...(args === undefined ? {} : { args }),
+      },
+    ],
+    {
+      ...ackBase,
+      updateStorage: () => {
+        handlerRan = true;
+        return true;
+      },
+      acknowledgeCommand: (command, detail, context) => acks.push({ command, detail, context }),
+    },
+  );
+  check(
+    `an empty UPDATE_STORAGE payload is a no-op, not a failure (${name})`,
+    executed.length === 1 &&
+      !handlerRan &&
+      acks.length === 1 &&
+      acks[0].context?.status === "completed" &&
+      !acks.some((a) => a.context?.status === "failed"),
+    JSON.stringify({ handlerRan, acks: acks.map((a) => a.context?.status) }),
+  );
+  check(
+    `the no-op acknowledgement carries the command id so the queue clears (${name})`,
+    acks[0]?.context?.commandId === `noop-${name}`,
+    JSON.stringify(acks[0]?.context),
+  );
+}
+
 // Payload validation: relative paths, filesystem roots, and garbage
 // capacities are refused with a message the admin screen can show.
 const {
   parseStorageConfigRequest,
   applyStorageConfig,
   buildStorageTelemetry,
+  buildStorageProfile,
+  isEmptyStorageRequest,
 } = await load("dist/services/storageConfig.js");
 for (const [name, payload] of [
   ["a relative path", { data_dir: "RippaNode" }],
   ["a filesystem root", { data_dir: "C:\\" }],
-  ["an empty payload", {}],
   ["a garbage capacity", { scratch_capacity_gb: "lots" }],
   ["a negative capacity", { scratch_capacity_gb: -4 }],
 ]) {
@@ -505,6 +567,59 @@ for (const [name, payload] of [
   }
   check(`an unsafe storage request is refused (${name})`, refused.length > 0, refused);
 }
+
+/*
+  AN EMPTY PAYLOAD IS NOT REFUSED ANY MORE.
+
+  It used to throw, which is what turned a cloud bug into a "failed" command and a
+  node that looked broken. It now parses to an empty request and applies as a
+  no-op — see the isEmptyStorageRequest checks in verify-storage.mjs for the full
+  matrix. These two pins keep the two halves from drifting apart.
+*/
+let emptyParsed = null;
+try {
+  emptyParsed = parseStorageConfigRequest({});
+} catch (error) {
+  emptyParsed = `THREW: ${error instanceof Error ? error.message : String(error)}`;
+}
+check(
+  "an empty storage payload parses to an empty request instead of throwing",
+  emptyParsed !== null && typeof emptyParsed === "object" && Object.keys(emptyParsed).length === 0,
+  JSON.stringify(emptyParsed),
+);
+check(
+  "isEmptyStorageRequest agrees that an empty payload has nothing to apply",
+  isEmptyStorageRequest({}) === true && isEmptyStorageRequest({ data_dir: "D:\\RippaNode" }) === false,
+);
+
+/*
+  THE BOOT PROFILE'S STORAGE DECLARATION.
+
+  The node reports its data folder and quotas once per boot via
+  POST /api/swarm/submit so the Mothership knows storage is already resolved and
+  has no reason to queue a system_update_storage at all. These keys are the
+  contract the cloud reads.
+*/
+const storageProfile = buildStorageProfile();
+check(
+  "the boot profile declares storage configured and resolved",
+  storageProfile.storage_configured === true && storageProfile.storage_resolved === true,
+  JSON.stringify(storageProfile),
+);
+check(
+  "the boot profile carries the resolved data folder under every spelling the cloud reads",
+  ["storage_data_dir", "storage_directory", "data_directory", "data_dir"].every(
+    (key) => typeof storageProfile[key] === "string" && storageProfile[key].length > 0,
+  ),
+  JSON.stringify(storageProfile),
+);
+check(
+  "the boot profile carries both capacities",
+  "scratch_capacity_gb" in storageProfile &&
+    "vault_capacity_gb" in storageProfile &&
+    "safe_vault_capacity_gb" in storageProfile,
+  JSON.stringify(storageProfile),
+);
 check(
   "a capacity-only request parses without a directory",
   parseStorageConfigRequest({ scratch_capacity_gb: 50, safe_vault_capacity_gb: 200 })
@@ -631,6 +746,62 @@ check(
   String(storageBeat.storage_data_dir),
 );
 
+/*
+  THE NODE-OWNED STORAGE WIRING, PINNED AT THE SOURCE.
+
+  `src/index.ts` and `src/server.ts` are not importable here (module top-level
+  boot / Express app), so the wiring that makes this feature real is asserted on
+  the source text — the same technique this suite already uses for the exit-42
+  contract. Each assertion names the exact string a future refactor must not
+  remove.
+*/
+const srcIndexStorage = fs.readFileSync(path.join(ROOT, "src", "index.ts"), "utf8");
+const srcServerStorage = fs.readFileSync(path.join(ROOT, "src", "server.ts"), "utf8");
+const srcPathsStorage = fs.readFileSync(path.join(ROOT, "src", "utils", "paths.ts"), "utf8");
+const dashHtmlStorage = fs.readFileSync(path.join(ROOT, "public", "dashboard.html"), "utf8");
+const dashJsStorage = fs.readFileSync(path.join(ROOT, "public", "dashboard.js"), "utf8");
+
+check(
+  "the boot sequence reports the node profile to POST /api/swarm/submit",
+  srcIndexStorage.includes("buildNodeProfile") && srcIndexStorage.includes("submitProfile"),
+);
+check(
+  "the profile is built from the storage declaration, not hand-rolled",
+  srcIndexStorage.includes("./services/nodeProfile") &&
+    fs
+      .readFileSync(path.join(ROOT, "src", "services", "nodeProfile.ts"), "utf8")
+      .includes("buildStorageProfile"),
+);
+check(
+  "the local dashboard can change the data folder (POST /api/system/storage)",
+  srcServerStorage.includes('app.post("/api/system/storage"') &&
+    srcServerStorage.includes('app.post("/api/config/storage"') &&
+    srcServerStorage.includes("storageHandler"),
+);
+check(
+  "the config payload exposes the storage block the panel renders",
+  srcServerStorage.includes("storage: {") && srcServerStorage.includes("defaultDirectory"),
+);
+check(
+  "the hardcoded local default is data/ beside the executable",
+  srcPathsStorage.includes('DEFAULT_DATA_DIR_NAME = "data"') &&
+    srcPathsStorage.includes("defaultDataDir"),
+);
+check(
+  "the OS app-data folder survives only as a migration source",
+  srcPathsStorage.includes("legacyDataDir") && srcPathsStorage.includes("renameSource: false"),
+);
+check(
+  "the dashboard exposes the Local Storage view",
+  dashHtmlStorage.includes('data-view="viewStorage"') &&
+    dashHtmlStorage.includes('id="storageDirInput"') &&
+    dashHtmlStorage.includes('id="storageSave"'),
+);
+check(
+  "the dashboard saves storage settings through the local endpoint",
+  dashJsStorage.includes('"/api/system/storage"') && dashJsStorage.includes("refreshStorage"),
+);
+
 // Restore the developer environment and remove the sandbox.
 process.chdir(prevStorageCwd);
 if (prevStorageConfigRoot === undefined) delete process.env.RIPPA_CONFIG_ROOT;
@@ -650,8 +821,23 @@ const osSwap = await import("node:os");
 const pathSwap = await import("node:path");
 const stageDir = fsSwap.mkdtempSync(pathSwap.join(osSwap.tmpdir(), "rippa-swap-"));
 const stagedExe = pathSwap.join(stageDir, "temp_update.exe");
+/*
+  THE SWAP SCRIPT IS STAGED IN THE DATA DIRECTORY, so this suite must not let that
+  directory default to `./data` inside the repository: with the hardcoded local
+  default, `stagingDir()` now resolves beside the exe, and every run would drop a
+  generated `update.bat` into the working tree. Pointed at a throwaway folder for
+  the duration of this block, then restored.
+*/
+const prevSwapDataDir = process.env.RIPPA_DATA_DIR;
+const swapStagingDir = fsSwap.mkdtempSync(pathSwap.join(osSwap.tmpdir(), "rippa-swapdata-"));
+process.env.RIPPA_DATA_DIR = swapStagingDir;
 const scriptPath = swap.writeSwapScript(stagedExe, "C:\\Program Files\\Rippa\\rippa-node.exe");
 const script = fsSwap.readFileSync(scriptPath, "utf8");
+check(
+  "the swap script is staged in the node's own data directory",
+  pathSwap.resolve(scriptPath) === pathSwap.resolve(swapStagingDir, "update.bat"),
+  scriptPath,
+);
 
 check("the swap script is named update.bat", pathSwap.basename(scriptPath) === "update.bat");
 check("the update is staged as temp_update.exe", pathSwap.basename(stagedExe) === "temp_update.exe");
@@ -714,6 +900,13 @@ check(
   /a\^&/.test(argTail) && !/[^\\^]&/.test(argTail),
   argTail,
 );
+
+// Restore the data directory override and remove the throwaway staging folder:
+// the rest of this suite must keep resolving whatever the developer's own
+// environment says.
+if (prevSwapDataDir === undefined) delete process.env.RIPPA_DATA_DIR;
+else process.env.RIPPA_DATA_DIR = prevSwapDataDir;
+fsSwap.rmSync(swapStagingDir, { recursive: true, force: true });
 
 /*
   THE FLASHING CONSOLE — "a cmd window pops up on the operator's screen".
@@ -811,17 +1004,54 @@ check("an explicit 'false' is not supervision", exitCodes.isUnderWatchdog() === 
 if (prevFlag === undefined) delete process.env.RIPPA_WATCHDOG;
 else process.env.RIPPA_WATCHDOG = prevFlag;
 
+/*
+  THE HANDOFF MODE DEPENDS ON TWO THINGS: the RIPPA_WATCHDOG flag, AND a LIVE
+  watchdog. The live half is a pid in `watchdog.lock` inside the DATA DIRECTORY
+  (`swapHandoff.stagingDir()`), so this test has to supply both — and it must
+  supply them explicitly rather than hoping the machine happens to have a lock
+  file lying around, which is what made it pass or fail for reasons unrelated to
+  the code under test.
+
+  The lock is therefore written into a throwaway data directory and names the
+  PARENT process, which is alive for the whole run. A dead pid is then checked
+  too: a stale lock left by a watchdog killed with the machine must NOT be
+  trusted, or the node would exit 43 into a supervisor that is not there.
+*/
+const prevHandoffDataDir = process.env.RIPPA_DATA_DIR;
+const handoffSandbox = fsSwap.mkdtempSync(pathSwap.join(osSwap.tmpdir(), "rippa-handoff-"));
+process.env.RIPPA_DATA_DIR = handoffSandbox;
+delete process.env.RIPPA_WATCHDOG;
 check(
   "an unsupervised node keeps the legacy detached-script handoff",
   swap.handoffMode() === "script",
   `unsupervised handoffMode is "${swap.handoffMode()}"`,
 );
+
 process.env.RIPPA_WATCHDOG = "1";
 check(
-  "RIPPA_WATCHDOG=1 switches the handoff to the watchdog",
-  swap.handoffMode() === "watchdog",
-  `supervised handoffMode is "${swap.handoffMode()}"`,
+  "the flag alone is not enough — with no live watchdog lock the node stays on the script handoff",
+  swap.handoffMode() === "script",
+  `flag-only handoffMode is "${swap.handoffMode()}"`,
 );
+
+const lockFile = pathSwap.join(handoffSandbox, swap.WATCHDOG_LOCK_FILE);
+fsSwap.writeFileSync(lockFile, String(process.ppid), "utf8");
+check(
+  "a live watchdog lock plus the flag switches the handoff to the watchdog",
+  swap.handoffMode() === "watchdog",
+  `supervised handoffMode is "${swap.handoffMode()}" (lock=${fsSwap.readFileSync(lockFile, "utf8")})`,
+);
+
+fsSwap.writeFileSync(lockFile, "999999999", "utf8");
+check(
+  "a stale lock left by a dead watchdog is not trusted",
+  swap.handoffMode() === "script",
+  `stale-lock handoffMode is "${swap.handoffMode()}"`,
+);
+
+fsSwap.rmSync(handoffSandbox, { recursive: true, force: true });
+if (prevHandoffDataDir === undefined) delete process.env.RIPPA_DATA_DIR;
+else process.env.RIPPA_DATA_DIR = prevHandoffDataDir;
 if (prevFlag === undefined) delete process.env.RIPPA_WATCHDOG;
 else process.env.RIPPA_WATCHDOG = prevFlag;
 
