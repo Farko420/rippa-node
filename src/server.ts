@@ -85,6 +85,7 @@ import {
   walkBatchFiles,
 } from "./services/commandCenter";
 import { registerSwarmTriageRoutes } from "./api/swarmTriageRoutes";
+import { registerProvisionNodeRoutes } from "./api/provisionNodeRoutes";
 import {
   completeRemoteTask,
   createRemoteTask,
@@ -2672,6 +2673,12 @@ export function createApp(): Express {
 
   // Register Swarm Triage routes (admin API for fleet command UI).
   registerSwarmTriageRoutes(app, requireDashboardAuth);
+
+  // Register the node-provisioning route (admin API: mint a ready-to-run
+  // Windows/Android node bundle). Registered here rather than inline so the
+  // endpoint's validation, its GitHub resolution and its zip assembly stay in
+  // one file instead of growing this function further.
+  registerProvisionNodeRoutes(app, requireDashboardAuth);
 
 
   return app;

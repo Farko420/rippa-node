@@ -49,6 +49,86 @@ export const GITHUB_REPO = process.env.RIPPA_GITHUB_REPO || "Farko420/rippa-node
 export const RELEASE_ASSET_NAME = process.env.RIPPA_GITHUB_ASSET || "rippa-node.exe";
 
 /**
+ * THE ANDROID RELEASE ASSET, in preference order.
+ *
+ * WHY A LIST RATHER THAN ONE NAME. The desktop artefact has exactly one
+ * contract name (`rippa-node.exe`) because `scripts/package.mjs` and the OTA
+ * updater both hardcode it. The Android artefact does NOT: the release workflow
+ * renames Gradle's output to `rippa-satellite.apk` at the workspace root, while
+ * an operator hand-publishing a build, or a future packaging change, will
+ * naturally reach for `rippa-node.apk` or the raw Gradle name
+ * `app-release.apk`. Naming only one of the three would turn a cosmetic rename
+ * into "the provisioning endpoint cannot see the Android build", which is
+ * exactly the failure mode the desktop fallback below already guards against.
+ *
+ * ORDER MATTERS ONLY WHEN SEVERAL EXIST, which should never happen: the first
+ * match wins, so the most likely names are tried first.
+ */
+export const ANDROID_RELEASE_ASSET_NAMES: readonly string[] = [
+  "rippa-node.apk",
+  "app-release.apk",
+  "rippa-satellite.apk",
+];
+
+/**
+ * The OS a provisioning bundle is being generated for.
+ *
+ * Deliberately NOT `process.platform`'s vocabulary: this is the TARGET the
+ * operator is provisioning, not the host doing the provisioning, so `win32`
+ * and `darwin` would be actively misleading. `windows` is the desktop build
+ * (`pkg` targets `node22-win-x64`); `android` is the Capacitor APK.
+ */
+export type ProvisionPlatform = "windows" | "android";
+
+/** Every platform {@link releaseAssetNamesForPlatform} understands. */
+export const PROVISION_PLATFORMS: readonly ProvisionPlatform[] = ["windows", "android"];
+
+/** The preferred asset names per platform. */
+export const PLATFORM_RELEASE_ASSET_NAMES: Record<ProvisionPlatform, readonly string[]> = {
+  windows: [RELEASE_ASSET_NAME],
+  android: ANDROID_RELEASE_ASSET_NAMES,
+};
+
+/**
+ * The fallback extension per platform — what "any real artefact" means when no
+ * preferred name matches.
+ *
+ * This is the safety net that stops a rename from wedging a whole platform, so
+ * it must be the extension the target can actually execute: `.exe` for the
+ * desktop build, `.apk` for Android. Falling back to `.exe` on Android would
+ * resolve a Windows binary into an APK-shaped bundle and only fail on the
+ * tablet.
+ */
+export const PLATFORM_RELEASE_EXTENSIONS: Record<ProvisionPlatform, readonly string[]> = {
+  windows: [".exe"],
+  android: [".apk"],
+};
+
+/**
+ * The asset names to try for a platform, most-preferred first.
+ *
+ * `RIPPA_GITHUB_ASSET` is honoured for `windows` ONLY, because that variable
+ * exists to repoint the fleet's own OTA at a differently-named desktop build —
+ * the Android artefact has no such single contract name to override, and
+ * letting a desktop override leak into an APK lookup would resolve the wrong
+ * file.
+ */
+export function releaseAssetNamesForPlatform(platform: ProvisionPlatform): readonly string[] {
+  if (platform === "windows") {
+    const override = (process.env.RIPPA_GITHUB_ASSET || "").trim();
+    if (override) return [override, ...PLATFORM_RELEASE_ASSET_NAMES.windows];
+  }
+  return PLATFORM_RELEASE_ASSET_NAMES[platform];
+}
+
+/** The fallback extensions to try for a platform (see the note above). */
+export function releaseAssetExtensionsForPlatform(
+  platform: ProvisionPlatform,
+): readonly string[] {
+  return PLATFORM_RELEASE_EXTENSIONS[platform];
+}
+
+/**
  * Resolves a GitHub token from the environment.
  *
  * FOUR names are accepted, in priority order:
@@ -258,6 +338,17 @@ export interface GitHubAssetDownload {
   /** Headers for that GET, including `Accept: application/octet-stream`. */
   headers: Record<string, string>;
   /**
+   * The asset's own `name`, exactly as the release publishes it.
+   *
+   * Optional because it is additive: the updaters only ever need the URL, and a
+   * caller that resolved an ALREADY-API-shaped asset endpoint (see the early
+   * return below) never learns a name. The provisioning endpoint DOES need it —
+   * the member inside the bundle must carry the real filename, not a guess, or
+   * an operator unzipping `app-release.apk` would find it named
+   * `rippa-satellite.apk` and reasonably conclude the wrong build shipped.
+   */
+  assetName?: string;
+  /**
    * Every diagnostic line this resolution emitted, in order.
    *
    * The caller re-throws these with its own failure message, so the reason the
@@ -300,6 +391,25 @@ export interface GitHubAssetResolveOptions {
    * with `RIPPA_GITHUB_ALLOW_PRERELEASE=true`.
    */
   allowPrerelease?: boolean;
+  /**
+   * The asset names to prefer, in order, REPLACING the desktop default.
+   *
+   * Omitted (the updaters' case) the candidates are the name the URL asked for
+   * and then {@link currentReleaseAssetName} — the pre-existing behaviour,
+   * unchanged. Supplied (the provisioning endpoint's case) the platform's own
+   * names are used instead, so an Android lookup is never offered
+   * `rippa-node.exe` as a candidate.
+   */
+  assetNames?: readonly string[];
+  /**
+   * The extensions that count as "a real artefact" when no preferred name
+   * matches. Defaults to `[".exe"]`.
+   *
+   * It also decides the wording of the failure line below, which is why it is
+   * threaded through rather than hardcoded: an operator provisioning Android
+   * must not be told the release has no `.exe`.
+   */
+  assetExtensions?: readonly string[];
 }
 
 /** Minimal shape of one asset in the releases payload. */
@@ -318,10 +428,19 @@ interface GithubRelease {
   assets?: unknown;
 }
 
-/** Picks the asset to install: exact contract name first, then any `.exe`. */
+/**
+ * Picks the asset to install: an exact contract name first, then the first
+ * asset with one of the fallback extensions.
+ *
+ * `fallbackExtensions` defaults to `[".exe"]`, which is the desktop contract and
+ * keeps every existing caller — the updaters and their tests — byte-identical.
+ * Android passes `[".apk"]`; see {@link releaseAssetExtensionsForPlatform} for
+ * why the extension has to travel with the platform rather than be inferred.
+ */
 export function selectAssetForDownload(
   assets: unknown,
   preferredNames: readonly string[],
+  fallbackExtensions: readonly string[] = [".exe"],
 ): GithubAsset | null {
   if (!Array.isArray(assets)) return null;
   const usable = assets.filter(
@@ -340,8 +459,15 @@ export function selectAssetForDownload(
     );
     if (exact) return exact;
   }
-  // Never wedge OTA over a rename: fall back to the first real executable.
-  return usable.find((candidate) => candidate.name!.toLowerCase().endsWith(".exe")) ?? null;
+  // Never wedge an update over a rename: fall back to the first real artefact
+  // with an extension the target can actually run.
+  for (const extension of fallbackExtensions) {
+    const suffix = extension.trim().toLowerCase();
+    if (!suffix) continue;
+    const match = usable.find((candidate) => candidate.name!.toLowerCase().endsWith(suffix));
+    if (match) return match;
+  }
+  return null;
 }
 
 /**
@@ -577,10 +703,14 @@ export async function resolveGitHubAssetDownload(
   const repo = repoFromGitHubUrl(trimmed);
   if (!repo) return null; // a CDN redirect URL: not ours to rewrite.
 
-  // Prefer the name the URL itself asked for, then the contract name. Both
-  // candidates may be empty (a URL with no filename), and the selector skips
+  // Prefer the name the URL itself asked for, then the platform's contract
+  // names — or, when no platform was named, the desktop contract name. Every
+  // candidate may be empty (a URL with no filename), and the selector skips
   // blanks rather than treating "" as a name to match.
-  const preferred = [assetNameFromDownloadUrl(trimmed) ?? "", currentReleaseAssetName()];
+  const preferred = options.assetNames?.length
+    ? [assetNameFromDownloadUrl(trimmed) ?? "", ...options.assetNames]
+    : [assetNameFromDownloadUrl(trimmed) ?? "", currentReleaseAssetName()];
+  const extensions = options.assetExtensions?.length ? options.assetExtensions : [".exe"];
   const headers = githubHeaders();
 
   // 1. The stable release.
@@ -603,11 +733,11 @@ export async function resolveGitHubAssetDownload(
 
   // 3. Pick the asset, and say so when there is nothing to pick.
   const assets = (payload as GithubRelease | null)?.assets;
-  const asset = selectAssetForDownload(assets, preferred);
+  const asset = selectAssetForDownload(assets, preferred, extensions);
   if (!asset || typeof asset.url !== "string") {
     emit(
-      `${prefix} Failed to find .exe asset in release ${tagOf(payload)} payload. ` +
-        `Available assets: ${describeAssets(assets)}.`,
+      `${prefix} Failed to find ${extensions.join("/")} asset in release ` +
+        `${tagOf(payload)} payload. Available assets: ${describeAssets(assets)}.`,
     );
     return null;
   }
@@ -622,6 +752,7 @@ export async function resolveGitHubAssetDownload(
     // anonymous shortcut that 404s here. Use the former, with octet-stream.
     url: asset.url,
     headers: githubHeaders({ Accept: "application/octet-stream" }),
+    assetName: asset.name,
     notes,
   };
 }
