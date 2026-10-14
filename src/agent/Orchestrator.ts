@@ -52,11 +52,14 @@ const AI_INFERENCE = "AI_INFERENCE";
 /**
  * The `scrape` task type — the Mothership's directed web-scraping work.
  *
- * The Mothership assigns `{ url }` (with `target` / `sourceUrl` accepted as
- * aliases, because the cloud and the queue have never fully agreed on a key) in
- * `task.payload`; the node fetches that page with the SAME engine the idle
- * forager uses and POSTs the sanitized body text back via `submitProfile` (kind
- * `scrape_result`).
+ * The Mothership assigns a URL, but neither the KEY nor the DEPTH is fixed: the
+ * schema varies with whichever fallback enqueued the task, so the handler reads
+ * a union of spellings (`url`, `target`, `sourceUrl` / `source_url`, `link`,
+ * `web_url`, `target_url`, `query_url`, `href`) across the task root and any
+ * nested `payload` / `data` / `params` / `context` container — see
+ * {@link scrapeUrlFrom}. The node fetches that page with the SAME engine the
+ * idle forager uses and POSTs the sanitized body text back via `submitProfile`
+ * (kind `scrape_result`).
  *
  * WHY THE MOTHERSHIP NEEDS THIS AT ALL: the page text is the payload it cannot
  * fetch itself — JS-rendered pages, per-IP content, geo-fenced pages. A node
@@ -762,7 +765,14 @@ export class Orchestrator {
   /**
    * SCRAPE — a Mothership-directed headless scrape.
    *
-   * Payload shape: `{ url }`, with `target` / `sourceUrl` accepted as aliases.
+   * Payload shape: THERE IS NO SINGLE ONE. Whichever fallback enqueued the task
+   * picks its own key and its own depth, so the URL is read from a union — the
+   * named spellings on the task root and in any nested `payload` / `data` /
+   * `params` / `context` container, and, failing every named key, from any
+   * property that carries an http(s) URL (see {@link scrapeUrlFrom}). A task
+   * that still yields nothing is logged with its raw key layout before it is
+   * skipped, so an unrecognised schema is diagnosable from the fleet log rather
+   * than arriving as a bare "had no url".
    *
    * The URL is fetched with the SAME engine the idle forager uses: Playwright /
    * headless Chromium on a desktop node, and the lightweight `fetch` scraper on a
@@ -782,15 +792,29 @@ export class Orchestrator {
    * the engine's generic `task_result` would double-report the same task.
    */
   private async handleScrapeTask(task: SwarmTask): Promise<TaskOutcome> {
-    const payload = (task.payload ?? {}) as Record<string, unknown>;
-    const url = String(payload["url"] ?? payload["target"] ?? payload["sourceUrl"] ?? "").trim();
+    const url = scrapeUrlFrom(task);
     if (!url) {
-      console.warn(`[Orchestrator] ${SCRAPE} task ${task.id} had no url — skipping.`);
+      /*
+        A SEARCH QUERY IS NOT A URL, but it is the shape most likely to be
+        mistaken for one: `query` / `search_term` with no target is a request
+        this node cannot act on. The raw key layout is logged on the way out —
+        for a task that carried a query AND for one that carried nothing this
+        node recognised — so the exact payload structure is visible in the fleet
+        log instead of being lost to a bare "had no url".
+      */
+      const searchTerm = scrapeQueryFrom(task);
+      console.warn(
+        `[Orchestrator] ${SCRAPE} task ${task.id} had no url — skipping.` +
+          (searchTerm ? ` It carried a search query instead ("${searchTerm}").` : "") +
+          ` Raw shape: ${describeScrapeShape(task)}`,
+      );
       await this.swarm.submitProfile({
         kind: "scrape_result",
         taskId: task.id,
         status: "skipped",
-        error: "task carried no url",
+        error: searchTerm
+          ? `task carried a search query ("${searchTerm}") instead of a url`
+          : "task carried no url",
       });
       return { status: "skipped", detail: "task carried no url", reported: true };
     }
@@ -1182,6 +1206,122 @@ function firstString(source: Record<string, unknown>, keys: readonly string[]): 
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return null;
+}
+
+/**
+ * THE KEY SPELLINGS A SCRAPE URL HIDES BEHIND.
+ *
+ * The Mothership's payload schema is not fixed: whichever fallback enqueued the
+ * task picks its own key, so every spelling the fleet is known to use has to be
+ * read. Checking one key is exactly what made task
+ * f21e1583-dae6-451b-bb08-bbf4c4b3ae01 log "had no url" while carrying one under
+ * a name this handler never looked at.
+ */
+const SCRAPE_URL_KEYS = [
+  "url",
+  "target",
+  "sourceUrl",
+  "source_url",
+  "link",
+  "web_url",
+  "target_url",
+  "query_url",
+  "href",
+] as const;
+
+/**
+ * THE CONTAINERS a scrape URL may be wrapped in.
+ *
+ * The task root is not always the payload: some fallbacks nest the work under
+ * `data`, `params` or `context`, and a `payload` can sit beside them. All of
+ * them are searched alongside the root, so the depth a producer chose does not
+ * decide whether this node can act.
+ */
+const SCRAPE_URL_CONTAINERS = ["payload", "data", "params", "context"] as const;
+
+/**
+ * THE KEYS A SEARCH TERM HIDES BEHIND.
+ *
+ * A payload carrying one of these and no URL is a search request, not a scrape.
+ * Naming it in the log is what turns "had no url" into an actionable line.
+ */
+const SCRAPE_QUERY_KEYS = [
+  "query",
+  "search_term",
+  "searchTerm",
+  "search",
+  "q",
+  "term",
+  "keywords",
+] as const;
+
+/** http(s) only — the scraper drives a browser, so no other scheme is work. */
+const HTTP_URL_PATTERN = /^https?:\/\//i;
+
+/**
+ * EVERY OBJECT A SCRAPE URL COULD BE HIDING IN: the task root first, then each
+ * nested container the payload might be wrapped in. Non-object values (a stray
+ * string `payload`, an array) are skipped rather than coerced.
+ */
+function collectScrapeSources(task: SwarmTask): Array<Record<string, unknown>> {
+  const root = task as unknown as Record<string, unknown>;
+  const sources: Array<Record<string, unknown>> = [root];
+  for (const container of SCRAPE_URL_CONTAINERS) {
+    const value = root[container];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      sources.push(value as Record<string, unknown>);
+    }
+  }
+  return sources;
+}
+
+/**
+ * THE URL A SCRAPE TASK POINTS AT, however the Mothership spelled it.
+ *
+ * Two passes, most certain first: a KNOWN key on the task root or any nested
+ * container, then — because a producer that invents a key name is precisely the
+ * case that was silently skipped — any string property whose value is an http(s)
+ * URL. Null means the payload genuinely carries no target, and the caller files
+ * a `skipped` result naming the shape it saw.
+ */
+function scrapeUrlFrom(task: SwarmTask): string | null {
+  const sources = collectScrapeSources(task);
+  for (const source of sources) {
+    const named = firstString(source, SCRAPE_URL_KEYS);
+    if (named) return named;
+  }
+  for (const source of sources) {
+    for (const value of Object.values(source)) {
+      if (typeof value === "string" && HTTP_URL_PATTERN.test(value.trim())) return value.trim();
+    }
+  }
+  return null;
+}
+
+/** The first search term a scrape payload carries, or null. */
+function scrapeQueryFrom(task: SwarmTask): string | null {
+  for (const source of collectScrapeSources(task)) {
+    const term = firstString(source, SCRAPE_QUERY_KEYS);
+    if (term) return term;
+  }
+  return null;
+}
+
+/**
+ * THE RAW KEY LAYOUT of a scrape task, for the log line a payload this node
+ * cannot read earns. Keys only — never values — because the point is to make the
+ * unknown schema visible in the fleet log, not to copy a payload around.
+ */
+function describeScrapeShape(task: SwarmTask): string {
+  const root = task as unknown as Record<string, unknown>;
+  const parts = [`task=[${Object.keys(root).join(", ")}]`];
+  for (const container of SCRAPE_URL_CONTAINERS) {
+    const value = root[container];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      parts.push(`${container}=[${Object.keys(value as Record<string, unknown>).join(", ")}]`);
+    }
+  }
+  return parts.join(" ");
 }
 
 /**

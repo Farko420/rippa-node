@@ -2620,6 +2620,46 @@ check(
   "`scrape` is no longer listed as an unwired TODO",
   !/case "scrape":\s*→/.test(orchestratorSource),
 );
+/*
+ * THE RESILIENT URL EXTRACTION. The reported skip of task
+ * f21e1583-dae6-451b-bb08-bbf4c4b3ae01 — "had no url" on a task that carried one
+ * — was the payload schema varying with whichever fallback enqueued the work.
+ * The handler now reads a union of key spellings across the task root and its
+ * nested containers, falls back to any http(s) property value, and logs the raw
+ * shape before skipping. The handler is private and needs a live scraper, so —
+ * exactly like the mapping checks above — the extraction is asserted at source.
+ */
+const scrapeUrlKeys = [
+  "url",
+  "target",
+  "sourceUrl",
+  "source_url",
+  "link",
+  "web_url",
+  "target_url",
+  "query_url",
+  "href",
+];
+check(
+  "`scrape` reads its url from every key spelling the Mothership uses",
+  orchestratorSource.includes("function scrapeUrlFrom(") &&
+    orchestratorSource.includes("const SCRAPE_URL_KEYS = [") &&
+    scrapeUrlKeys.every((key) => orchestratorSource.includes(`"${key}"`)),
+);
+check(
+  "`scrape` searches the task root and its nested payload/data/params/context containers",
+  orchestratorSource.includes(
+    'const SCRAPE_URL_CONTAINERS = ["payload", "data", "params", "context"] as const;',
+  ) &&
+    orchestratorSource.includes("collectScrapeSources(task)") &&
+    orchestratorSource.includes("HTTP_URL_PATTERN.test(value.trim())"),
+);
+check(
+  "`scrape` logs the raw payload shape (and any search query) before skipping",
+  orchestratorSource.includes("function describeScrapeShape(") &&
+    orchestratorSource.includes("const searchTerm = scrapeQueryFrom(task);") &&
+    orchestratorSource.includes("Raw shape: ${describeScrapeShape(task)}"),
+);
 
 // --- THE THIRD MISSING TASK HANDLER: `deep_research` --------------------------
 /*
