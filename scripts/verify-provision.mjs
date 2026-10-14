@@ -408,9 +408,12 @@ async function unpack(bundle, tag) {
 // --- 5. THE ENDPOINT, over real HTTP ----------------------------------------
 /*
   The service-level checks above prove the bundling flow. This one proves the
-  CONTRACT an operator actually calls: a JSON body naming `android` comes back
-  as a .zip. The route is mounted on a bare Express app rather than the whole
-  node, so the assertion is about the endpoint and nothing else.
+  CONTRACT an operator actually calls. It now has TWO shapes, chosen by the
+  caller: a JSON body naming `android` (or any request carrying
+  `Accept: application/json`) comes back as `{ apiKey, url }` with nothing
+  fetched from GitHub, while `windows` still comes back as a .zip. The route is
+  mounted on a bare Express app rather than the whole node, so the assertion is
+  about the endpoint and nothing else.
 
   `globalThis.fetch` is stubbed to serve the synthetic release, but LOCAL requests
   are passed through to the real implementation — otherwise the stub would also
@@ -429,26 +432,40 @@ const server = await new Promise((resolve) => {
 });
 const base = `http://127.0.0.1:${server.address().port}/api/admin/provision-node`;
 
-/** POSTs `body` to the endpoint and returns `{ status, headers, bytes }`. */
-async function provisionRequest(body, { realFetch } = {}) {
+/**
+ * POSTs `body` to the endpoint and returns `{ status, contentType, disposition,
+ * platform, asset, bytes, json }`. `json` is the parsed body when the response
+ * was JSON, and null otherwise (a zip body is not valid JSON).
+ */
+async function provisionRequest(body, { realFetch, accept } = {}) {
   const previous = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     if (String(url).startsWith("http://127.0.0.1:")) return realFetch(url, init);
     return previous(url, init);
   };
   try {
+    const headers = { "Content-Type": "application/json" };
+    if (accept) headers.Accept = accept;
     const response = await realFetch(base, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
     });
+    const bytes = Buffer.from(await response.arrayBuffer());
+    let json = null;
+    try {
+      json = JSON.parse(bytes.toString("utf8"));
+    } catch {
+      json = null;
+    }
     return {
       status: response.status,
       contentType: response.headers.get("content-type") ?? "",
       disposition: response.headers.get("content-disposition") ?? "",
       platform: response.headers.get("x-rippa-node-platform"),
       asset: response.headers.get("x-rippa-node-asset"),
-      bytes: Buffer.from(await response.arrayBuffer()),
+      bytes,
+      json,
     };
   } finally {
     globalThis.fetch = previous;
@@ -459,34 +476,71 @@ async function provisionRequest(body, { realFetch } = {}) {
   const realFetch = globalThis.fetch;
   const stub = stubRelease();
   try {
+    // ANDROID NOW RETURNS CREDENTIALS AS JSON. Nothing is fetched from GitHub
+    // and no archive is built, so the stub above is never consulted for this
+    // call — which is the whole point of the change.
     const android = await provisionRequest({ platform: "android" }, { realFetch });
     check("POST /api/admin/provision-node with platform=android returns 200", android.status === 200, String(android.status));
     check(
-      "the response is served as a zip attachment",
-      android.contentType.includes("application/zip") &&
-        android.disposition.startsWith('attachment; filename="rippa-node-android-'),
+      "the android response is JSON, not a zip attachment",
+      android.contentType.includes("application/json") && android.disposition === "",
       `${android.contentType} / ${android.disposition}`,
     );
-    check("the response names the android asset", android.asset === "app-release.apk", String(android.asset));
-    check("the response declares the android platform", android.platform === "android", String(android.platform));
-
-    const dir = await extractZipBuffer(android.bytes, "http-android");
     check(
-      "the HTTP response unpacks to an APK + config.json",
-      fs.existsSync(path.join(dir, "app-release.apk")) && fs.existsSync(path.join(dir, "config.json")),
-      fs.readdirSync(dir).join(", "),
+      "the android response carries a non-empty apiKey and url",
+      typeof android.json?.apiKey === "string" &&
+        android.json.apiKey.length > 0 &&
+        typeof android.json?.url === "string" &&
+        android.json.url.length > 0,
+      JSON.stringify(android.json),
+    );
+    check(
+      "the android credentials are exactly { apiKey, url }",
+      android.json !== null && Object.keys(android.json).sort().join(",") === "apiKey,url",
+      Object.keys(android.json ?? {}).join(","),
     );
 
     // The same call spelled the other accepted way must behave identically.
     const viaOs = await provisionRequest({ os: "android" }, { realFetch });
-    check("the `os` alias is accepted for android", viaOs.status === 200 && viaOs.platform === "android", String(viaOs.status));
+    check(
+      "the `os` alias is accepted for android and also returns JSON",
+      viaOs.status === 200 && viaOs.contentType.includes("application/json") && typeof viaOs.json?.apiKey === "string",
+      `${viaOs.status} / ${viaOs.contentType}`,
+    );
 
-    // The desktop flow still works through the endpoint, unchanged.
+    // The desktop flow is UNCHANGED: still a real, unpackable .zip.
     const windows = await provisionRequest({ platform: "windows" }, { realFetch });
     check(
       "platform=windows still returns the .exe bundle",
       windows.status === 200 && windows.asset === "rippa-node.exe",
       `${windows.status} / ${String(windows.asset)}`,
+    );
+    check(
+      "the windows bundle is still served as a zip attachment",
+      windows.contentType.includes("application/zip") &&
+        windows.disposition.startsWith('attachment; filename="rippa-node-windows-'),
+      `${windows.contentType} / ${windows.disposition}`,
+    );
+
+    const dir = await extractZipBuffer(windows.bytes, "http-windows");
+    check(
+      "the windows HTTP response unpacks to an EXE + config.json",
+      fs.existsSync(path.join(dir, "rippa-node.exe")) && fs.existsSync(path.join(dir, "config.json")),
+      fs.readdirSync(dir).join(", "),
+    );
+
+    // A scripted caller can ask for JSON for ANY platform, not just Android.
+    const windowsJson = await provisionRequest(
+      { platform: "windows" },
+      { realFetch, accept: "application/json" },
+    );
+    check(
+      "an Accept: application/json header switches windows to JSON credentials",
+      windowsJson.status === 200 &&
+        windowsJson.contentType.includes("application/json") &&
+        typeof windowsJson.json?.apiKey === "string" &&
+        typeof windowsJson.json?.url === "string",
+      `${windowsJson.status} ${windowsJson.contentType} ${JSON.stringify(windowsJson.json)}`,
     );
 
     const rejected = await provisionRequest({ platform: "darwin" }, { realFetch });

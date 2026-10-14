@@ -4,7 +4,9 @@ import { env } from "../config";
 import {
   SUPPORTED_PROVISION_PLATFORMS,
   buildNodeProvisionBundle,
+  buildProvisionConfig,
   normalizeProvisionPlatform,
+  type ProvisionNodeInput,
 } from "../services/nodeProvisioner";
 
 /**
@@ -19,20 +21,31 @@ import {
  * returns a `.zip` containing the artefact and the config, ready to drop on the
  * machine.
  *
- * ONE FLOW, EVERY PLATFORM. `android` is not a special case in the handler: the
- * platform is validated, normalised and handed to
- * {@link buildNodeProvisionBundle}, which resolves the platform's release
- * artefact through the same GitHub asset resolver the desktop build uses and
- * zips it with the same generated `config.json`. The desktop and Android paths
- * differ only in the asset names and extension fallback declared in
- * `update/githubAsset.ts`.
+ * TWO TRANSPORTS, ONE MINTED IDENTITY. Whichever transport a caller picks, the
+ * node record itself (its permanent node code and its per-node API key) is
+ * minted through the SAME {@link buildProvisionConfig}, so an Android node and a
+ * Windows node are indistinguishable in the fleet registry.
  *
- * TRANSPORT. A successful response is the archive ITSELF (`application/zip`),
- * not a JSON envelope around base64: a 100 MB executable base64-encoded would
- * inflate to ~133 MB, blow past every sane response limit and have to be decoded
- * again by the caller. Errors are JSON, because a failure has to be readable —
- * which is also why the status code distinguishes "you asked wrong" (400) from
- * "GitHub would not give us the artefact" (502).
+ *   - WINDOWS DESKTOP — a machine with a filesystem, a browser and an unzip
+ *     tool. It gets the archive ITSELF (`application/zip`): a 100 MB executable
+ *     base64-encoded into a JSON envelope would inflate to ~133 MB, blow past
+ *     every sane response limit and have to be decoded again by the caller.
+ *     {@link buildNodeProvisionBundle} resolves the platform's release artefact
+ *     through the same GitHub asset resolver the desktop build uses and zips it
+ *     with the generated `config.json`, exactly as before.
+ *   - ANDROID — a mobile app that downloads the raw APK from GitHub itself and
+ *     cannot read a side-loaded zipped `config.json`. It asks only for the
+ *     connection credentials and gets them as JSON. Nothing is fetched from
+ *     GitHub and no archive is built, so the response is instant and small.
+ *
+ * JSON is returned when the platform is `android` OR the request carries
+ * `Accept: application/json` (so a scripted caller can ask for credentials for
+ * any platform). Everything else — in practice a Windows desktop node — keeps
+ * the zip flow byte-for-byte.
+ *
+ * ERRORS ARE ALWAYS JSON, because a failure has to be readable — which is also
+ * why the status code distinguishes "you asked wrong" (400) from "GitHub would
+ * not give us the artefact" (502).
  */
 
 /**
@@ -54,6 +67,19 @@ const provisionNodeSchema = z.object({
   pairWithMaster: z.boolean().optional(),
   masterCode: z.string().trim().max(64).optional(),
 });
+
+/**
+ * True when the caller asked for a JSON body rather than the zip archive.
+ *
+ * ONLY AN EXPLICIT `application/json` COUNTS. A wildcard Accept (what curl and
+ * most HTTP clients send by default) must not be treated as "give me JSON": that
+ * would silently swap the Windows desktop's executable for two strings — a
+ * download that appears to succeed and produces a file Windows refuses to run.
+ * The zip stays the default; JSON has to be asked for, or implied by `android`.
+ */
+function acceptsJsonResponse(req: Request): boolean {
+  return (req.get("accept") ?? "").includes("application/json");
+}
 
 export function registerProvisionNodeRoutes(
   r: Router,
@@ -93,19 +119,48 @@ export function registerProvisionNodeRoutes(
       return;
     }
 
+    const provisionInput: ProvisionNodeInput = {
+      platform,
+      nodeName: parsed.data.nodeName,
+      nodeCode: parsed.data.nodeCode,
+      role: parsed.data.role,
+      masterUrl: parsed.data.masterUrl,
+      mothershipUrl: parsed.data.mothershipUrl,
+      dashboardPin: parsed.data.dashboardPin,
+      meshKey: parsed.data.meshKey,
+      pairWithMaster: parsed.data.pairWithMaster,
+      masterCode: parsed.data.masterCode,
+    };
+
+    // JSON TRANSPORT — Android, or any caller that explicitly asked for JSON.
+    // The node record is minted through the SAME `buildProvisionConfig` the zip
+    // path uses, so the node code and API key are generated exactly as before;
+    // the release artefact is simply never resolved, downloaded or zipped. The
+    // mobile app fetches the raw APK from GitHub itself and only needs the
+    // credentials that point it back at this Master.
+    if (platform === "android" || acceptsJsonResponse(req)) {
+      try {
+        const { config, nodeCode } = buildProvisionConfig(provisionInput);
+        console.log(
+          `[Provision] Issued ${platform} credentials for node ${nodeCode} as JSON ` +
+            `(no artefact fetched).`,
+        );
+        res.status(200).json({
+          apiKey: config.NODE_API_KEY,
+          url: config.MOTHERSHIP_URL,
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          platform,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      return;
+    }
+
     try {
-      const bundle = await buildNodeProvisionBundle({
-        platform,
-        nodeName: parsed.data.nodeName,
-        nodeCode: parsed.data.nodeCode,
-        role: parsed.data.role,
-        masterUrl: parsed.data.masterUrl,
-        mothershipUrl: parsed.data.mothershipUrl,
-        dashboardPin: parsed.data.dashboardPin,
-        meshKey: parsed.data.meshKey,
-        pairWithMaster: parsed.data.pairWithMaster,
-        masterCode: parsed.data.masterCode,
-      });
+      const bundle = await buildNodeProvisionBundle(provisionInput);
 
       console.log(
         `[Provision] Bundled ${bundle.platform} node ${bundle.config.NODE_CODE} ` +
