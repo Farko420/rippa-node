@@ -24,7 +24,12 @@
  * forager cannot tell which engine produced the text and needs no branching.
  */
 
-/** Identical contract to `ScraperService.scrape()`. */
+/**
+ * The mobile scraper's result. Deliberately the same `url`/`title`/`text` shape
+ * as `ScraperService.scrape()` (which additionally reports WHICH pass of the
+ * waterfall produced the text — see `ScrapeEngine`), so the forager cannot tell
+ * which engine produced the text and needs no branching.
+ */
 export interface MobileScrapeResult {
   url: string;
   title: string;
@@ -156,6 +161,154 @@ const DESKTOP_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+/** Raw outcome of ONE lightweight fetch, before any waterfall judgement. */
+export interface FetchedPage {
+  url: string;
+  title: string;
+  /** Sanitized, whitespace-normalized body text (capped, like the desktop path). */
+  text: string;
+  /** The raw HTML response, capped at MAX_RESPONSE_BYTES. */
+  html: string;
+  /** HTTP status. Always 2xx here — anything else is a failure, not a page. */
+  status: number;
+}
+
+/** Why a fetch did not produce a page. */
+export type FetchFailureKind = "http" | "network" | "empty";
+
+/**
+ * A fetch attempt that never throws for an EXPECTED failure.
+ *
+ * WHY THIS SHAPE EXISTS. The waterfall (`agent/WaterfallScraper`) has to be able
+ * to say "the fast pass failed, escalate to a browser" — a decision it cannot
+ * make from an exception alone, and must not make by catching one, because a
+ * caller-initiated ABORT arrives as an exception too and must keep propagating
+ * (a PRIORITY task preempting a forage pass must never trigger a browser
+ * launch). So `fetchPage` returns the outcome and `scrapeMobile` rethrows it,
+ * which keeps ONE fetch implementation serving both callers.
+ */
+export type FetchAttempt =
+  | { ok: true; page: FetchedPage }
+  | {
+      ok: false;
+      kind: FetchFailureKind;
+      reason: string;
+      error: Error;
+      status?: number;
+      /**
+       * The document that produced no text, when one was received.
+       *
+       * Only the EMPTY case carries this. A non-2xx never has its body read (the
+       * status is the answer, and downloading an error page on a tablet for no
+       * reason is exactly what the mobile path exists to avoid), and a network
+       * fault has no body at all. It is here because "no text" has two very
+       * different causes the waterfall must be able to tell apart: a genuinely
+       * blank page, and a React/Next shell whose content only exists after its
+       * bundle runs.
+       */
+      html?: string;
+    };
+
+/**
+ * Fetches a URL with `fetch` alone and reports the outcome.
+ *
+ * PREEMPTIBLE: `signal` aborts the fetch when a PRIORITY task arrives. The
+ * timeout signal is linked (not replaced) so an explicit abort wins over the
+ * navigation deadline instead of one clobbering the other. An abort is RETHROWN
+ * rather than returned as a failure — see {@link FetchAttempt}.
+ */
+export async function fetchPage(
+  url: string,
+  signal?: AbortSignal,
+  /**
+   * Deadline for the whole attempt. Defaults to the mobile navigation deadline,
+   * which is right for the APK (there the fetch IS the engine, so it gets the
+   * full budget). The desktop waterfall passes a SHORTER one — see
+   * `FAST_PASS_TIMEOUT_MS` in `WaterfallScraper`.
+   */
+  timeoutMs: number = NAV_TIMEOUT_MS,
+): Promise<FetchAttempt> {
+  throwIfAborted(signal);
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const combined = linkSignals(signal, timeout);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      headers: {
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-AU,en;q=0.9",
+        "User-Agent": DESKTOP_UA,
+      },
+      signal: combined,
+    });
+  } catch (error) {
+    // A preemption is not a scraping failure — it is the engine cancelling this
+    // work, so it must reject exactly as it did before this refactor existed.
+    throwIfAborted(signal);
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      kind: "network",
+      reason: `network error (${message})`,
+      error: new Error(`Fetch failed for ${url}: ${message}`),
+    };
+  }
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      kind: "http",
+      reason: `HTTP ${response.status}`,
+      error: new Error(`HTTP ${response.status} for ${url}`),
+      status: response.status,
+    };
+  }
+
+  // Reject an oversized body up front when the server declares a length, then
+  // clamp the real payload too — a server can lie about, or omit, Content-Length.
+  const declared = Number(response.headers?.get?.("content-length") ?? "0");
+  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    const message = `response is ${(declared / 1024 / 1024).toFixed(1)} MB — refusing to download a page this large`;
+    return { ok: false, kind: "network", reason: message, error: new Error(message) };
+  }
+
+  let html: string;
+  try {
+    html = (await response.text()).slice(0, MAX_RESPONSE_BYTES);
+  } catch (error) {
+    throwIfAborted(signal);
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      kind: "network",
+      reason: `response body failed (${message})`,
+      error: new Error(`Fetch failed for ${url}: ${message}`),
+    };
+  }
+  throwIfAborted(signal);
+
+  const title = extractTitle(html) || url;
+  const text = htmlToText(html);
+
+  if (!text) {
+    return {
+      ok: false,
+      kind: "empty",
+      reason: "no extractable body text",
+      error: new Error(`No extractable body text at ${url}`),
+      status: response.status,
+      // Carried so the waterfall can tell a blank page from a client-rendered
+      // shell — the same "no text" verdict, two very different diagnoses.
+      html,
+    };
+  }
+
+  return { ok: true, page: { url, title, text, html, status: response.status } };
+}
+
 /**
  * Fetches a URL and returns sanitized text using only `fetch`.
  *
@@ -163,48 +316,16 @@ const DESKTOP_UA =
  * scraper's contract exactly so the forager's failure and backoff handling is
  * identical on either engine.
  *
- * PREEMPTIBLE: `signal` aborts the fetch when a PRIORITY task arrives. The
- * timeout signal is linked (not replaced) so an explicit abort wins over the
- * navigation deadline instead of one clobbering the other.
+ * This is the engine the APK runs, and the same one the desktop waterfall uses
+ * as its FAST PASS — one implementation, two callers, so the two paths can never
+ * drift into fetching pages differently.
  */
 export async function scrapeMobile(url: string, signal?: AbortSignal): Promise<MobileScrapeResult> {
-  throwIfAborted(signal);
-  const timeout = AbortSignal.timeout(NAV_TIMEOUT_MS);
-  const combined = linkSignals(signal, timeout);
-  const response = await fetch(url, {
-    method: "GET",
-    redirect: "follow",
-    headers: {
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-AU,en;q=0.9",
-      "User-Agent": DESKTOP_UA,
-    },
-    signal: combined,
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} for ${url}`);
+  const attempt = await fetchPage(url, signal);
+  if (attempt.ok) {
+    return { url, title: attempt.page.title, text: attempt.page.text };
   }
-
-  // Reject an oversized body up front when the server declares a length, then
-  // clamp the real payload too — a server can lie about, or omit, Content-Length.
-  const declared = Number(response.headers?.get?.("content-length") ?? "0");
-  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
-    throw new Error(
-      `response is ${(declared / 1024 / 1024).toFixed(1)} MB — refusing to download a page this large on mobile`,
-    );
-  }
-
-  const html = (await response.text()).slice(0, MAX_RESPONSE_BYTES);
-  throwIfAborted(signal);
-  const title = extractTitle(html) || url;
-  const text = htmlToText(html);
-
-  if (!text) {
-    throw new Error(`No extractable body text at ${url}`);
-  }
-
-  return { url, title, text };
+  throw attempt.error;
 }
 
 /** Throws a preemption-flavoured abort when `signal` is already fired. */

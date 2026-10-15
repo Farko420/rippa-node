@@ -2891,6 +2891,76 @@ check(
     orchestratorSource.includes("Raw shape: ${describeScrapeShape(task)}"),
 );
 
+/* --- THE WATERFALL: FAST PASS -> VALIDATION -> BROWSER FALLBACK -------------- */
+/*
+ * The scrape engine is now a waterfall rather than one engine. The heuristics
+ * that decide when to escalate are exercised behaviourally against fixture HTML
+ * in verify-mobile.mjs; what is pinned HERE is the wiring those fixtures cannot
+ * prove — that the cheap pass really is attempted before a browser is launched,
+ * that only the escalation reaches Playwright, and that the browser is closed in
+ * a `finally` block so an unattended overnight node cannot accumulate Chromium
+ * processes and memory on the operator's desktop.
+ */
+const scraperSource = readFileSync(path.join(ROOT, "src", "agent", "Scraper.ts"), "utf8");
+const waterfallSource = readFileSync(
+  path.join(ROOT, "src", "agent", "WaterfallScraper.ts"),
+  "utf8",
+);
+check(
+  "the scraper attempts the fetch fast pass BEFORE it opens a browser",
+  scraperSource.includes("await fastPassScrape(url, signal)") &&
+    scraperSource.indexOf("await fastPassScrape(url, signal)") <
+      scraperSource.indexOf("await this.acquireBrowserSlot()"),
+);
+check(
+  "a winning fast pass is returned without ever touching Chromium",
+  /if \(fast\.ok\) \{[\s\S]*?return \{ \.\.\.fast\.result, engine: "fast-pass" \};/.test(scraperSource),
+);
+check(
+  "a definitive fast-pass failure (404/410) is NOT escalated to a browser",
+  scraperSource.includes("if (!fast.escalate)") && scraperSource.includes("throw fast.error;"),
+);
+check(
+  "the fallback renders with Chromium and reports which engine won",
+  scraperSource.includes('return { url, title, text, engine: "chromium" };') &&
+    scraperSource.includes("await this.getBrowser()"),
+);
+check(
+  "the fallback waits for the network to go idle (or the cap) before extracting",
+  scraperSource.includes('await page.waitForLoadState("networkidle", { timeout: NETWORK_IDLE_CAP_MS })'),
+);
+check(
+  "the browser is strictly closed in a `finally` block",
+  /finally \{[\s\S]*?if \(lastOneOut\) await this\.close\(\);/.test(scraperSource),
+);
+check(
+  "...and only when it has no other user and no parked waiter",
+  scraperSource.includes(
+    "const lastOneOut = this.browserUsers === 0 && this.browserWaiters.length === 0;",
+  ),
+);
+check(
+  "the validation lives in the waterfall module, not inside the fetch",
+  waterfallSource.includes("export function detectBotWall(") &&
+    waterfallSource.includes("export function looksLikeSpaSkeleton(") &&
+    waterfallSource.includes("const wall = detectBotWall(html, status);"),
+);
+check(
+  "an abort is never treated as a fast-pass failure (no browser for preempted work)",
+  waterfallSource.includes("throwIfAborted(signal);") === false &&
+    /export async function fastPassScrape\([\s\S]*?const attempt = await fetchPage\(url, signal, FAST_PASS_TIMEOUT_MS\);/.test(
+      waterfallSource,
+    ),
+);
+check(
+  "the fast pass runs on its own, shorter deadline than the browser fallback",
+  waterfallSource.includes("export const FAST_PASS_TIMEOUT_MS = 15_000;"),
+);
+check(
+  "the scrape_result payload reports which pass produced the text",
+  orchestratorSource.includes("engine: result.engine"),
+);
+
 // --- THE THIRD MISSING TASK HANDLER: `deep_research` --------------------------
 /*
  * The reported `Unhandled task type "deep_research"` skip. `deep_research` is in

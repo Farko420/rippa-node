@@ -2,6 +2,7 @@ import "../pkgNativeShim"; // must load before playwright (exe loader shims)
 import type { Browser, BrowserContext, Page } from "playwright";
 import { describeRuntime, supportsBrowserScraping } from "../platform";
 import { scrapeMobile } from "./MobileScraper";
+import { fastPassScrape } from "./WaterfallScraper";
 import type { ResourceGovernor } from "../services/resourceGovernor";
 import { hasSubscribers, publishScrape, publishViewport } from "../services/engineTelemetry";
 
@@ -36,17 +37,40 @@ function loadChromium(): ChromiumApi {
 /**
  * THE EYES — headless scraping service.
  *
- * Launches a (reused) headless Chromium instance, navigates to a URL and
- * extracts the `innerText` of `<body>` after stripping navigation, footer,
- * scripts, styles and ad/popup chrome. This keeps the token payload sent
- * to the local LLM as small as possible.
+ * SCRAPING IS A WATERFALL (see `agent/WaterfallScraper`), not a single engine:
+ *
+ *   1. FAST PASS   — a plain `fetch` (the same engine as the mobile scraper).
+ *                    No browser, no renderer, no 150MB of RAM.
+ *   2. VALIDATION  — if that returned a 403/Cloudflare challenge, an empty body,
+ *                    or a React/Next shell with no server-side text, the fast
+ *                    pass did not see the page and its text is discarded.
+ *   3. FALLBACK    — only then is a (reused) headless Chromium launched, the URL
+ *                    navigated, the network allowed to go idle, and the
+ *                    `innerText` of `<body>` read after stripping navigation,
+ *                    footer, scripts, styles and ad/popup chrome.
+ *
+ * That ordering keeps the token payload sent to the local LLM as small as
+ * possible AND keeps the expensive engine off the hot path: a static page is
+ * served by `fetch` alone, and Chromium is spent only on the pages that actually
+ * need JavaScript to render.
  */
+
+/** Which pass of the waterfall produced a result. Reported upstream for diagnosis. */
+export type ScrapeEngine =
+  /** The lightweight `fetch` pass won — no browser was launched. */
+  | "fast-pass"
+  /** The headless Chromium fallback won. */
+  | "chromium"
+  /** This runtime has no browser at all, so `fetch` was the only engine. */
+  | "fetch";
 
 export interface ScrapeResult {
   url: string;
   title: string;
   /** Sanitized, whitespace-normalized body text (capped at MAX_TEXT_CHARS). */
   text: string;
+  /** WHICH PASS produced `text` — the one piece of waterfall observability. */
+  engine: ScrapeEngine;
 }
 
 /** Hard cap on extracted text so a single page can never blow the LLM context. */
@@ -319,6 +343,20 @@ export class ScraperService {
   /** Callers parked on "a browser slot just freed up", in FIFO order. */
   private readonly browserWaiters: Array<() => void> = [];
 
+  /**
+   * SCRAPES CURRENTLY HOLDING THE BROWSER — the counter that makes the strict
+   * teardown in {@link ScraperService.scrape} safe under concurrency.
+   *
+   * WHY IT IS NEEDED. Requirement: the browser must be closed in a `finally`
+   * block so an overnight run cannot accumulate Chromium processes and memory.
+   * But the browser is SHARED: with the Governor's `max_concurrent_tasks` above
+   * 1, two scrapes can hold the same instance, and a naive `close()` in the
+   * first one's `finally` would tear the browser out from under the second
+   * mid-navigation. So the `finally` closes it only when nobody is using it AND
+   * nobody is parked waiting for it (see the comment there).
+   */
+  private browserUsers = 0;
+
   constructor() {
     this.canUseBrowser = supportsBrowserScraping();
 
@@ -379,7 +417,15 @@ export class ScraperService {
 
   /**
    * Launches (or returns the already-running) headless Chromium instance.
-   * The browser is reused across scrapes and torn down via `close()`.
+   *
+   * LIFECYCLE — THE WATERFALL CHANGED WHAT "REUSED" MEANS. The instance is still
+   * reused while it is in use, so two overlapping scrapes share one browser. But
+   * because Chromium is now only reached when the fetch fast pass failed, it is
+   * an escalation resource rather than the steady state, so the LAST scrape to
+   * finish with it closes it (see the `finally` in {@link ScraperService.scrape})
+   * and the node's shutdown path closes it via `close()` as before. That is the
+   * trade this feature makes deliberately: a fresh launch per escalation costs
+   * less than the fast pass saves, and no Chromium survives an idle night.
    *
    * HEADLESS IS NOT A DEFAULT HERE, IT IS A CONSTRAINT. This node forages and
    * scrapes unattended, often overnight, while the operator is doing something
@@ -472,10 +518,32 @@ export class ScraperService {
     }
   }
 
-  /** Scrapes a URL and returns sanitized body text. Throws on navigation failure / empty page. */
+  /**
+   * SCRAPES A URL BY WATERFALL AND RETURNS SANITIZED BODY TEXT.
+   *
+   * Throws on failure. Which engine produced the text is reported in
+   * {@link ScrapeResult.engine}, so the caller never has to know — but an
+   * operator can always see whether a page needed JavaScript.
+   *
+   * THE ORDER OF THE BRANCHES IS THE FEATURE:
+   *
+   *   1. No browser on this runtime (the APK) → `fetch` IS the engine, taken
+   *      immediately and with no second request, exactly as before.
+   *   2. FAST PASS (`fetch`) → returned as-is when the page was actually served.
+   *   3. VALIDATION (inside `fastPassScrape`) → a bot wall, an empty body or a
+   *      client-rendered shell means the fast pass did NOT see the page, so its
+   *      text is discarded rather than handed to the LLM as though it were the
+   *      page. A definitive 404/410 is not escalated — rendering a page that does
+   *      not exist produces nothing but a wasted browser launch.
+   *   4. FALLBACK (headless Chromium) → navigate, let the network go idle, read
+   *      `document.body.innerText`. Every degraded path below (no Chromium, a
+   *      failed launch, the Governor's memory guard) falls back to the fetch
+   *      scraper rather than throwing, so a broken browser costs this node its
+   *      browser scraping and nothing else.
+   */
   async scrape(url: string, signal?: AbortSignal): Promise<ScrapeResult> {
     /*
-      THE MOBILE FALLBACK, taken BEFORE any Playwright call.
+      RUNTIME WITH NO BROWSER — the fetch scraper IS the engine.
 
       Placed at the top rather than deep inside `getBrowser()` on purpose: the
       decision is per-runtime, not per-browser-instance, and failing to take it
@@ -483,13 +551,46 @@ export class ScraperService {
       run one. The returned shape is identical either way, so the caller (the
       idle forager) has no idea which engine produced the text.
 
+      THE FAST PASS IS SKIPPED HERE ON PURPOSE: on this runtime the fast pass and
+      the fallback are the SAME fetch, so running the waterfall would download
+      every page twice for no possible gain.
+
       PREEMPTIBLE: the caller's AbortSignal is forwarded so a PRIORITY task
       arriving mid-scrape kills the fetch immediately.
     */
     if (!this.canUseBrowser) {
       publishScrape("idle", "Lightweight fetch scraper in use (no Chromium on this runtime).", url);
-      return scrapeMobile(url, signal);
+      return { ...(await scrapeMobile(url, signal)), engine: "fetch" };
     }
+
+    /*
+      STEP 1 — THE FAST PASS, AND STEP 2 — ITS VALIDATION.
+
+      Both live in `agent/WaterfallScraper` so the judgement is unit-testable
+      against fixture HTML with no network and no browser. This call never
+      launches a browser, and it rethrows a caller-initiated ABORT rather than
+      reporting it as a fast-pass failure — a preempted scrape must never spend a
+      browser launch on work the engine just cancelled.
+    */
+    const fast = await fastPassScrape(url, signal);
+
+    if (fast.ok) {
+      publishScrape(
+        "extract",
+        `[FAST PASS] ${fast.result.text.length.toLocaleString("en-AU")} chars · ${countPlaceCandidates(fast.result.text)} place candidates · no browser needed`,
+        url,
+      );
+      return { ...fast.result, engine: "fast-pass" };
+    }
+
+    // A definitive answer ("no such page") is not something rendering can fix.
+    if (!fast.escalate) {
+      publishScrape("error", `[FAST PASS] ${fast.reason}`, url);
+      throw fast.error;
+    }
+
+    publishScrape("status", `[FAST PASS] ${fast.reason} — escalating to headless Chromium.`, url);
+    throwIfScrapeAborted(signal);
 
     /*
       THE RUNTIME SAID YES BUT THE BROWSER IS NOT THERE.
@@ -509,30 +610,9 @@ export class ScraperService {
       console.log(
         "[Scraper] No Chromium available — this node will use the lightweight fetch scraper.",
       );
-      return scrapeMobile(url, signal);
+      return { ...(await scrapeMobile(url, signal)), engine: "fetch" };
     }
 
-    /*
-      A LAUNCH THAT FAILS IS ALSO A DEGRADATION, NOT A CRASH.
-
-      Everything above can succeed — runtime is Node, the binary was found — and
-      still fail here: the binary is corrupt, blocked by antivirus, or missing a
-      system library. That must cost this node its browser scraping and nothing
-      else, so the instance is demoted (which also stops `isBrowserBacked()`
-      reporting a capability that does not work) and the caller falls back.
-    */
-    let browser: Browser;
-    try {
-      browser = await this.getBrowser();
-    } catch (error) {
-      this.canUseBrowser = false;
-      console.warn(
-        `[Scraper] Chromium failed to launch — ${
-          error instanceof Error ? error.message : String(error)
-        }. Using the lightweight fetch scraper instead.`,
-      );
-      return scrapeMobile(url, signal);
-    }
     /*
       RESOURCE GOVERNOR — MEMORY GUARD.
 
@@ -548,7 +628,7 @@ export class ScraperService {
         "[GOVERNOR] Memory limit exceeded — using lightweight fetch scraper.",
         url,
       );
-      return scrapeMobile(url, signal);
+      return { ...(await scrapeMobile(url, signal)), engine: "fetch" };
     }
 
     /*
@@ -556,11 +636,43 @@ export class ScraperService {
 
       Wait for a free browser slot BEFORE opening the context, so no more than
       the Governor's `max_concurrent_tasks` contexts are ever open at once. The
-      slot is handed back in the `finally` below (success and failure alike), and
-      also on a context-launch error, so a failed launch cannot leak a slot.
+      slot is handed back in the `finally` below (success and failure alike),
+      including when the browser or the context fails to open, so a failed launch
+      cannot leak a slot.
+
+      THE SLOT IS TAKEN BEFORE `getBrowser()` ON PURPOSE. Chromium is closed by
+      whichever scrape finishes last (see the `finally`), so a scrape that holds
+      a slot is guaranteed to be looking at a browser no other scrape has torn
+      down. Taking the browser first and then parking here would let a scrape
+      wake up holding a reference to an instance the last finisher had closed.
     */
     await this.acquireBrowserSlot();
-    let context: BrowserContext;
+
+    /*
+      STEP 3 — THE FALLBACK. A LAUNCH THAT FAILS IS A DEGRADATION, NOT A CRASH.
+
+      The runtime is Node and the binary was found, and this can still fail: the
+      binary is corrupt, blocked by antivirus, or missing a system library. That
+      must cost this node its browser scraping and nothing else, so the instance
+      is demoted (which also stops `isBrowserBacked()` reporting a capability
+      that does not work) and the caller falls back to the fetch scraper.
+    */
+    let browser: Browser;
+    try {
+      browser = await this.getBrowser();
+    } catch (launchError) {
+      this.releaseBrowserSlot();
+      this.canUseBrowser = false;
+      console.warn(
+        `[Scraper] Chromium failed to launch — ${
+          launchError instanceof Error ? launchError.message : String(launchError)
+        }. Using the lightweight fetch scraper instead.`,
+      );
+      return { ...(await scrapeMobile(url, signal)), engine: "fetch" };
+    }
+    this.browserUsers += 1;
+
+    let context: BrowserContext | null = null;
     try {
       context = await browser.newContext({
         // en-AU + a stock desktop UA keeps the parse honest for AU-targeted pages.
@@ -570,12 +682,7 @@ export class ScraperService {
           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         viewport: { width: 1366, height: 768 },
       });
-    } catch (contextError) {
-      this.releaseBrowserSlot();
-      throw contextError;
-    }
 
-    try {
       const page = await context.newPage();
       publishScrape("navigate", `[NAVIGATE] ${url}`, url);
       // PREEMPTIBLE NAVIGATION: Playwright has no native AbortSignal for
@@ -601,7 +708,14 @@ export class ScraperService {
       }
       throwIfScrapeAborted(signal);
 
-      // Let lazy-loaded content settle, but never block longer than the cap.
+      /*
+        WAIT FOR THE JAVASCRIPT TO RENDER. `networkidle` is the signal that the
+        page's own data fetches have finished — exactly what an SPA needs before
+        `innerText` is worth reading — and the cap is what stops a page that polls
+        forever from holding the browser open indefinitely. The cap is a WAIT, not
+        a failure: whatever rendered in that window is still far more than the
+        shell the fast pass rejected.
+      */
       await page.waitForLoadState("networkidle", { timeout: NETWORK_IDLE_CAP_MS }).catch(() => undefined);
 
       const title = (await page.title().catch(() => "")) || url;
@@ -618,10 +732,10 @@ export class ScraperService {
 
       publishScrape(
         "extract",
-        `[EXTRACT] ${text.length.toLocaleString("en-AU")} chars · ${countPlaceCandidates(text)} place candidates`,
+        `[EXTRACT] ${text.length.toLocaleString("en-AU")} chars · ${countPlaceCandidates(text)} place candidates · rendered by Chromium`,
         url,
       );
-      return { url, title, text };
+      return { url, title, text, engine: "chromium" };
     } catch (error) {
       publishScrape(
         "error",
@@ -630,10 +744,33 @@ export class ScraperService {
       );
       throw error;
     } finally {
-      // One context per scrape: cookies/storage never leak between sources.
-      await context.close().catch(() => undefined);
-      // Hand the Governor's browser slot back, whatever the outcome.
+      /*
+        STRICT TEARDOWN — THE BROWSER NEVER OUTLIVES ITS LAST USER.
+
+        Three things are released here, in this order, and the order matters:
+
+          1. The context. One context per scrape, so cookies and storage never
+             leak between sources.
+          2. The browser-user count, then the Governor's slot.
+          3. The browser itself — but ONLY when this scrape was the last one
+             using it AND nobody is parked waiting for a slot. `lastOneOut` is
+             computed BEFORE `releaseBrowserSlot()` hands the slot to a waiter,
+             because that waiter is about to use the same browser and closing it
+             underneath them would abort their navigation. Without this guard,
+             "close the browser in a `finally`" would be a concurrency bug at any
+             Governor setting above one task.
+
+        Closing Chromium on every escalation is deliberate. With the fast pass in
+        front, the browser is now reached only for pages that genuinely need
+        JavaScript, so one launch per escalation costs less than the fast pass
+        saves — and an unattended overnight node can never accumulate Chromium
+        processes and the memory that goes with them.
+      */
+      await context?.close().catch(() => undefined);
+      this.browserUsers = Math.max(0, this.browserUsers - 1);
+      const lastOneOut = this.browserUsers === 0 && this.browserWaiters.length === 0;
       this.releaseBrowserSlot();
+      if (lastOneOut) await this.close();
     }
   }
 

@@ -1,5 +1,6 @@
 /**
- * MOBILE RUNTIME — platform detection + the lightweight scraping fallback.
+ * MOBILE RUNTIME — platform detection, the lightweight scraping fallback, and the
+ * WATERFALL's fast pass + validation.
  *
  * Not part of the shipped app. Pure in-process checks (no network, no browser,
  * no Android SDK) so they run identically on a laptop and in CI.
@@ -171,6 +172,189 @@ check("second extraction keeps its own content", second.includes("Second documen
   } finally {
     globalThis.fetch = originalFetch;
   }
+}
+
+// --- 5. WATERFALL SCRAPING — the fast pass and its validation ----------------
+/*
+ * The waterfall is the feature: fetch first, and escalate to a browser ONLY when
+ * the response shows the fast pass did not see the page. The verdict logic is
+ * pure and takes fixture HTML, so it is exercised here against a faked `fetch` —
+ * no network, no browser, no Chromium download in CI. The escalation itself
+ * (Playwright, navigation, teardown) is asserted at the source in verify-units.
+ */
+const { fastPassScrape, detectBotWall, looksLikeSpaSkeleton, countWords } = await load(
+  "dist/agent/WaterfallScraper.js",
+);
+
+/** Runs `body` with `globalThis.fetch` replaced by `impl`, always restoring it. */
+async function withFetch(impl, body) {
+  const original = globalThis.fetch;
+  globalThis.fetch = impl;
+  try {
+    return await body();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+/** A `fetch` stub that returns one canned response. */
+const serve = (status, html) => async () => ({
+  ok: status >= 200 && status < 300,
+  status,
+  headers: { get: () => null },
+  text: async () => html,
+});
+
+const STATIC_PAGE = `<html><head><title>Lamington NP</title></head><body>
+  <h1>Lamington National Park</h1>
+  <p>${"The campground at Green Mountains is open and the waterfall track is passable after rain. ".repeat(4)}</p>
+</body></html>`;
+
+{
+  const verdict = await withFetch(serve(200, STATIC_PAGE), () =>
+    fastPassScrape("https://example.test/static"),
+  );
+  check(
+    "a served static page passes the fast pass",
+    verdict.ok === true,
+    verdict.ok ? "" : verdict.reason,
+  );
+  check("...and its text is the page's text", verdict.ok && verdict.result.text.includes("Green Mountains"));
+  check("...and its title is extracted", verdict.ok && verdict.result.title === "Lamington NP");
+}
+
+const CLOUDFLARE_BODY = `<html><head><title>Just a moment...</title></head><body>
+  <div id="challenge-platform"><script>window.__cf_chl_opt = {};</script></div>
+  <p>Checking your browser before accessing example.test.</p></body></html>`;
+
+{
+  const verdict = await withFetch(serve(403, CLOUDFLARE_BODY), () =>
+    fastPassScrape("https://example.test/wall"),
+  );
+  check(
+    "a 403 Cloudflare challenge fails the fast pass",
+    verdict.ok === false && verdict.kind === "bot-wall",
+    verdict.ok ? "" : verdict.reason,
+  );
+  check("...and it escalates to the browser", verdict.ok === false && verdict.escalate === true);
+  check(
+    "...and the reason names the refusal",
+    verdict.ok === false && /403/.test(verdict.reason),
+    verdict.ok ? "" : verdict.reason,
+  );
+}
+
+{
+  /*
+    THE SNEAKY CASE: a 200 carrying a challenge body. Nothing in the status says
+    "wall", so without the body check this document is handed to the LLM as
+    though it were the page — which is how a node "successfully" learns nothing.
+  */
+  const verdict = await withFetch(serve(200, CLOUDFLARE_BODY), () =>
+    fastPassScrape("https://example.test/wall-200"),
+  );
+  check(
+    "a 200 carrying a challenge body still fails the fast pass",
+    verdict.ok === false && verdict.kind === "bot-wall",
+    verdict.ok ? "" : verdict.reason,
+  );
+  check(
+    "...and the reason names Cloudflare",
+    verdict.ok === false && /cloudflare/i.test(verdict.reason),
+    verdict.ok ? "" : verdict.reason,
+  );
+}
+
+{
+  /*
+    A BARE 403 — no challenge body to read, because the fast pass deliberately
+    never downloads an error page's body. The status alone is the diagnosis.
+  */
+  const verdict = await withFetch(serve(403, "<html><body></body></html>"), () =>
+    fastPassScrape("https://example.test/forbidden"),
+  );
+  check(
+    "a bare 403 is diagnosed as a wall from the status alone",
+    verdict.ok === false && verdict.kind === "bot-wall",
+    verdict.ok ? "" : verdict.reason,
+  );
+  check("...and escalates", verdict.ok === false && verdict.escalate === true);
+}
+
+const SPA_SHELL = `<html><head><title>AllTrails</title>
+  <script src="/_next/static/chunks/main-abc123.js" type="module"></script></head>
+  <body><div id="root"></div>
+  <noscript>You need to enable JavaScript to run this app.</noscript></body></html>`;
+
+{
+  const verdict = await withFetch(serve(200, SPA_SHELL), () =>
+    fastPassScrape("https://example.test/spa"),
+  );
+  check(
+    "a React shell with no server-side text fails the fast pass",
+    verdict.ok === false && verdict.kind === "spa-skeleton",
+    verdict.ok ? "" : verdict.reason,
+  );
+  check("...and escalates to the browser", verdict.ok === false && verdict.escalate === true);
+}
+
+{
+  const verdict = await withFetch(serve(404, "<html><body><h1>Not found</h1></body></html>"), () =>
+    fastPassScrape("https://example.test/gone"),
+  );
+  check("a 404 fails the fast pass", verdict.ok === false && verdict.kind === "http");
+  check(
+    "...but does NOT escalate (rendering a missing page cannot help)",
+    verdict.ok === false && verdict.escalate === false,
+  );
+}
+
+{
+  /*
+    THE WORD GATE IS THE ONLY RULE THAT CAN RULE A DOCUMENT IN. A long
+    server-rendered page must never be escalated, however many framework markers
+    it happens to carry.
+  */
+  const long = `<html><head><script src="/_next/static/app.js" type="module"></script></head>
+    <body><div id="root">${"Track conditions are good and the campsite is open. ".repeat(20)}</div></body></html>`;
+  const verdict = await withFetch(serve(200, long), () => fastPassScrape("https://example.test/ssr"));
+  check("a long server-rendered page passes despite SPA markers", verdict.ok === true);
+}
+
+check(
+  "detectBotWall is null on ordinary content",
+  detectBotWall("<html><body><p>Trail open</p></body></html>", 200) === null,
+);
+check(
+  "detectBotWall names a DataDome wall",
+  /datadome/i.test(detectBotWall("<html>dd_cookie_test</html>", 200) ?? ""),
+);
+check(
+  "looksLikeSpaSkeleton ignores a short but real static page",
+  looksLikeSpaSkeleton(
+    `<html><body><p>${"short page ".repeat(10)}</p>${"<!-- padding -->".repeat(200)}</body></html>`,
+    "short page ".repeat(10),
+  ) === false,
+);
+check("countWords counts whitespace-separated words", countWords(" one  two\nthree ") === 3);
+
+{
+  /*
+    PREEMPTION IS NOT A WATERFALL TRIGGER. An abort must REJECT, never come back
+    as "the fast pass failed" — that would spend a browser launch on work the
+    engine just cancelled, on the exact path a PRIORITY task preempts.
+  */
+  const controller = new AbortController();
+  controller.abort(new Error("preempted"));
+  let rejected = false;
+  await withFetch(serve(200, STATIC_PAGE), async () => {
+    try {
+      await fastPassScrape("https://example.test/aborted", controller.signal);
+    } catch (error) {
+      rejected = /preempted/.test(String(error.message));
+    }
+  });
+  check("an aborted fast pass rejects instead of escalating", rejected);
 }
 
 const failed = results.filter((r) => !r.pass);

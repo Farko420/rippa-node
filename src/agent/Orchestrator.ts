@@ -774,12 +774,12 @@ export class Orchestrator {
    * skipped, so an unrecognised schema is diagnosable from the fleet log rather
    * than arriving as a bare "had no url".
    *
-   * The URL is fetched with the SAME engine the idle forager uses: Playwright /
-   * headless Chromium on a desktop node, and the lightweight `fetch` scraper on a
-   * runtime that has no Chromium (the APK). That routing already lives inside
-   * {@link ScraperService.scrape}, so a scrape task behaves identically however
-   * this node is deployed — including the Chromium bootstrap, the governor's
-   * browser-slot cap, and the 20k-character payload cap.
+   * The URL is fetched by the node's WATERFALL (`ScraperService.scrape`): a
+   * lightweight `fetch` fast pass first, escalating to headless Chromium only
+   * when the response is a bot wall, an empty body or a client-rendered shell —
+   * and on the APK, where no browser exists, `fetch` is the only engine. Which
+   * pass won is filed back as `engine`, so the Mothership can see how often its
+   * sources genuinely need JavaScript without asking this node for a log.
    *
    * The sanitized body text is filed back as a `scrape_result`: that text IS the
    * payload the Mothership cannot fetch itself (JS-rendered, geo-fenced or
@@ -831,6 +831,14 @@ export class Orchestrator {
         title: result.title,
         text: result.text,
         chars: result.text.length,
+        /*
+          WHICH PASS OF THE WATERFALL PRODUCED THE TEXT — "fast-pass" (a plain
+          fetch served the page), "chromium" (the page needed JavaScript, so the
+          browser was escalated to) or "fetch" (this runtime has no browser at
+          all). Reported so the Mothership can see how many of its sources are
+          JavaScript-only without reading this node's log.
+        */
+        engine: result.engine,
         /*
           A cheap yield hint, not a verdict: how many lines look like a named
           place or carry coordinates. The Mothership can use it to decide whether
